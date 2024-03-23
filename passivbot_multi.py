@@ -352,7 +352,7 @@ class Passivbot:
                         else:
                             ex_logo = "🔰"
                         
-                        if self.user_info["account"].startswith("cpt_"):
+                        if self.user.startswith("cpt_"):
                             telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} filled {upd['symbol']:} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}")
                         else:
                             telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} filled {upd['symbol']:} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}")
@@ -393,7 +393,7 @@ class Passivbot:
                     balance_old_abs = round(self.balance, 2)
                     balance_new_abs = round(upd['USDT']['total'], 2)
                     if balance_old_abs != 0.00 and balance_old_abs != balance_new_abs:
-                        if self.user_info["account"].startswith("cpt_"):
+                        if self.user.startswith("cpt_"):
                             telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd['USDT']['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}")
                         else:
                             telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd['USDT']['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}")
@@ -496,7 +496,7 @@ class Passivbot:
                     else:
                         ex_logo = "🔰"
 
-                    if self.user_info["account"].startswith("cpt_"):
+                    if self.user.startswith("cpt_"):
                         telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
                     else:
                         telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
@@ -644,7 +644,7 @@ class Passivbot:
                 else:
                     ex_logo = "🔰"
                 if balance_old_abs != 0.00 and balance_old_abs != balance_new_abs:
-                    if self.user_info["account"].startswith("cpt_"):
+                    if self.user.startswith("cpt_"):
                         telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(balance_old):.2f} -> ${abs(balance_new):.2f}\nMargin: ${abs(balance_new + self.calc_upnl_sum()):.4f}")
                     else:
                         telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(balance_old):.2f} -> ${abs(balance_new):.2f}\nMargin: ${abs(balance_new + self.calc_upnl_sum()):.4f}")
