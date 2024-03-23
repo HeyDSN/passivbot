@@ -1,0 +1,7 @@
+{
+  "telegram": {
+    "token": "bot_token",
+    "group_chat_id": "@channel_name or chat_id",
+    "private_chat_id": "chat_id"
+  }
+}

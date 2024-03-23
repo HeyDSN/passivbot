@@ -48,6 +48,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
+# TELEGRAM NOTIFICATIONS
+import telegram
 
 class Passivbot:
     def __init__(self, config: dict):
@@ -341,6 +343,23 @@ class Passivbot:
                     logging.info(
                         f"   filled {upd['symbol']: <{self.sym_padding}} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']} source: WS"
                     )
+                    # TELEGRAM NOTIFICATIONS
+                    try:
+                        if self.exchange == "binance":
+                            ex_logo = "🟡"
+                        elif self.exchange == "bybit":
+                            ex_logo = "🟠"
+                        else:
+                            ex_logo = "🔰"
+                        
+                        if self.user_info["account"].startswith("sub_"):
+                            telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} filled {upd['symbol']:} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}")
+                        elif self.user_info["account"].startswith("cpt_"):
+                            telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} filled {upd['symbol']:} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}")
+                        
+                    except Exception as e:
+                        logging.error(f"{ex_logo} {self.exchange.capitalize()} new filled, error sending telegram message {e}")
+                        telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} Exception new filled, message {e}")
                     self.recent_fill = True
                 elif upd["status"] in ["canceled", "expired"]:
                     # remove order from open_orders
@@ -362,6 +381,25 @@ class Passivbot:
                 logging.info(
                     f"balance changed: {self.balance} -> {upd['USDT']['total']} equity: {(upd['USDT']['total'] + self.calc_upnl_sum()):.4f} source: WS"
                 )
+                # TELEGRAM NOTIFICATIONS
+                try:
+                    if self.exchange == "binance":
+                        ex_logo = "🟡"
+                    elif self.exchange == "bybit":
+                        ex_logo = "🟠"
+                    else:
+                        ex_logo = "🔰"
+                    # create balance old with 2 decimal places
+                    balance_old_abs = round(self.balance, 2)
+                    balance_new_abs = round(upd['USDT']['total'], 2)
+                    if balance_old_abs != 0.00 and balance_old_abs != balance_new_abs:
+                        if self.user_info["account"].startswith("sub_"):
+                            telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd['USDT']['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}")
+                        elif self.user_info["account"].startswith("cpt_"):
+                            telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd['USDT']['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}")
+                except Exception as e:
+                    logging.error(f"{ex_logo} {self.exchange.capitalize()} balance changed, error sending telegram message {e}")
+                    telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} Exception balance changed, message {e}")
             self.balance = max(upd["USDT"]["total"], 1e-12)
         except Exception as e:
             logging.error(f"error updating balance from websocket {upd} {e}")
@@ -449,6 +487,22 @@ class Passivbot:
                 logging.info(
                     f"{len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}"
                 )
+                # TELEGRAM NOTIFICATIONS
+                try:
+                    if self.exchange == "binance":
+                        ex_logo = "🟡"
+                    elif self.exchange == "bybit":
+                        ex_logo = "🟠"
+                    else:
+                        ex_logo = "🔰"
+
+                    if self.user_info["account"].startswith("sub_"):
+                        telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
+                    elif self.user_info["account"].startswith("cpt_"):
+                        telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
+                except Exception as e:
+                    logging.error(f"{ex_logo} {self.exchange.capitalize()} new pnl, error sending telegram message {e}")
+                    telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} Exception new pnl, message {e}")
             try:
                 json.dump(self.pnls, open(self.pnls_cache_filepath, "w"))
             except Exception as e:
@@ -578,6 +632,25 @@ class Passivbot:
             logging.info(
                 f"balance changed: {balance_old} -> {balance_new} equity: {(balance_new + self.calc_upnl_sum()):.4f} source: REST"
             )
+            # TELEGRAM NOTIFICATIONS
+            try:
+                # create balance old with 2 decimal places
+                balance_old_abs = round(balance_old, 2)
+                balance_new_abs = round(balance_new, 2)
+                if self.exchange == "binance":
+                    ex_logo = "🟡"
+                elif self.exchange == "bybit":
+                    ex_logo = "🟠"
+                else:
+                    ex_logo = "🔰"
+                if balance_old_abs != 0.00 and balance_old_abs != balance_new_abs:
+                    if self.user_info["account"].startswith("sub_"):
+                        telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(balance_old):.2f} -> ${abs(balance_new):.2f}\nMargin: ${abs(balance_new + self.calc_upnl_sum()):.4f}")
+                    elif self.user_info["account"].startswith("cpt_"):
+                        telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(balance_old):.2f} -> ${abs(balance_new):.2f}\nMargin: ${abs(balance_new + self.calc_upnl_sum()):.4f}")
+            except Exception as e:
+                logging.error(f"{ex_logo} {self.exchange.capitalize()} balance changed, error sending telegram message {e}")
+                telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} Exception balance changed, message {e}")
         return True
 
     async def update_tickers(self):
