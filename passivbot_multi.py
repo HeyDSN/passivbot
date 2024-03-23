@@ -352,10 +352,10 @@ class Passivbot:
                         else:
                             ex_logo = "🔰"
                         
-                        if self.user_info["account"].startswith("sub_"):
-                            telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} filled {upd['symbol']:} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}")
-                        elif self.user_info["account"].startswith("cpt_"):
+                        if self.user_info["account"].startswith("cpt_"):
                             telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} filled {upd['symbol']:} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}")
+                        else:
+                            telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} filled {upd['symbol']:} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}")
                         
                     except Exception as e:
                         logging.error(f"{ex_logo} {self.exchange.capitalize()} new filled, error sending telegram message {e}")
@@ -393,10 +393,10 @@ class Passivbot:
                     balance_old_abs = round(self.balance, 2)
                     balance_new_abs = round(upd['USDT']['total'], 2)
                     if balance_old_abs != 0.00 and balance_old_abs != balance_new_abs:
-                        if self.user_info["account"].startswith("sub_"):
-                            telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd['USDT']['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}")
-                        elif self.user_info["account"].startswith("cpt_"):
+                        if self.user_info["account"].startswith("cpt_"):
                             telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd['USDT']['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}")
+                        else:
+                            telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd['USDT']['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}")
                 except Exception as e:
                     logging.error(f"{ex_logo} {self.exchange.capitalize()} balance changed, error sending telegram message {e}")
                     telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} Exception balance changed, message {e}")
@@ -496,10 +496,10 @@ class Passivbot:
                     else:
                         ex_logo = "🔰"
 
-                    if self.user_info["account"].startswith("sub_"):
-                        telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
-                    elif self.user_info["account"].startswith("cpt_"):
+                    if self.user_info["account"].startswith("cpt_"):
                         telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
+                    else:
+                        telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
                 except Exception as e:
                     logging.error(f"{ex_logo} {self.exchange.capitalize()} new pnl, error sending telegram message {e}")
                     telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} Exception new pnl, message {e}")
@@ -644,10 +644,10 @@ class Passivbot:
                 else:
                     ex_logo = "🔰"
                 if balance_old_abs != 0.00 and balance_old_abs != balance_new_abs:
-                    if self.user_info["account"].startswith("sub_"):
-                        telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(balance_old):.2f} -> ${abs(balance_new):.2f}\nMargin: ${abs(balance_new + self.calc_upnl_sum()):.4f}")
-                    elif self.user_info["account"].startswith("cpt_"):
+                    if self.user_info["account"].startswith("cpt_"):
                         telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(balance_old):.2f} -> ${abs(balance_new):.2f}\nMargin: ${abs(balance_new + self.calc_upnl_sum()):.4f}")
+                    else:
+                        telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} balance changed:\nWallet: ${abs(balance_old):.2f} -> ${abs(balance_new):.2f}\nMargin: ${abs(balance_new + self.calc_upnl_sum()):.4f}")
             except Exception as e:
                 logging.error(f"{ex_logo} {self.exchange.capitalize()} balance changed, error sending telegram message {e}")
                 telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} Exception balance changed, message {e}")
