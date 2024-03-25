@@ -40,10 +40,6 @@ def send_message_worker():
         data = {"parse_mode": "HTML", "chat_id": chat_id, "text": message}
         response = requests.post(url, data=data)
 
-        # Print response and message
-        print(f"Telegram response: {response.json()}")
-        print(f"[{datetime.datetime.now()}] Message sent to Telegram: \n{message}")
-
         # Mark the message as done in the queue
         message_queue.task_done()
 

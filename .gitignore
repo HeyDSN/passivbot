@@ -354,5 +354,8 @@ configs/live/multigrid.json
 # Reports
 reports/*
 
+*.pyc
+*.npy
+__pycache__
 caches
 mycfg
