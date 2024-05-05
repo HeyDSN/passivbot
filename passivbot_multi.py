@@ -67,6 +67,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
+# TELEGRAM NOTIFICATIONS
+import telegram
 
 class Passivbot:
     def __init__(self, config: dict):
@@ -734,6 +736,22 @@ class Passivbot:
                 logging.info(
                     f"{len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}"
                 )
+                # TELEGRAM NOTIFICATIONS
+                try:
+                    if self.exchange == "binance":
+                        ex_logo = "🟡"
+                    elif self.exchange == "bybit":
+                        ex_logo = "🟠"
+                    else:
+                        ex_logo = "🔰"
+
+                    if self.user.startswith("cpt_"):
+                        telegram.send_channel(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
+                    else:
+                        telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} {len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}")
+                except Exception as e:
+                    logging.error(f"{ex_logo} {self.exchange.capitalize()} new pnl, error sending telegram message {e}")
+                    telegram.send_private(f"{ex_logo} {self.exchange.capitalize()} Exception new pnl, message {e}")
             try:
                 json.dump(self.pnls, open(self.pnls_cache_filepath, "w"))
             except Exception as e:
