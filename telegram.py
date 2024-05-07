@@ -16,6 +16,24 @@ PRIVATE_CHAT_ID = config["telegram"]["private_chat_id"]
 # Create a thread-safe queue
 message_queue = Queue()
 
+def send_notification(exchange, account, message):
+    try:
+        if exchange == "binance":
+            ex_logo = "🟡"
+        elif exchange == "bybit":
+            ex_logo = "🟠"
+        else:
+            ex_logo = "🔰"
+
+        message = f"{ex_logo} {exchange.capitalize()} {account} {message}"
+        
+        if account.startswith("cpt_"):
+            send_channel(message)
+        else:
+            send_private(message)
+        
+    except Exception as e:
+        send_private(f"{ex_logo} {exchange.capitalize()} Exception new notification, message {e}")
 
 def send_channel(message):
     # Put the message into the queue

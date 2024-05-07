@@ -67,6 +67,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
+# TELEGRAM NOTIFICATIONS
+import telegram
+# TELEGRAM NOTIFICATIONS
+
 class Passivbot:
     def __init__(self, config: dict):
         self.config = config
@@ -641,6 +645,12 @@ class Passivbot:
                         f"   filled {self.pad_sym(upd['symbol'])} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']} source: WS"
                     )
                     self.recent_fill = True
+
+                    # TELEGRAM NOTIFICATIONS
+                    message = f"filled {self.pad_sym(upd['symbol'])} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}"
+                    telegram.send_notification(self.exchange, self.user, message)
+                    # TELEGRAM NOTIFICATIONS
+
                 elif upd["status"] in ["canceled", "expired", "rejected"]:
                     # remove order from open_orders
                     self.remove_cancelled_order(upd)
@@ -662,6 +672,16 @@ class Passivbot:
                     f"balance changed: {self.balance} -> {upd[self.quote]['total']} equity: {equity:.4f} source: {source}"
                 )
             self.balance = max(upd[self.quote]["total"], 1e-12)
+
+            # TELEGRAM NOTIFICATIONS
+            # create balance old with 2 decimal places
+            balance_old_abs = round(self.balance, 2)
+            balance_new_abs = round(upd[self.quote]['total'], 2)
+            if balance_old_abs != 0.00 and balance_old_abs != balance_new_abs:
+                message = f"balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd[self.quote]['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}"
+                telegram.send_notification(self.exchange, self.user, message)
+            # TELEGRAM NOTIFICATIONS
+
         except Exception as e:
             logging.error(f"error updating balance from websocket {upd} {e}")
             traceback.print_exc()
@@ -764,6 +784,11 @@ class Passivbot:
                 logging.info(
                     f"{len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}"
                 )
+                # TELEGRAM NOTIFICATIONS
+                message = f"{len(new_pnls)} new pnl{'s' if len(new_pnls) > 1 else ''} {new_income} {self.quote}"
+                telegram.send_notification(self.exchange, self.user, message)
+                # TELEGRAM NOTIFICATIONS
+
             try:
                 json.dump(self.pnls, open(self.pnls_cache_filepath, "w"))
             except Exception as e:
