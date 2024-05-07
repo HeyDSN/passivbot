@@ -1,0 +1,5 @@
+.git/
+docs/
+historical_data/
+mycfg/
+api-keys.json
