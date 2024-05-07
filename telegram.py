@@ -25,7 +25,7 @@ def send_notification(exchange, account, message):
         else:
             ex_logo = "🔰"
 
-        message = f"{ex_logo} {exchange.capitalize()} {account} {message}"
+        message = f"{ex_logo} {exchange.capitalize()} {message}"
         
         if account.startswith("cpt_"):
             send_channel(message)
