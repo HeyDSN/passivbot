@@ -264,7 +264,7 @@ class Passivbot:
         if not hasattr(self, "formatted_symbols_map"):
             self.formatted_symbols_map = {}
             self.formatted_symbols_map_inv = defaultdict(set)
-        formatted = f"{symbol2coin(symbol)}/{self.quote}:{self.quote}"
+        formatted = f"{symbol2coin(symbol.replace(',', ''))}/{self.quote}:{self.quote}"
         self.formatted_symbols_map[symbol] = formatted
         self.formatted_symbols_map_inv[formatted].add(symbol)
         return formatted
@@ -355,32 +355,38 @@ class Passivbot:
         # defined by each exchange child class
         pass
 
+    def reformat_symbol(self, symbol: str, verbose=False) -> str:
+        # tries to reformat symbol to correct variant for exchange
+        # (e.g. BONK -> 1000BONK/USDT:USDT, PEPE - kPEPE/USDC:USDC)
+        # if no reformatting is possible, return empty string
+        fsymbol = self.format_symbol(symbol)
+        if fsymbol in self.markets_dict:
+            return fsymbol
+        else:
+            if verbose:
+                logging.info(f"{symbol} missing from {self.exchange}")
+            if fsymbol in self.formatted_symbols_map_inv:
+                for x in self.formatted_symbols_map_inv[fsymbol]:
+                    if x in self.markets_dict:
+                        if verbose:
+                            logging.info(f"changing {symbol} -> {x}")
+                        return x
+        return ""
+
     async def init_flags(self):
-        self.ignored_symbols = {self.format_symbol(x) for x in self.config["ignored_symbols"]}
+        self.ignored_symbols = {self.reformat_symbol(x) for x in self.config["ignored_symbols"]}
         self.flags = {}
         self.eligible_symbols = set()  # symbols which may be approved for trading
+
         for symbol in self.config["approved_symbols"]:
-            fsymbol = self.format_symbol(symbol)
-            if fsymbol not in self.markets_dict:
-                logging.info(f"{symbol} missing from {self.exchange}")
-                if fsymbol in self.formatted_symbols_map_inv:
-                    for x in self.formatted_symbols_map_inv[fsymbol]:
-                        if x in self.markets_dict:
-                            logging.info(f"changing {symbol} -> {x}")
-                            self.flags[x] = (
-                                self.config["approved_symbols"][symbol]
-                                if isinstance(self.config["approved_symbols"], dict)
-                                else ""
-                            )
-                            self.eligible_symbols.add(x)
-                            break
-            else:
-                self.flags[fsymbol] = (
+            reformatted_symbol = self.reformat_symbol(symbol, verbose=True)
+            if reformatted_symbol:
+                self.flags[reformatted_symbol] = (
                     self.config["approved_symbols"][symbol]
                     if isinstance(self.config["approved_symbols"], dict)
                     else ""
                 )
-                self.eligible_symbols.add(fsymbol)
+                self.eligible_symbols.add(reformatted_symbol)
         if not self.config["approved_symbols"]:
             self.eligible_symbols = set(self.markets_dict)
 
@@ -402,7 +408,31 @@ class Passivbot:
                 self.flags[symbol].split() if symbol in self.flags else []
             )
             for pside in ["long", "short"]:
-                if (mode := getattr(self.flags[symbol], f"{pside}_mode")) is not None:
+                if (mode := getattr(self.flags[symbol], f"{pside}_mode")) is None:
+                    if symbol in self.ignored_symbols:
+                        setattr(
+                            self.flags[symbol],
+                            f"{pside}_mode",
+                            "graceful_stop" if self.config["auto_gs"] else "manual",
+                        )
+                        self.forced_modes[pside][symbol] = getattr(
+                            self.flags[symbol], f"{pside}_mode"
+                        )
+                    elif self.config[f"forced_mode_{pside}"]:
+                        try:
+                            setattr(
+                                self.flags[symbol],
+                                f"{pside}_mode",
+                                expand_PB_mode(self.config[f"forced_mode_{pside}"]),
+                            )
+                            self.forced_modes[pside][symbol] = getattr(
+                                self.flags[symbol], f"{pside}_mode"
+                            )
+                        except Exception as e:
+                            logging.error(
+                                f"failed to set PB mode {self.config[f'forced_mode_{pside}']} {e}"
+                            )
+                else:
                     self.forced_modes[pside][symbol] = mode
 
         if self.forager_mode and self.config["minimum_market_age_days"] > 0:
@@ -453,7 +483,8 @@ class Passivbot:
             for symbol in self.forced_modes[pside]:
                 if self.forced_modes[pside][symbol] == "normal":
                     self.ideal_actives[pside][symbol] = ""
-                self.PB_modes[pside][symbol] = self.forced_modes[pside][symbol]
+                if symbol in self.actual_actives[pside]:
+                    self.PB_modes[pside][symbol] = self.forced_modes[pside][symbol]
         if self.forager_mode:
             self.calc_noisiness()  # ideal symbols are high noise symbols
             for symbol in sorted(self.noisiness, key=lambda x: self.noisiness[x], reverse=True):
@@ -470,7 +501,7 @@ class Passivbot:
             for pside in self.actual_actives:
                 # actual actives fill slots first
                 for symbol in self.actual_actives[pside]:
-                    if symbol in self.PB_modes[pside]:
+                    if symbol in self.forced_modes[pside]:
                         continue  # is a forced mode
                     if symbol in self.ideal_actives[pside]:
                         self.PB_modes[pside][symbol] = "normal"
@@ -483,7 +514,7 @@ class Passivbot:
                 # a slot is filled if symbol in [normal, graceful_stop]
                 # symbols on other modes are ignored
                 for symbol in self.ideal_actives[pside]:
-                    if symbol in self.PB_modes[pside]:
+                    if symbol in self.PB_modes[pside] or symbol in self.forced_modes[pside]:
                         continue
                     slots_filled = {
                         k for k, v in self.PB_modes[pside].items() if v in ["normal", "graceful_stop"]
