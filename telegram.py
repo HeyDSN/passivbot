@@ -1,6 +1,6 @@
 import json
+import re
 import requests
-import datetime
 import threading
 from queue import Queue
 
@@ -16,6 +16,7 @@ PRIVATE_CHAT_ID = config["telegram"]["private_chat_id"]
 # Create a thread-safe queue
 message_queue = Queue()
 
+
 def send_notification(exchange, account, message):
     try:
         if exchange == "binance":
@@ -25,15 +26,24 @@ def send_notification(exchange, account, message):
         else:
             ex_logo = "🔰"
 
-        message = f"{ex_logo} {exchange.capitalize()} {message}"
-        
+        cleaned_text = remove_extra_spaces(message)
+
+        cleaned_message = f"{ex_logo} {exchange.capitalize()} {cleaned_text}"
+
         if account.startswith("cpt_"):
-            send_channel(message)
+            send_channel(cleaned_message)
         else:
-            send_private(message)
-        
+            send_private(cleaned_message)
+
     except Exception as e:
-        send_private(f"{ex_logo} {exchange.capitalize()} Exception new notification, message {e}")
+        send_private(
+            f"{ex_logo} {exchange.capitalize()} Exception new notification, message {e}"
+        )
+
+
+def remove_extra_spaces(text):
+    return re.sub(r"\s+", " ", text)
+
 
 def send_channel(message):
     # Put the message into the queue
