@@ -17,7 +17,7 @@ PRIVATE_CHAT_ID = config["telegram"]["private_chat_id"]
 message_queue = Queue()
 
 
-def send_notification(exchange, account, message):
+def send_notification(exchange, account, message, filter = True):
     try:
         if exchange == "binance":
             ex_logo = "🟡"
@@ -26,7 +26,10 @@ def send_notification(exchange, account, message):
         else:
             ex_logo = "🔰"
 
-        cleaned_text = remove_extra_spaces(message)
+        if filter:
+            cleaned_text = remove_extra_spaces(message)
+        else:
+            cleaned_text = message
 
         cleaned_message = f"{ex_logo} {exchange.capitalize()} {cleaned_text}"
 
