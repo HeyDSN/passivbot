@@ -673,7 +673,7 @@ class Passivbot:
                 )
                 # TELEGRAM NOTIFICATIONS
                 message = f"balance changed:\nWallet: ${abs(self.balance):.4f} -> ${abs(upd[self.quote]['total']):.4f}\nMargin: ${abs(equity):.4f}"
-                telegram.send_notification(self.exchange, self.user, message)
+                telegram.send_notification(self.exchange, self.user, message, False)
                 # TELEGRAM NOTIFICATIONS
             self.balance = max(upd[self.quote]["total"], 1e-12)
 
