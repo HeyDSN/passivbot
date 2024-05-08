@@ -671,16 +671,11 @@ class Passivbot:
                 logging.info(
                     f"balance changed: {self.balance} -> {upd[self.quote]['total']} equity: {equity:.4f} source: {source}"
                 )
-            self.balance = max(upd[self.quote]["total"], 1e-12)
-
-            # TELEGRAM NOTIFICATIONS
-            # create balance old with 2 decimal places
-            balance_old_abs = round(self.balance, 2)
-            balance_new_abs = round(upd[self.quote]['total'], 2)
-            if balance_old_abs != 0.00 and balance_old_abs != balance_new_abs:
-                message = f"balance changed:\nWallet: ${abs(self.balance):.2f} -> ${abs(upd[self.quote]['total']):.2f}\nMargin: ${abs(upd['USDT']['total'] + self.calc_upnl_sum()):.4f}"
+                # TELEGRAM NOTIFICATIONS
+                message = f"balance changed:\nWallet: ${abs(self.balance):.4f} -> ${abs(upd[self.quote]['total']):.4f}\nMargin: ${abs(equity):.4f}"
                 telegram.send_notification(self.exchange, self.user, message)
-            # TELEGRAM NOTIFICATIONS
+                # TELEGRAM NOTIFICATIONS
+            self.balance = max(upd[self.quote]["total"], 1e-12)
 
         except Exception as e:
             logging.error(f"error updating balance from websocket {upd} {e}")
