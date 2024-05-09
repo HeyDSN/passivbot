@@ -37,7 +37,7 @@ jobs:
           docker push deni1743/passivbot:${{ steps.strip_tag.outputs.tag }}
           docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} deni1743/passivbot:latest
           docker push deni1743/passivbot:latest
-          docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} ghcr.io/${{ github.repository_owner }}/passivbot:${{ steps.strip_tag.outputs.tag }}
-          docker push ghcr.io/${{ github.repository_owner }}/passivbot:${{ steps.strip_tag.outputs.tag }}
-          docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} ghcr.io/${{ github.repository_owner }}/passivbot:latest
-          docker push ghcr.io/${{ github.repository_owner }}/passivbot:latest
+          docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} ghcr.io/${{ github.repository }}:${{ steps.strip_tag.outputs.tag }}
+          docker push ghcr.io/${{ github.repository }}:${{ steps.strip_tag.outputs.tag }}
+          docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} ghcr.io/${{ github.repository }}:latest
+          docker push ghcr.io/${{ github.repository }}:latest
