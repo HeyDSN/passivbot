@@ -122,6 +122,7 @@ class Passivbot:
         self.emas = {"long": {}, "short": {}}
         self.ema_alphas = {"long": {}, "short": {}}
         self.upd_minute_emas = {}
+        self.ineligible_symbols_with_pos = set()
 
     def set_live_configs(self):
         # live configs priority:
@@ -274,7 +275,8 @@ class Passivbot:
         return formatted
 
     async def init_markets_dict(self):
-        self.markets_dict = await self.cca.load_markets()
+        self.markets_dict = {elm["symbol"]: elm for elm in (await self.cca.fetch_markets())}
+        self.markets_dict_all = deepcopy(self.markets_dict)
         # remove ineligible symbols from markets dict
         ineligible_symbols = {}
         for symbol in list(self.markets_dict):
@@ -296,6 +298,12 @@ class Passivbot:
                 logging.info(f"{line}: {len(syms_)} symbols")
             elif len(syms_) > 0:
                 logging.info(f"{line}: {','.join(sorted(set([s for s in syms_])))}")
+
+        for symbol in self.ineligible_symbols_with_pos:
+            if symbol not in self.markets_dict and symbol in self.markets_dict_all:
+                logging.info(f"There is a position in an ineligible market: {symbol}.")
+                self.markets_dict[symbol] = self.markets_dict_all[symbol]
+                self.config["ignored_symbols"].append(symbol)
 
         self.set_market_specific_settings()
         for symbol in self.markets_dict:
@@ -438,6 +446,8 @@ class Passivbot:
                             )
                 else:
                     self.forced_modes[pside][symbol] = mode
+                if not self.markets_dict[symbol]["active"]:
+                    self.forced_modes[pside][symbol] = "tp_only"
 
         if self.forager_mode and self.config["minimum_market_age_days"] > 0:
             if not hasattr(self, "first_timestamps"):
@@ -801,6 +811,20 @@ class Passivbot:
         self.upd_timestamps["pnls"] = utc_ms()
         return True
 
+    async def check_for_inactive_markets(self):
+        self.ineligible_symbols_with_pos = [
+            elm["symbol"]
+            for elm in self.fetched_positions + self.fetched_open_orders
+            if elm["symbol"] not in self.markets_dict
+        ]
+        if self.ineligible_symbols_with_pos:
+            logging.info(
+                f"Caught symbol with pos for ineligible market: {self.ineligible_symbols_with_pos}"
+            )
+            await self.init_markets_dict()
+            await self.init_flags()
+            self.set_live_configs()
+
     async def update_open_orders(self):
         if not hasattr(self, "open_orders"):
             self.open_orders = {}
@@ -808,6 +832,7 @@ class Passivbot:
         if res in [None, False]:
             return False
         self.fetched_open_orders = res
+        await self.check_for_inactive_markets()
         open_orders = res
         oo_ids_old = {elm["id"] for sublist in self.open_orders.values() for elm in sublist}
         created_prints, cancelled_prints = [], []
@@ -852,6 +877,7 @@ class Passivbot:
             return False
         positions_list_new, balance_new = res
         self.fetched_positions = positions_list_new
+        await self.check_for_inactive_markets()
         self.handle_balance_update({self.quote: {"total": balance_new}})
         positions_new = {
             sym: {
@@ -1333,7 +1359,7 @@ class Passivbot:
                     to_cancel_ = [x for x in to_cancel_ if x["position_side"] != pside]
                     to_create_ = [x for x in to_create_ if x["position_side"] != pside]
                 elif self.live_configs[symbol][pside]["mode"] == "tp_only":
-                    # if take profit only mode, remove same pside entry orders
+                    # if take profit only mode, neither cancel nor create entries
                     to_cancel_ = [
                         x
                         for x in to_cancel_
