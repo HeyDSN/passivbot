@@ -1,6 +1,6 @@
 aiohttp==3.9.3
 asyncio==3.4.3
-ccxt==4.1.72
+ccxt==4.3.24
 hjson==3.0.2
 numba==0.59.1
 numpy==1.26.4
