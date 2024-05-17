@@ -6,3 +6,4 @@ numba==0.59.1
 numpy==1.26.4
 python-dateutil==2.8.2
 websockets==10.1
+prettytable==3.0.0
