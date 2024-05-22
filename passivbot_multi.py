@@ -606,6 +606,11 @@ class Passivbot:
         try:
             if not order or "id" not in order:
                 return False
+            if "symbol" not in order or order["symbol"] is None:
+                logging.info(f"{order}")
+                return False
+            if order["symbol"] not in self.open_orders:
+                self.open_orders[order["symbol"]] = []
             if order["id"] not in {x["id"] for x in self.open_orders[order["symbol"]]}:
                 self.open_orders[order["symbol"]].append(order)
                 logging.info(
@@ -621,6 +626,11 @@ class Passivbot:
         try:
             if not order or "id" not in order:
                 return False
+            if "symbol" not in order or order["symbol"] is None:
+                logging.info(f"{order}")
+                return False
+            if order["symbol"] not in self.open_orders:
+                self.open_orders[order["symbol"]] = []
             if order["id"] in {x["id"] for x in self.open_orders[order["symbol"]]}:
                 self.open_orders[order["symbol"]] = [
                     x for x in self.open_orders[order["symbol"]] if x["id"] != order["id"]
@@ -814,7 +824,6 @@ class Passivbot:
                 cancelled_prints.append(
                     f"cancelled {self.pad_sym(oo['symbol'])} {oo['side']} {oo['qty']} {oo['position_side']} @ {oo['price']} source: REST"
                 )
-        self.open_orders = {symbol: [] for symbol in self.open_orders}
         self.open_orders = {}
         for elm in open_orders:
             if elm["symbol"] not in self.open_orders:
@@ -1300,7 +1309,7 @@ class Passivbot:
         actual_orders = {}
         for symbol in self.active_symbols:
             actual_orders[symbol] = []
-            for x in self.open_orders[symbol]:
+            for x in self.open_orders[symbol] if symbol in self.open_orders else []:
                 actual_orders[symbol].append(
                     {
                         "symbol": x["symbol"],
@@ -1365,6 +1374,7 @@ class Passivbot:
         self.previous_execution_ts = utc_ms()
         try:
             self.update_PB_modes()
+            await self.add_new_symbols_to_maintainer_EMAs()
             await self.update_exchange_configs()
             if self.recent_fill:
                 self.upd_timestamps["positions"] = 0.0
@@ -1421,7 +1431,6 @@ class Passivbot:
         while True:
             if self.stop_websocket:
                 break
-            await self.add_new_symbols_to_maintainer_EMAs()
             if utc_ms() - self.execution_delay_millis > self.previous_execution_ts:
                 await self.execute_to_exchange()
             await asyncio.sleep(1.0)
