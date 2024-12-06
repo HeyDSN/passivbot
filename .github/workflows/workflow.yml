@@ -40,10 +40,6 @@ jobs:
       - name: Build and push to Docker Hub and GHCR
         run: |
           docker build -t deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} -f _Dockerfile .
-          docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} deni1743/passivbot:${{ steps.strip_tag.outputs.tag }}
-          docker push deni1743/passivbot:${{ steps.strip_tag.outputs.tag }}
-          docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} deni1743/passivbot:latest
-          docker push deni1743/passivbot:latest
           docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} ghcr.io/${{ env.OWNER_LC }}/passivbot:${{ steps.strip_tag.outputs.tag }}
           docker push ghcr.io/${{ env.OWNER_LC }}/passivbot:${{ steps.strip_tag.outputs.tag }}
           docker tag deni1743/passivbot:${{ steps.strip_tag.outputs.tag }} ghcr.io/${{ env.OWNER_LC }}/passivbot:latest
