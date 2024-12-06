@@ -1,10 +1,10 @@
 services:
-passivbot_binance_cpt1:
-  image: ghcr.io/heydsn/passivbot:7.2.8
-  container_name: passivbot_binance_cpt1
-  restart: unless-stopped
-  volumes:
-    - $PWD/caches:/passivbot/caches
-    - $PWD/mycfg:/passivbot/mycfg
-    - $PWD/api-keys.json:/passivbot/api-keys.json
-  command: python3 src/main.py mycfg/live_binance_cpt1.json
+  passivbot_binance_cpt1:
+    image: ghcr.io/heydsn/passivbot:7.2.8
+    container_name: passivbot_binance_cpt1
+    restart: unless-stopped
+    volumes:
+      - $PWD/caches:/passivbot/caches
+      - $PWD/mycfg:/passivbot/mycfg
+      - $PWD/api-keys.json:/passivbot/api-keys.json
+    command: python3 src/main.py mycfg/live_binance_cpt1.json
