@@ -1,0 +1,84 @@
+name: Build and Release
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  create-tag-and-release:
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.title, '[Build] v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from PR title
+        id: extract_version
+        run: |
+          VERSION=$(echo "${{ github.event.pull_request.title }}" | grep -oP '(?<=\[Build\] v).*')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -a "v${{ steps.extract_version.outputs.version }}" -m "Release v${{ steps.extract_version.outputs.version }}"
+          git push origin "v${{ steps.extract_version.outputs.version }}"
+
+  build-and-push:
+    needs: create-tag-and-release
+    name: Build and Push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          ref: "v${{ needs.create-tag-and-release.outputs.version }}"
+
+      - name: set lower case owner name
+        id: lc_owner
+        run: |
+          echo "OWNER_LC=${OWNER,,}" >>${GITHUB_ENV}
+        env:
+          OWNER: "${{ github.repository_owner }}"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push to GHCR
+        run: |
+          docker build -t deni1743/passivbot:${{ needs.create-tag-and-release.outputs.version }} -f _Dockerfile .
+          docker tag deni1743/passivbot:${{ needs.create-tag-and-release.outputs.version }} ghcr.io/${{ env.OWNER_LC }}/passivbot:${{ needs.create-tag-and-release.outputs.version }}
+          docker push ghcr.io/${{ env.OWNER_LC }}/passivbot:${{ needs.create-tag-and-release.outputs.version }}
+          docker tag deni1743/passivbot:${{ needs.create-tag-and-release.outputs.version }} ghcr.io/${{ env.OWNER_LC }}/passivbot:latest
+          docker push ghcr.io/${{ env.OWNER_LC }}/passivbot:latest
+
+  release:
+    needs: [create-tag-and-release, build-and-push]
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "v${{ needs.create-tag-and-release.outputs.version }}"
+          release_name: "Release v${{ needs.create-tag-and-release.outputs.version }}"
+          body: |
+            Automated release from PR #${{ github.event.pull_request.number }}
+            PR Title: ${{ github.event.pull_request.title }}
+          draft: false
+          prerelease: false
