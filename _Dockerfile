@@ -1,5 +1,5 @@
-# Base image
-FROM python:3.10-slim-buster
+# First stage: builder
+FROM python:3.10-slim-buster AS builder
 
 # Install dependencies
 RUN apt update && apt install -y build-essential curl git && apt clean
@@ -23,7 +23,7 @@ RUN cd passivbot-rust && \
     maturin build --release && \
     pip install target/wheels/*.whl
 
-# Final stage
+# Second stage: final
 FROM python:3.10-slim-buster
 
 # Create working directory
