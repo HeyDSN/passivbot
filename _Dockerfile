@@ -1,29 +1,22 @@
-# Build stage
-FROM python:3.10-slim-buster as builder
+# Base image
+FROM python:3.10-slim-buster
 
-# Install build dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# Install dependencies
+RUN apt update && apt install -y build-essential curl git && apt clean
 
-# Install Rust
+# Install the latest version of Rust and Cargo
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Create working directory
 WORKDIR /passivbot
 
-# Copy only the files needed for building
-COPY requirements.txt .
-COPY passivbot-rust ./passivbot-rust
+# Copy the current directory contents into the container at /passivbot
+COPY . .
 
 # Install Python dependencies
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip pip install --upgrade pip
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
 
 # Build the Rust code
 RUN cd passivbot-rust && \
@@ -33,12 +26,12 @@ RUN cd passivbot-rust && \
 # Final stage
 FROM python:3.10-slim-buster
 
+# Create working directory
 WORKDIR /passivbot
 
 # Copy only necessary files from builder
 COPY --from=builder /usr/local/lib/python3.10/site-packages/ /usr/local/lib/python3.10/site-packages/
-COPY --from=builder /passivbot/passivbot-rust/target/wheels/*.whl ./
-COPY . .
+COPY --from=builder /passivbot/ /passivbot/
 
 # Install the wheel file without build dependencies
 RUN pip install --no-cache-dir *.whl && rm *.whl
