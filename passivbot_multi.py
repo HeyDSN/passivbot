@@ -657,7 +657,7 @@ class Passivbot:
                     self.recent_fill = True
 
                     # TELEGRAM NOTIFICATIONS
-                    message = f"filled {self.pad_sym(upd['symbol'])} {upd['side']} {upd['qty']} {upd['position_side']} @ {upd['price']}"
+                    message = f"{upd['side'][0].upper()}{upd['side'][1:]} {self.pad_sym(upd['symbol'])} {upd['position_side'].upper()}"
                     telegram.send_notification(self.exchange, self.user, message)
                     # TELEGRAM NOTIFICATIONS
 
