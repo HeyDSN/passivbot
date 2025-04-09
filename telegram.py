@@ -41,6 +41,7 @@ except Exception as e:
 def send_notification(exchange, account, message, filter = True):
     # Do nothing if Telegram is not enabled
     if not TELEGRAM_ENABLED:
+        logging.info(f"Telegram notifications disabled, not sending: {message}")
         return
     
     try:
@@ -57,22 +58,27 @@ def send_notification(exchange, account, message, filter = True):
             cleaned_text = message
 
         cleaned_message = f"{ex_logo} {exchange.capitalize()}: {cleaned_text}"
+        logging.info(f"Preparing to send Telegram notification: {cleaned_message}")
 
         if account.startswith("cpt_"):
+            logging.info(f"Sending to channel: {GROUP_CHAT_ID}")
             send_channel(cleaned_message)
         else:
+            logging.info(f"Sending to private: {PRIVATE_CHAT_ID}")
             send_private(cleaned_message)
 
     except Exception as e:
+        # Log the exception
+        logging.error(f"Error sending Telegram notification: {e}")
         # Only try to send error message if Telegram is enabled
         try:
             if TELEGRAM_ENABLED:
                 send_private(
                     f"{ex_logo} {exchange.capitalize()} Exception new notification, message {e}"
                 )
-        except:
-            # Silently fail if even the error notification fails
-            pass
+        except Exception as inner_e:
+            # Log the inner exception
+            logging.error(f"Error sending Telegram error notification: {inner_e}")
 
 
 def remove_extra_spaces(text):
@@ -93,19 +99,32 @@ def send_private(error_message):
 
 def send_message_worker():
     while True:
-        # Get the next message from the queue
-        message_type, message = message_queue.get()
+        try:
+            # Get the next message from the queue
+            message_type, message = message_queue.get()
 
-        # Determine the appropriate chat ID
-        chat_id = GROUP_CHAT_ID if message_type == "channel" else PRIVATE_CHAT_ID
+            # Determine the appropriate chat ID
+            chat_id = GROUP_CHAT_ID if message_type == "channel" else PRIVATE_CHAT_ID
+            logging.info(f"Worker processing message type: {message_type}, chat_id: {chat_id}")
 
-        # Send the message
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        data = {"parse_mode": "HTML", "chat_id": chat_id, "text": message}
-        response = requests.post(url, data=data)
+            # Send the message
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            data = {"parse_mode": "HTML", "chat_id": chat_id, "text": message}
+            logging.info(f"Sending request to Telegram API: {url}")
+            response = requests.post(url, data=data)
+            
+            # Log the response
+            if response.status_code == 200:
+                logging.info(f"Telegram API response success: {response.status_code}")
+            else:
+                logging.error(f"Telegram API error: {response.status_code}, {response.text}")
 
-        # Mark the message as done in the queue
-        message_queue.task_done()
+            # Mark the message as done in the queue
+            message_queue.task_done()
+        except Exception as e:
+            logging.error(f"Error in send_message_worker: {e}")
+            # Continue the loop even if there's an error
+            continue
 
 
 # Start the message sending thread only if Telegram is enabled
