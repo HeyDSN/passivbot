@@ -64,7 +64,7 @@ def send_notification(exchange, account, message, filter = True):
             logging.info(f"Sending to channel: {GROUP_CHAT_ID}")
             send_channel(cleaned_message)
         else:
-            logging.info(f"Sending to private: {PRIVATE_CHAT_ID}")
+            logging.info(f"Sending to private chat")
             send_private(cleaned_message)
 
     except Exception as e:
@@ -105,12 +105,12 @@ def send_message_worker():
 
             # Determine the appropriate chat ID
             chat_id = GROUP_CHAT_ID if message_type == "channel" else PRIVATE_CHAT_ID
-            logging.info(f"Worker processing message type: {message_type}, chat_id: {chat_id}")
+            logging.info(f"Worker processing message type: {message_type}")
 
             # Send the message
             url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
             data = {"parse_mode": "HTML", "chat_id": chat_id, "text": message}
-            logging.info(f"Sending request to Telegram API: {url}")
+            logging.info(f"Sending request to Telegram API")
             response = requests.post(url, data=data)
             
             # Log the response
