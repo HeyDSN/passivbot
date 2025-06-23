@@ -169,6 +169,17 @@ def format_config(config: dict, verbose=True, live_only=False) -> dict:
                 [10.0, 1440.0],
             ),
             (
+                "close_grid_markup_start",
+                result["bot"][pside].get("close_grid_min_markup", 0.001)
+                + result["bot"][pside].get("close_grid_markup_range", 0.001),
+                result["optimize"]["bounds"].get(f"{pside}_min_markup", [0.001, 0.03]),
+            ),
+            (
+                "close_grid_markup_end",
+                result["bot"][pside].get("close_grid_min_markup", 0.001),
+                result["optimize"]["bounds"].get(f"{pside}_close_grid_min_markup", [0.001, 0.03]),
+            ),
+            (
                 "filter_volume_drop_pct",
                 result["live"].get("filter_relative_volume_clip_pct", 0.5),
                 [0.0, 1.0],
@@ -212,6 +223,12 @@ def format_config(config: dict, verbose=True, live_only=False) -> dict:
         # unneeded adjustments if running live
         for k in ("approved_coins", "ignored_coins"):
             result["live"][k] = normalize_coins_source(result["live"].get(k, ""))
+        for pside in result["live"]["approved_coins"]:
+            result["live"]["approved_coins"][pside] = [
+                c
+                for c in result["live"]["approved_coins"][pside]
+                if c not in result["live"]["ignored_coins"][pside]
+            ]
         result["backtest"]["end_date"] = format_end_date(result["backtest"]["end_date"])
         result["optimize"]["scoring"] = sorted(result["optimize"]["scoring"])
         result["optimize"]["limits"] = parse_limits_string(result["optimize"]["limits"])
@@ -253,7 +270,7 @@ def format_config(config: dict, verbose=True, live_only=False) -> dict:
     return result
 
 
-def normalize_coins_source(src) -> dict[str, list[str]]:
+def normalize_coins_source(src):  # -> dict[str, list[str]]: # python3.8 incompatible
     """
     Turn   str | list | {'long':[..],'short':[...]} | ''   into
     {'long':[...], 'short':[...]}   (comma expansion included).
@@ -1412,7 +1429,7 @@ def load_ccxt_version():
         # Get the directory of the current script
         script_dir = os.path.dirname(os.path.abspath(__file__))
         # Construct the path to the requirements.txt file
-        requirements_path = os.path.join(script_dir, "..", "requirements.txt")
+        requirements_path = os.path.join(script_dir, "..", "requirements-live.txt")
 
         # Open and read the requirements.txt file
         with open(requirements_path, "r") as f:
