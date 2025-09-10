@@ -35,26 +35,21 @@ from backtest import (
     prep_backtest_args,
     expand_analysis,
 )
-from pure_funcs import (
+from config_utils import (
     get_template_live_config,
-    symbol_to_coin,
-    ts_to_date_utc,
-    denumpyize,
-    sort_dict_keys,
-    calc_hash,
-    flatten,
-    date_to_ts,
-)
-from procedures import (
-    make_get_filepath,
-    utc_ms,
     load_hjson_config,
     load_config,
     format_config,
     add_arguments_recursively,
     update_config_with_args,
 )
-from downloader import add_all_eligible_coins_to_config
+from pure_funcs import (
+    denumpyize,
+    sort_dict_keys,
+    calc_hash,
+    flatten,
+)
+from utils import date_to_ts, ts_to_date_utc, utc_ms, make_get_filepath, format_approved_ignored_coins
 from copy import deepcopy
 from main import manage_rust_compilation
 import numpy as np
@@ -669,7 +664,7 @@ class Evaluator:
             self.seen_hashes[individual_hash] = None
         analyses = {}
         for exchange in self.exchanges:
-            bot_params, _, _ = prep_backtest_args(
+            bot_params_list, _, _ = prep_backtest_args(
                 config,
                 [],
                 exchange,
@@ -682,7 +677,7 @@ class Evaluator:
                 self.hlcvs_dtypes[exchange].str,
                 self.btc_usd_shared_memory_files[exchange],
                 self.btc_usd_dtypes[exchange].str,
-                bot_params,
+                bot_params_list,
                 self.exchange_params[exchange],
                 self.backtest_params[exchange],
             )
@@ -771,12 +766,13 @@ class Evaluator:
 
         scores = []
         for sk in sorted(self.config["optimize"]["scoring"]):
-            val = analyses_combined.get(f"{sk}_mean")
-            if val is None:
+            if modifier:
+                scores.append(modifier)
+            else:
                 val = analyses_combined.get(f"{sk}_mean")
-            if val is None:
-                return None
-            scores.append(val * self.scoring_weights[sk] + modifier)
+                if val is None:
+                    return None
+                scores.append(val * self.scoring_weights[sk])
         return tuple(scores)
 
     def __del__(self):
@@ -900,10 +896,9 @@ async def main():
     else:
         logging.info(f"loading config {args.config_path}")
         config = load_config(args.config_path, verbose=True)
-    old_config = deepcopy(config)
     update_config_with_args(config, args)
     config = format_config(config, verbose=True)
-    await add_all_eligible_coins_to_config(config)
+    await format_approved_ignored_coins(config, config["backtest"]["exchanges"])
     try:
         # Prepare data for each exchange
         hlcvs_dict = {}

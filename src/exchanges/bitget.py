@@ -6,15 +6,17 @@ import pprint
 import asyncio
 import traceback
 import numpy as np
+from utils import utc_ms, ts_to_date_utc
 from pure_funcs import (
     multi_replace,
     floatify,
-    ts_to_date_utc,
     calc_hash,
     shorten_custom_id,
 )
-from njit_funcs import calc_diff
-from procedures import print_async_exception, utc_ms, assert_correct_ccxt_version
+import passivbot_rust as pbr
+
+calc_diff = pbr.calc_diff
+from procedures import print_async_exception, assert_correct_ccxt_version
 import passivbot_rust as pbr
 
 assert_correct_ccxt_version(ccxt=ccxt_async)
@@ -223,6 +225,8 @@ class BitgetBot(Passivbot):
             for h, x in with_hashes.items():
                 data_d[h] = x
                 data_d[h]["pnl"] = float(x["profit"])
+                data_d[h]["price"] = float(x["price"])
+                data_d[h]["amount"] = float(x["baseVolume"])
                 data_d[h]["id"] = x["tradeId"]
                 data_d[h]["timestamp"] = float(x["cTime"])
                 data_d[h]["datetime"] = ts_to_date_utc(data_d[h]["timestamp"])
@@ -303,39 +307,15 @@ class BitgetBot(Passivbot):
         all_res_list = sorted(all_res.values(), key=lambda x: x["timestamp"])
         return all_res_list
 
-    async def execute_cancellation(self, order: dict) -> dict:
-        executed = None
-        try:
-            executed = await self.cca.cancel_order(order["id"], symbol=order["symbol"])
-            return executed
-        except Exception as e:
-            logging.error(f"error cancelling order {order} {e}")
-            print_async_exception(executed)
-            traceback.print_exc()
-            return {}
-
-    async def execute_cancellations(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_cancellation")
-
-    async def execute_order(self, order: dict) -> dict:
-        order_type = order["type"] if "type" in order else "limit"
-        executed = await self.cca.create_order(
-            symbol=order["symbol"],
-            type=order_type,
-            side=order["side"],
-            amount=abs(order["qty"]),
-            price=order["price"],
-            params={
-                "timeInForce": "PO" if self.config["live"]["time_in_force"] == "post_only" else "GTC",
-                "holdSide": order["position_side"],
-                "reduceOnly": order["reduce_only"],
-                "oneWayMode": False,
-            },
-        )
-        return executed
-
-    async def execute_orders(self, orders: [dict]) -> [dict]:
-        return await self.execute_multiple(orders, "execute_order")
+    def get_order_execution_params(self, order: dict) -> dict:
+        # defined for each exchange
+        return {
+            "timeInForce": "PO" if self.config["live"]["time_in_force"] == "post_only" else "GTC",
+            "holdSide": order["position_side"],
+            "reduceOnly": order["reduce_only"],
+            "oneWayMode": False,
+            "clientOid": order["custom_id"],
+        }
 
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call_lev, coros_to_call_margin_mode = {}, {}
@@ -351,7 +331,9 @@ class BitgetBot(Passivbot):
                 logging.error(f"{symbol}: error setting cross mode {e}")
             try:
                 coros_to_call_lev[symbol] = asyncio.create_task(
-                    self.cca.set_leverage(int(self.live_configs[symbol]["leverage"]), symbol=symbol)
+                    self.cca.set_leverage(
+                        int(self.config_get(["live", "leverage"], symbol=symbol)), symbol=symbol
+                    )
                 )
             except Exception as e:
                 logging.error(f"{symbol}: a error setting leverage {e}")
@@ -398,15 +380,6 @@ class BitgetBot(Passivbot):
         except Exception as e:
             logging.error(f"error setting hedge mode {e} {res}")
 
-    def format_custom_ids(self, orders: [dict]) -> [dict]:
-        # bitget needs broker code plus '#' at the beginning of the custom_id
-        new_orders = []
-        for order in orders:
-            order["custom_id"] = (
-                self.broker_code
-                + "#"
-                + shorten_custom_id(order["custom_id"] if "custom_id" in order else "")
-                + uuid4().hex
-            )[: self.custom_id_max_length]
-            new_orders.append(order)
-        return new_orders
+    def format_custom_id_single(self, order_type_id: int) -> str:
+        formatted = super().format_custom_id_single(order_type_id)
+        return (self.broker_code + "#" + formatted)[: self.custom_id_max_length]

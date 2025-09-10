@@ -1,14 +1,8 @@
 use crate::entries::calc_min_entry_qty;
 use crate::types::{
-    BotParams, BotParamsPair, EMABands, ExchangeParams, Order, OrderType, Position, Positions,
-    StateParams, TrailingPriceBundle,
+    BotParams, ExchangeParams, Order, OrderType, Position, StateParams, TrailingPriceBundle,
 };
-use crate::utils::{
-    calc_pprice_diff_int, calc_wallet_exposure, cost_to_qty, interpolate, round_, round_dn,
-    round_up,
-};
-use ndarray::{Array1, Array2};
-use std::collections::HashMap;
+use crate::utils::{calc_wallet_exposure, cost_to_qty, interpolate, round_, round_dn, round_up};
 
 pub fn calc_close_qty(
     exchange_params: &ExchangeParams,
@@ -313,7 +307,7 @@ pub fn calc_next_close_long(
                 trailing_allocation = 0.0;
             }
             let grid_allocation = round_(
-                position.size - trailing_allocation,
+                (position.size - trailing_allocation) * 1.01, // add 1% to avoid hitting the threshold exactly
                 exchange_params.qty_step,
             );
             let position_mod = Position {
@@ -340,8 +334,10 @@ pub fn calc_next_close_long(
             if grid_allocation < min_entry_qty {
                 grid_allocation = 0.0;
             }
-            let trailing_allocation =
-                round_(position.size - grid_allocation, exchange_params.qty_step);
+            let trailing_allocation = round_(
+                (position.size - grid_allocation) * 1.01,
+                exchange_params.qty_step,
+            );
             let position_mod = Position {
                 size: f64::min(position.size, f64::max(trailing_allocation, min_entry_qty)),
                 price: position.price,
@@ -632,7 +628,7 @@ pub fn calc_next_close_short(
                 trailing_allocation = 0.0;
             }
             let grid_allocation = round_(
-                position_size_abs - trailing_allocation,
+                (position_size_abs - trailing_allocation) * 1.01,
                 exchange_params.qty_step,
             );
             let position_mod = Position {
@@ -659,7 +655,7 @@ pub fn calc_next_close_short(
                 grid_allocation = 0.0;
             }
             let trailing_allocation = round_(
-                position_size_abs - grid_allocation,
+                (position_size_abs - grid_allocation) * 1.01,
                 exchange_params.qty_step,
             );
             let position_mod = Position {
