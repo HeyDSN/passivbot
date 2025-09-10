@@ -9,27 +9,33 @@ from tools.event_loop_policy import set_windows_event_loop_policy
 set_windows_event_loop_policy()
 import asyncio
 import argparse
-
-from procedures import (
-    utc_ms,
-    make_get_filepath,
-    fetch_market_specific_settings_multi,
+from config_utils import (
     load_config,
     dump_config,
     add_arguments_recursively,
     update_config_with_args,
     format_config,
+    get_template_live_config,
+    parse_overrides,
+)
+from utils import (
+    utc_ms,
+    make_get_filepath,
+    load_markets,
     format_end_date,
+    format_approved_ignored_coins,
 )
 from pure_funcs import (
-    get_template_live_config,
     ts_to_date,
     sort_dict_keys,
     calc_hash,
 )
 import pprint
 from copy import deepcopy
-from downloader import prepare_hlcvs, prepare_hlcvs_combined, add_all_eligible_coins_to_config
+from downloader import (
+    prepare_hlcvs,
+    prepare_hlcvs_combined,
+)
 from pathlib import Path
 from plotting import plot_fills_forager
 from collections import defaultdict
@@ -295,12 +301,26 @@ async def prepare_hlcvs_mss(config, exchange):
 
 def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_params=None):
     coins = sorted(set(config["backtest"]["coins"][exchange]))
-    bot_params = {k: config["bot"][k].copy() for k in ["long", "short"]}
-    for pside in bot_params:
-        n_positions = max(0, min(bot_params[pside]["n_positions"], len(coins)))
-        bot_params[pside]["wallet_exposure_limit"] = (
-            bot_params[pside]["total_wallet_exposure_limit"] / n_positions if n_positions > 0 else 0.0
-        )
+    bot_params_list = []
+    bot_params_template = deepcopy(config["bot"])
+    for coin in coins:
+        coin_specific_bot_params = deepcopy(bot_params_template)
+        if coin in config.get("coin_overrides", {}):
+            for pside in ["long", "short"]:
+                for key in config["coin_overrides"][coin].get("bot", {}).get(pside, {}):
+                    coin_specific_bot_params[pside][key] = config["coin_overrides"][coin]["bot"][
+                        pside
+                    ][key]
+                coin_specific_bot_params[pside]["is_forced_active"] = (
+                    config["coin_overrides"].get("live", {}).get(f"forced_mode_{pside}", "")
+                    == "normal"
+                )
+        for pside in ["long", "short"]:
+            if "wallet_exposure_limit" not in config["coin_overrides"].get(coin, {}).get(
+                "bot", {}
+            ).get(pside, {}):
+                coin_specific_bot_params[pside]["wallet_exposure_limit"] = -1.0
+        bot_params_list.append(coin_specific_bot_params)
     if exchange_params is None:
         exchange_params = [
             {k: mss[coin][k] for k in ["qty_step", "price_step", "min_qty", "min_cost", "c_mult"]}
@@ -313,7 +333,7 @@ def prep_backtest_args(config, mss, exchange, exchange_params=None, backtest_par
             "coins": coins,
             "use_btc_collateral": config["backtest"].get("use_btc_collateral", False),
         }
-    return bot_params, exchange_params, backtest_params
+    return bot_params_list, exchange_params, backtest_params
 
 
 def expand_analysis(analysis_usd, analysis_btc, fills, config):
@@ -344,7 +364,7 @@ def expand_analysis(analysis_usd, analysis_btc, fills, config):
 
 
 def run_backtest(hlcvs, mss, config: dict, exchange: str, btc_usd_prices):
-    bot_params, exchange_params, backtest_params = prep_backtest_args(config, mss, exchange)
+    bot_params_list, exchange_params, backtest_params = prep_backtest_args(config, mss, exchange)
     if not config["backtest"]["use_btc_collateral"]:
         btc_usd_prices = np.ones(len(btc_usd_prices))
     logging.info(f"Backtesting {exchange}...")
@@ -360,7 +380,7 @@ def run_backtest(hlcvs, mss, config: dict, exchange: str, btc_usd_prices):
             hlcvs.dtype.str,
             btc_usd_shared_memory_file,
             btc_usd_prices.dtype.str,
-            bot_params,
+            bot_params_list,
             exchange_params,
             backtest_params,
         )
@@ -424,12 +444,19 @@ def plot_forager(
 ):
     plots_dir = make_get_filepath(oj(results_path, "fills_plots", ""))
     plt.clf()
-    bal_eq[["balance", "equity"]].plot()
+    bal_eq[["balance", "equity"]].plot(logy=False)
     plt.savefig(oj(results_path, "balance_and_equity.png"))
+    plt.clf()
+    bal_eq[["balance", "equity"]].plot(logy=True)
+    plt.savefig(oj(results_path, "balance_and_equity_logy.png"))
+    plt.clf()
     if config["backtest"]["use_btc_collateral"]:
         plt.clf()
-        bal_eq[["balance_btc", "equity_btc"]].plot()
+        bal_eq[["balance_btc", "equity_btc"]].plot(logy=False)
         plt.savefig(oj(results_path, "balance_and_equity_btc.png"))
+        plt.clf()
+        bal_eq[["balance_btc", "equity_btc"]].plot(logy=True)
+        plt.savefig(oj(results_path, "balance_and_equity_btc_logy.png"))
 
     if not config["disable_plotting"]:
         for i, coin in enumerate(config["backtest"]["coins"][exchange]):
@@ -480,7 +507,10 @@ async def main():
         config = load_config(args.config_path)
     update_config_with_args(config, args)
     config = format_config(config, verbose=False)
-    await add_all_eligible_coins_to_config(config)
+    for ex in config["backtest"]["exchanges"]:
+        await load_markets(ex)
+    config = parse_overrides(config, verbose=True)
+    await format_approved_ignored_coins(config, config["backtest"]["exchanges"])
     config["disable_plotting"] = args.disable_plotting
     config["backtest"]["cache_dir"] = {}
     config["backtest"]["coins"] = {}

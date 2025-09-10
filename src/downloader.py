@@ -10,6 +10,7 @@ import shutil
 import sys
 import traceback
 import zipfile
+import re
 from collections import deque
 from functools import wraps
 from io import BytesIO
@@ -27,22 +28,31 @@ import numpy as np
 import pandas as pd
 from dateutil import parser
 from tqdm import tqdm
-from pure_funcs import (
-    date_to_ts,
-    ts_to_date_utc,
-    safe_filename,
-    symbol_to_coin,
-    get_template_live_config,
-    coin_to_symbol,
-)
-from procedures import (
-    make_get_filepath,
-    format_end_date,
-    utc_ms,
-    get_file_mod_utc,
-    get_first_timestamps_unified,
+from config_utils import (
     add_arguments_recursively,
     load_config,
+    get_template_live_config,
+    update_config_with_args,
+)
+from pure_funcs import (
+    safe_filename,
+)
+from utils import (
+    make_get_filepath,
+    utc_ms,
+    format_end_date,
+    ts_to_date_utc,
+    date_to_ts,
+    get_file_mod_utc,
+    normalize_exchange_name,
+    get_quote,
+    symbol_to_coin,
+    coin_to_symbol,
+    load_markets,
+    format_approved_ignored_coins,
+)
+from procedures import (
+    get_first_timestamps_unified,
 )
 
 # ========================= CONFIGURABLES & GLOBALS =========================
@@ -142,7 +152,7 @@ def fill_gaps_in_ohlcvs(df):
     return new_df.reset_index().rename(columns={"index": "timestamp"})
 
 
-def attempt_gap_fix_ohlcvs(df, symbol=None):
+def attempt_gap_fix_ohlcvs(df, symbol=None, verbose=True):
     interval = 60_000
     max_hours = 12
     max_gap = interval * 60 * max_hours
@@ -151,7 +161,7 @@ def attempt_gap_fix_ohlcvs(df, symbol=None):
         return df
     if greatest_gap > max_gap:
         raise Exception(f"Huge gap in data for {symbol}: {greatest_gap/(1000*60*60)} hours.")
-    if self.verbose:
+    if verbose:
         logging.info(
             f"Filling small gaps in {symbol}. Largest gap: {greatest_gap/(1000*60*60):.3f} hours."
         )
@@ -225,14 +235,74 @@ async def get_zip_bitget(url):
 
 
 def ensure_millis(df):
+    """
+    Normalize a DataFrame's 'timestamp' column to milliseconds.
+
+    Heuristic:
+    - If no valid (non-zero, finite) timestamps exist, assume timestamps are already ms.
+    - If there are multiple unique timestamps, use the median difference between unique timestamps:
+      if the median difference is a multiple of 1000 (within a small tolerance), treat timestamps as ms.
+      Otherwise treat them as seconds and multiply by 1000.
+    - If only one non-zero timestamp exists, fall back to magnitude-based detection using epoch-scale
+      thresholds:
+        - >= 1e15 -> microseconds
+        - >= 1e12 -> milliseconds
+        - >= 1e9  -> seconds
+        - <  1e9  -> assume milliseconds (likely small ms values)
+    This avoids mis-detecting when the first timestamp is 0 (which previously caused incorrect scaling).
+    """
     if "timestamp" not in df.columns:
         return df
-    if df.timestamp.iloc[0] > 1e14:  # is microseconds
-        df.timestamp /= 1000
-    elif df.timestamp.iloc[0] > 1e11:  # is milliseconds
+
+    # Work with a float copy for robust numeric checks
+    try:
+        ts = df["timestamp"].astype("float64").values
+    except Exception:
+        # If casting fails, leave unchanged
+        return df
+
+    # Identify finite, non-zero timestamps to base heuristics on
+    finite_mask = np.isfinite(ts) & (ts != 0)
+    if not finite_mask.any():
+        # All timestamps are zero or invalid — assume already in milliseconds
+        return df
+
+    non_zero_ts = ts[finite_mask]
+    uniq = np.unique(non_zero_ts)
+
+    if uniq.size > 1:
+        # Use median diff between unique timestamps to determine units.
+        diffs = np.diff(uniq)
+        median_diff = float(np.median(diffs))
+
+        # If median_diff is a clean multiple of 1000, it's likely millisecond data (1 minute = 60000, etc).
+        if abs(median_diff - round(median_diff / 1000.0) * 1000.0) < 1e-6:
+            return df  # already milliseconds
+        else:
+            # Likely seconds -> convert to milliseconds
+            df["timestamp"] = df["timestamp"] * 1000.0
+            return df
+
+    # Fallback: single representative timestamp -> magnitude-based detection
+    rep = float(np.abs(non_zero_ts).max())
+
+    # Epoch magnitude thresholds (approx):
+    # - seconds:      ~1e9
+    # - milliseconds: ~1e12
+    # - microseconds: ~1e15
+    if rep >= 1e15:
+        # microseconds -> convert to milliseconds
+        df["timestamp"] = df["timestamp"] / 1000.0
+    elif rep >= 1e12:
+        # already milliseconds
         pass
-    else:  # is seconds
-        df.timestamp *= 1000
+    elif rep >= 1e9:
+        # seconds -> convert to milliseconds
+        df["timestamp"] = df["timestamp"] * 1000.0
+    else:
+        # small magnitudes (< 1e9) are assumed to already be milliseconds (e.g., 60000)
+        pass
+
     return df
 
 
@@ -250,8 +320,8 @@ class OHLCVManager:
         gap_tolerance_ohlcvs_minutes=120.0,
         verbose=True,
     ):
-        self.exchange = "binanceusdm" if exchange == "binance" else exchange
-        self.quote = "USDC" if exchange == "hyperliquid" else "USDT"
+        self.exchange = normalize_exchange_name(exchange)
+        self.quote = get_quote(exchange)
         self.start_date = "2020-01-01" if start_date is None else format_end_date(start_date)
         self.end_date = format_end_date("now" if end_date is None else end_date)
         self.start_ts = date_to_ts(self.start_date)
@@ -289,11 +359,7 @@ class OHLCVManager:
 
     def get_symbol(self, coin):
         assert self.markets, "needs to call self.load_markets() first"
-        return coin_to_symbol(
-            coin,
-            {k for k in self.markets if self.markets[k]["swap"] and k.endswith(f":{self.quote}")},
-            self.quote,
-        )
+        return coin_to_symbol(coin, self.exchange)
 
     def get_market_specific_settings(self, coin):
         mss = self.markets[self.get_symbol(coin)]
@@ -316,6 +382,10 @@ class OHLCVManager:
             mss["taker"] = mss["taker_fee"] = 0.00055
         elif self.exchange == "bitget":
             pass
+        elif self.exchange in ("kucoin", "kucoinfutures"):
+            # ccxt reports incorrect fees for kucoin futures. Assume VIP0
+            mss["maker"] = mss["maker_fee"] = 0.0002
+            mss["taker"] = mss["taker_fee"] = 0.0006
         elif self.exchange == "gateio":
             # ccxt reports incorrect fees for gateio perps. Assume VIP0
             mss["maker"] = mss["maker_fee"] = 0.0002
@@ -404,6 +474,8 @@ class OHLCVManager:
             await self.download_ohlcvs_bybit(coin)
         elif self.exchange == "bitget":
             await self.download_ohlcvs_bitget(coin)
+        elif self.exchange in ("kucoin", "kucoinfutures"):
+            await self.download_ohlcvs_kucoin(coin)
         elif self.exchange == "gateio":
             if self.cc is None:
                 self.load_cc()
@@ -442,6 +514,9 @@ class OHLCVManager:
                 ohlcvs = await self.cc.fetch_ohlcv(
                     self.get_symbol(coin), since=int(date_to_ts("2020-01-01")), timeframe="1d"
                 )
+        elif self.exchange in ("kucoin", "kucoinfutures"):
+            fts = await self.find_first_day_kucoin(coin)
+            return fts
         elif self.exchange == "bitget":
             fts = await self.find_first_day_bitget(coin)
             return fts
@@ -459,11 +534,13 @@ class OHLCVManager:
 
     async def load_markets(self):
         self.load_cc()
-        self.markets = self.load_markets_from_cache()
-        if self.markets:
-            return
-        self.markets = await self.cc.load_markets()
-        self.dump_markets_to_cache()
+        self.markets = await load_markets(self.exchange, verbose=False)
+        # Populate the ccxt client's markets without incurring another network call if possible
+        try:
+            if hasattr(self.cc, "set_markets"):
+                self.cc.set_markets(self.markets)
+        except Exception:
+            pass
 
     def load_markets_from_cache(self, max_age_ms=1000 * 60 * 60 * 24):
         try:
@@ -810,7 +887,7 @@ class OHLCVManager:
             prev_day = earliest - datetime.timedelta(days=1)
             prev_url = self.get_url_bitget(base_url, symbol, prev_day.strftime("%Y%m%d"))
             try:
-                await check_rate_limit()
+                await self.check_rate_limit()
                 async with aiohttp.ClientSession() as session:
                     async with session.head(prev_url) as response:
                         if response.status == 200:
@@ -824,6 +901,134 @@ class OHLCVManager:
             self.dump_first_timestamp(coin, fts)
             return fts
         return None
+
+    async def download_ohlcvs_kucoin(self, coin: str):
+        # KuCoin has public data archives for futures
+        missing_days = await self.get_missing_days_ohlcvs(coin)
+        if not missing_days:
+            return
+        symbolf = self.get_symbol(coin).replace("/USDT:", "") + "M"
+        dirpath = make_get_filepath(os.path.join(self.cache_filepaths["ohlcvs"], coin, ""))
+        tasks = []
+        for day in sorted(missing_days):
+            fpath = os.path.join(dirpath, day + ".npy")
+            await self.check_rate_limit()
+            tasks.append(asyncio.create_task(self.download_single_kucoin(symbolf, day, fpath)))
+        for task in tasks:
+            try:
+                await task
+            except Exception as e:
+                logging.error(f"kucoin Error with downloader for {coin} {e}")
+
+    async def download_single_kucoin(self, symbolf: str, day: str, fpath: str):
+        url = f"https://historical-data.kucoin.com/data/futures/daily/klines/{symbolf}/1m/{symbolf}-1m-{day}.zip"
+        try:
+            zips = await fetch_zips(url)
+            if not zips:
+                if self.verbose:
+                    logging.info(f"kucoin No data at {url}")
+                return
+            dfs = []
+            for z in zips:
+                df = pd.read_csv(z)
+                df.columns = [c.strip().lower() for c in df.columns]
+                if "time" in df.columns:
+                    df = df.rename(columns={"time": "timestamp"})
+                required = ["timestamp", "open", "high", "low", "close", "volume"]
+                missing = [c for c in required if c not in df.columns]
+                if missing:
+                    raise Exception(f"kucoin missing columns {missing} in {url}")
+                dfs.append(df[required])
+            dfc = pd.concat(dfs, ignore_index=True)
+            # Cast and sort
+            for c in ["timestamp", "open", "high", "low", "close", "volume"]:
+                dfc[c] = pd.to_numeric(dfc[c], errors="coerce")
+            dfc = dfc.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            # Normalize timestamp to ms
+            dfc = ensure_millis(dfc)
+            # Clip to day and fill minute gaps
+            start_ts_day = date_to_ts(day)
+            end_ts_day = start_ts_day + 24 * 60 * 60 * 1000
+            dfc = dfc[(dfc["timestamp"] >= start_ts_day) & (dfc["timestamp"] < end_ts_day)]
+            if dfc.empty:
+                if self.verbose:
+                    logging.info(f"kucoin Empty filtered dataframe for {symbolf} {day}")
+                return
+            # Deduplicate by timestamp
+            dfc = dfc.drop_duplicates(subset=["timestamp"], keep="last")
+            # Reindex to full 1m grid and fill
+            expected_ts = np.arange(start_ts_day, end_ts_day, 60000)
+            dfc = dfc.set_index("timestamp").reindex(expected_ts)
+            dfc["close"] = dfc["close"].ffill()
+            for col in ["open", "high", "low"]:
+                dfc[col] = dfc[col].fillna(dfc["close"])
+            dfc["volume"] = dfc["volume"].fillna(0.0)
+            dfc = dfc.reset_index().rename(columns={"index": "timestamp"})
+            if len(dfc) == 1440:
+                dump_ohlcv_data(ensure_millis(dfc), fpath)
+                if self.verbose:
+                    logging.info(f"kucoin Dumped daily data {fpath}")
+            else:
+                if self.verbose:
+                    logging.info(f"kucoin incomplete daily data for {symbolf} {day}: {len(dfc)} rows")
+        except Exception as e:
+            logging.error(f"kucoin Failed to download {url}: {e}")
+            traceback.print_exc()
+
+    async def find_first_day_kucoin(self, coin: str, start_year=2019) -> float:
+        """Find first day where data is available for a given symbol on KuCoin futures"""
+        if fts := self.load_first_timestamp(coin):
+            return fts
+        if not self.markets:
+            await self.load_markets()
+        symbolf = self.get_symbol(coin).replace("/USDT:", "") + "M"
+        base_url = "https://historical-data.kucoin.com/data/futures/daily/klines/"
+        start = datetime.datetime(start_year, 1, 1)
+        end = datetime.datetime.utcnow()
+        earliest = None
+
+        while start <= end:
+            mid = start + (end - start) // 2
+            day = mid.strftime("%Y-%m-%d")
+            url = f"{base_url}{symbolf}/1m/{symbolf}-1m-{day}.zip"
+            try:
+                await self.check_rate_limit()
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(url) as response:
+                        if self.verbose:
+                            logging.info(
+                                f"kucoin, searching for first day of data for {symbolf} {day}"
+                            )
+                        if response.status == 200:
+                            earliest = mid
+                            end = mid - datetime.timedelta(days=1)
+                        else:
+                            start = mid + datetime.timedelta(days=1)
+            except Exception:
+                start = mid + datetime.timedelta(days=1)
+
+        if earliest:
+            prev_day = earliest - datetime.timedelta(days=1)
+            prev_day_str = prev_day.strftime("%Y-%m-%d")
+            prev_url = f"{base_url}{symbolf}/1m/{symbolf}-1m-{prev_day_str}.zip"
+            try:
+                await self.check_rate_limit()
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(prev_url) as response:
+                        if response.status == 200:
+                            earliest = prev_day
+            except Exception:
+                pass
+            fts = date_to_ts(earliest.strftime("%Y-%m-%d"))
+            self.dump_first_timestamp(coin, fts)
+            if self.verbose:
+                logging.info(
+                    f"KuCoin, found first day for {symbolf}: {earliest.strftime('%Y-%m-%d')}"
+                )
+            return fts
+        fts = 0.0
+        self.dump_first_timestamp(coin, fts)
+        return fts
 
     async def download_ohlcvs_gateio(self, coin: str):
         # GateIO doesn't have public data archives, but has ohlcvs via REST API
@@ -918,8 +1123,7 @@ async def prepare_hlcvs(config: dict, exchange: str):
         set([symbol_to_coin(c) for c in config["live"]["approved_coins"]["long"]])
         | set([symbol_to_coin(c) for c in config["live"]["approved_coins"]["short"]])
     )
-    if exchange == "binance":
-        exchange = "binanceusdm"
+    exchange = normalize_exchange_name(exchange)
     start_date = config["backtest"]["start_date"]
     end_date = format_end_date(config["backtest"]["end_date"])
 
@@ -982,7 +1186,12 @@ async def prepare_hlcvs_internal(config, coins, exchange, start_date, end_date, 
             logging.info(f"coin {coin} missing from first_timestamps_unified, skipping")
             continue
         if minimum_coin_age_days > 0.0:
-            first_ts = await om.get_first_timestamp(coin)
+            try:
+                first_ts = await om.get_first_timestamp(coin)
+            except Exception as e:
+                logging.error(f"error with get_first_timestamp for {coin} {e}. Skipping")
+                traceback.print_exc()
+                continue
             if first_ts >= end_ts:
                 logging.info(
                     f"{exchange} Coin {coin} too young, start date {ts_to_date_utc(first_ts)}. Skipping"
@@ -1084,9 +1293,7 @@ async def prepare_hlcvs_internal(config, coins, exchange, start_date, end_date, 
 
 
 async def prepare_hlcvs_combined(config):
-    exchanges_to_consider = [
-        "binanceusdm" if e == "binance" else e for e in config["backtest"]["exchanges"]
-    ]
+    exchanges_to_consider = [normalize_exchange_name(e) for e in config["backtest"]["exchanges"]]
     om_dict = {}
     for ex in exchanges_to_consider:
         om_dict[ex] = OHLCVManager(
@@ -1352,6 +1559,7 @@ async def fetch_data_for_coin_and_exchange(
         df = await om.get_ohlcvs(coin)
     except Exception as e:
         logging.warning(f"Error retrieving {coin} from {ex}: {e}")
+        traceback.print_exc()
         return None
 
     if df.empty:
@@ -1519,37 +1727,6 @@ async def compute_exchange_volume_ratios(
     return averages
 
 
-async def add_all_eligible_coins_to_config(config):
-    path = config["live"]["approved_coins"]
-    if config["live"]["empty_means_all_approved"] and path in [
-        [""],
-        [],
-        None,
-        "",
-        0,
-        0.0,
-        {"long": [], "short": []},
-        {"long": [""], "short": [""]},
-    ]:
-        approved_coins = await get_all_eligible_coins(config["backtest"]["exchanges"])
-        config["live"]["approved_coins"] = {"long": approved_coins, "short": approved_coins}
-
-
-async def get_all_eligible_coins(exchanges):
-    oms = {}
-    for ex in exchanges:
-        oms[ex] = OHLCVManager(ex, verbose=False)
-    await asyncio.gather(*[oms[ex].load_markets() for ex in oms])
-    approved_coins = set()
-    for ex in oms:
-        for s in oms[ex].markets:
-            if oms[ex].has_coin(s):
-                coin = symbol_to_coin(s)
-                if coin:
-                    approved_coins.add(symbol_to_coin(s))
-    return sorted(approved_coins)
-
-
 async def main():
     parser = argparse.ArgumentParser(prog="downloader", description="download ohlcv data")
     parser.add_argument(
@@ -1586,14 +1763,15 @@ async def main():
     else:
         logging.info(f"loading config {args.config_path}")
         config = load_config(args.config_path)
-    await add_all_eligible_coins_to_config(config)
+    update_config_with_args(config, args)
+    await format_approved_ignored_coins(config, config["backtest"]["exchanges"])
     oms = {}
     try:
         for ex in config["backtest"]["exchanges"]:
             oms[ex] = OHLCVManager(
                 ex, config["backtest"]["start_date"], config["backtest"]["end_date"]
             )
-        logging.info("loading markets for {config['backtest']['exchanges']}")
+        logging.info(f"loading markets for {config['backtest']['exchanges']}")
         await asyncio.gather(*[oms[ex].load_markets() for ex in oms])
         coins = [x for y in config["live"]["approved_coins"].values() for x in y]
         for coin in sorted(set(coins)):

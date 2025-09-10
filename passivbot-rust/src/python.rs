@@ -1,26 +1,25 @@
-use crate::backtest::{analyze_backtest_pair, Backtest};
+use crate::analysis::analyze_backtest_pair;
+use crate::backtest::Backtest;
 use crate::closes::{
     calc_closes_long, calc_closes_short, calc_next_close_long, calc_next_close_short,
 };
 use crate::entries::{
     calc_entries_long, calc_entries_short, calc_next_entry_long, calc_next_entry_short,
 };
+use crate::types::OrderType;
 use crate::types::{
-    Analysis, BacktestParams, BotParams, BotParamsPair, EMABands, Equities, ExchangeParams, Order,
-    OrderBook, Position, StateParams, TrailingPriceBundle,
+    BacktestParams, BotParams, BotParamsPair, EMABands, ExchangeParams, OrderBook, Position,
+    StateParams, TrailingPriceBundle,
 };
 use memmap::MmapOptions;
-use ndarray::{Array1, Array2, Array3, Array4, ArrayBase, ArrayD, ArrayView, ShapeBuilder};
-use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyReadonlyArray2, PyReadonlyArray3,
-    PyReadonlyArray4,
-};
+use ndarray::{Array1, Array2, ArrayView};
+use numpy::{IntoPyArray, PyArray1, PyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use pyo3::wrap_pyfunction;
 use serde::Serialize;
-use std::{fs::File, slice};
+use std::fs::File;
+use std::str::FromStr;
 
 #[pyfunction]
 pub fn run_backtest(
@@ -29,7 +28,7 @@ pub fn run_backtest(
     hlcvs_dtype: &str,                  // Dtype of HLCV data
     btc_usd_shared_memory_file: &str,   // New BTC/USD shared memory file
     btc_usd_dtype: &str,                // Dtype of BTC/USD data
-    bot_params_pair_dict: &PyDict,      // Bot parameters
+    bot_params: &PyAny,                 // Bot parameters per coin
     exchange_params_list: &PyAny,       // Exchange parameters
     backtest_params_dict: &PyDict,      // Backtest parameters
 ) -> PyResult<(
@@ -80,8 +79,18 @@ pub fn run_backtest(
         )));
     }
 
-    // Prepare bot, exchange, and backtest parameters
-    let bot_params_pair = bot_params_pair_from_dict(bot_params_pair_dict)?;
+    let bot_params_py_list = bot_params
+        .downcast::<PyList>()
+        .map_err(|_| PyValueError::new_err("bot_params must be a list[dict] (one per coin)"))?;
+
+    let mut bot_params_vec = Vec::with_capacity(bot_params_py_list.len());
+    for item in bot_params_py_list {
+        let dict = item
+            .downcast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("each bot_params element must be a dict"))?;
+        bot_params_vec.push(bot_params_pair_from_dict(dict)?);
+    }
+
     let exchange_params = {
         let mut params_vec = Vec::new();
         if let Ok(py_list) = exchange_params_list.downcast::<PyList>() {
@@ -107,7 +116,7 @@ pub fn run_backtest(
     let mut backtest = Backtest::new(
         &hlcvs_rust,
         &btc_usd_rust,
-        bot_params_pair,
+        bot_params_vec,
         exchange_params,
         &backtest_params,
     );
@@ -138,10 +147,14 @@ pub fn run_backtest(
             py_fills[(i, 12)] = fill.order_type.to_string().into_py(py);
         }
 
-        let py_equities_usd = Array1::from_vec(equities.usd).into_pyarray(py).to_owned();
-        let py_equities_btc = Array1::from_vec(equities.btc).into_pyarray(py).to_owned();
+        let py_equities_usd = Array1::from_vec(equities.usd)
+            .into_pyarray_bound(py)
+            .unbind();
+        let py_equities_btc = Array1::from_vec(equities.btc)
+            .into_pyarray_bound(py)
+            .unbind();
         Ok((
-            py_fills.into_pyarray(py).to_owned(),
+            py_fills.into_pyarray_bound(py).unbind(),
             py_equities_usd,
             py_equities_btc,
             py_analysis_usd.into(),
@@ -262,7 +275,12 @@ fn extract_value<'a, T: pyo3::FromPyObject<'a>>(dict: &'a PyDict, key: &str) -> 
         .map_err(|_| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Key '{}' not found", key))
         })?
-        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Value is None"))
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Value for key '{}' is None",
+                key
+            ))
+        })
         .and_then(pyo3::FromPyObject::extract)
 }
 
@@ -288,6 +306,8 @@ pub fn calc_next_entry_long_py(
     position_price: f64,
     min_since_open: f64,
     max_since_min: f64,
+    max_since_open: f64,
+    min_since_max: f64,
     ema_bands_lower: f64,
     order_book_bid: f64,
 ) -> (f64, f64, String) {
@@ -330,7 +350,8 @@ pub fn calc_next_entry_long_py(
     let trailing_price_bundle = TrailingPriceBundle {
         min_since_open: min_since_open,
         max_since_min: max_since_min,
-        ..Default::default()
+        max_since_open: max_since_open,
+        min_since_max: min_since_max,
     };
     let next_entry = calc_next_entry_long(
         &exchange_params,
@@ -366,6 +387,8 @@ pub fn calc_next_close_long_py(
     balance: f64,
     position_size: f64,
     position_price: f64,
+    min_since_open: f64,
+    max_since_min: f64,
     max_since_open: f64,
     min_since_max: f64,
     order_book_ask: f64,
@@ -402,9 +425,10 @@ pub fn calc_next_close_long_py(
         price: position_price,
     };
     let trailing_price_bundle = TrailingPriceBundle {
+        min_since_open: min_since_open,
+        max_since_min: max_since_min,
         max_since_open: max_since_open,
         min_since_max: min_since_max,
-        ..Default::default()
     };
     let next_entry = calc_next_close_long(
         &exchange_params,
@@ -440,6 +464,8 @@ pub fn calc_next_entry_short_py(
     balance: f64,
     position_size: f64,
     position_price: f64,
+    min_since_open: f64,
+    max_since_min: f64,
     max_since_open: f64,
     min_since_max: f64,
     ema_bands_upper: f64,
@@ -482,9 +508,10 @@ pub fn calc_next_entry_short_py(
         price: position_price,
     };
     let trailing_price_bundle = TrailingPriceBundle {
+        min_since_open: min_since_open,
+        max_since_min: max_since_min,
         max_since_open: max_since_open,
         min_since_max: min_since_max,
-        ..Default::default()
     };
     let next_entry = calc_next_entry_short(
         &exchange_params,
@@ -522,6 +549,8 @@ pub fn calc_next_close_short_py(
     position_price: f64,
     min_since_open: f64,
     max_since_min: f64,
+    max_since_open: f64,
+    min_since_max: f64,
     order_book_bid: f64,
 ) -> (f64, f64, String) {
     let exchange_params = ExchangeParams {
@@ -558,7 +587,8 @@ pub fn calc_next_close_short_py(
     let trailing_price_bundle = TrailingPriceBundle {
         min_since_open: min_since_open,
         max_since_min: max_since_min,
-        ..Default::default()
+        max_since_open: max_since_open,
+        min_since_max: min_since_max,
     };
     let next_entry = calc_next_close_short(
         &exchange_params,
@@ -596,9 +626,11 @@ pub fn calc_entries_long_py(
     position_price: f64,
     min_since_open: f64,
     max_since_min: f64,
+    max_since_open: f64,
+    min_since_max: f64,
     ema_bands_lower: f64,
     order_book_bid: f64,
-) -> Vec<(f64, f64, String)> {
+) -> Vec<(f64, f64, u16)> {
     let exchange_params = ExchangeParams {
         qty_step,
         price_step,
@@ -641,7 +673,8 @@ pub fn calc_entries_long_py(
     let trailing_price_bundle = TrailingPriceBundle {
         min_since_open: min_since_open,
         max_since_min: max_since_min,
-        ..Default::default()
+        max_since_open: max_since_open,
+        min_since_max: min_since_max,
     };
     let entries = calc_entries_long(
         &exchange_params,
@@ -654,7 +687,7 @@ pub fn calc_entries_long_py(
     // Convert entries to Python-compatible format
     entries
         .into_iter()
-        .map(|order| (order.qty, order.price, order.order_type.to_string()))
+        .map(|order| (order.qty, order.price, order.order_type.id()))
         .collect()
 }
 
@@ -678,11 +711,13 @@ pub fn calc_entries_short_py(
     balance: f64,
     position_size: f64,
     position_price: f64,
+    min_since_open: f64,
+    max_since_min: f64,
     max_since_open: f64,
     min_since_max: f64,
     ema_bands_upper: f64,
     order_book_ask: f64,
-) -> Vec<(f64, f64, String)> {
+) -> Vec<(f64, f64, u16)> {
     let exchange_params = ExchangeParams {
         qty_step,
         price_step,
@@ -723,9 +758,10 @@ pub fn calc_entries_short_py(
         price: position_price,
     };
     let trailing_price_bundle = TrailingPriceBundle {
+        min_since_open: min_since_open,
+        max_since_min: max_since_min,
         max_since_open: max_since_open,
         min_since_max: min_since_max,
-        ..Default::default()
     };
     let entries = calc_entries_short(
         &exchange_params,
@@ -738,8 +774,26 @@ pub fn calc_entries_short_py(
     // Convert entries to Python-compatible format
     entries
         .into_iter()
-        .map(|order| (order.qty, order.price, order.order_type.to_string()))
+        .map(|order| (order.qty, order.price, order.order_type.id()))
         .collect()
+}
+
+#[pyfunction]
+pub fn calc_min_entry_qty_py(
+    price: f64,
+    c_mult: f64,
+    qty_step: f64,
+    min_qty: f64,
+    min_cost: f64,
+) -> f64 {
+    let exchange_params = ExchangeParams {
+        qty_step,
+        price_step: 0.0,
+        min_qty,
+        min_cost,
+        c_mult,
+    };
+    crate::entries::calc_min_entry_qty(price, &exchange_params)
 }
 
 #[pyfunction]
@@ -761,10 +815,12 @@ pub fn calc_closes_long_py(
     balance: f64,
     position_size: f64,
     position_price: f64,
+    min_since_open: f64,
+    max_since_min: f64,
     max_since_open: f64,
     min_since_max: f64,
     order_book_ask: f64,
-) -> Vec<(f64, f64, String)> {
+) -> Vec<(f64, f64, u16)> {
     let exchange_params = ExchangeParams {
         qty_step,
         price_step,
@@ -800,9 +856,10 @@ pub fn calc_closes_long_py(
         price: position_price,
     };
     let trailing_price_bundle = TrailingPriceBundle {
+        min_since_open: min_since_open,
+        max_since_min: max_since_min,
         max_since_open: max_since_open,
         min_since_max: min_since_max,
-        ..Default::default()
     };
     let closes = calc_closes_long(
         &exchange_params,
@@ -815,7 +872,7 @@ pub fn calc_closes_long_py(
     // Convert closes to Python-compatible format
     closes
         .into_iter()
-        .map(|order| (order.qty, order.price, order.order_type.to_string()))
+        .map(|order| (order.qty, order.price, order.order_type.id()))
         .collect()
 }
 
@@ -840,8 +897,10 @@ pub fn calc_closes_short_py(
     position_price: f64,
     min_since_open: f64,
     max_since_min: f64,
+    max_since_open: f64,
+    min_since_max: f64,
     order_book_bid: f64,
-) -> Vec<(f64, f64, String)> {
+) -> Vec<(f64, f64, u16)> {
     let exchange_params = ExchangeParams {
         qty_step,
         price_step,
@@ -878,7 +937,8 @@ pub fn calc_closes_short_py(
     let trailing_price_bundle = TrailingPriceBundle {
         min_since_open: min_since_open,
         max_since_min: max_since_min,
-        ..Default::default()
+        max_since_open: max_since_open,
+        min_since_max: min_since_max,
     };
     let closes = calc_closes_short(
         &exchange_params,
@@ -891,6 +951,36 @@ pub fn calc_closes_short_py(
     // Convert closes to Python-compatible format
     closes
         .into_iter()
-        .map(|order| (order.qty, order.price, order.order_type.to_string()))
+        .map(|order| (order.qty, order.price, order.order_type.id()))
         .collect()
+}
+
+#[pyfunction]
+pub fn order_type_id_to_snake(id: u16) -> PyResult<String> {
+    let ot = OrderType::try_from(id)
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("unknown order type id"))?;
+    Ok(ot.to_string())
+}
+
+#[pyfunction]
+pub fn all_order_types_ids(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    use strum::IntoEnumIterator;
+    let d = PyDict::new(py);
+    for ot in OrderType::iter() {
+        let id: u16 = ot.into();
+        d.set_item(id, ot.to_string())?;
+    }
+    Ok(d.into())
+}
+
+#[pyfunction]
+pub fn order_type_snake_to_id(name: &str) -> PyResult<u16> {
+    OrderType::from_str(name)
+        .map(|ot| ot.id())
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("unknown order type name"))
+}
+
+#[pyfunction(name = "get_order_id_type_from_string")]
+pub fn get_order_id_type_from_string_alias(name: &str) -> PyResult<u16> {
+    order_type_snake_to_id(name)
 }

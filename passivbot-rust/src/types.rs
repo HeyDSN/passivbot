@@ -1,6 +1,8 @@
+use core::str::FromStr;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::fmt;
+use strum_macros::{Display, EnumIter, EnumString};
 
 #[derive(Debug)]
 pub struct ExchangeParams {
@@ -53,16 +55,6 @@ pub struct Order {
     pub qty: f64,
     pub price: f64,
     pub order_type: OrderType,
-}
-
-impl Order {
-    pub fn new(qty: f64, price: f64, order_type: OrderType) -> Self {
-        Order {
-            qty,
-            price,
-            order_type,
-        }
-    }
 }
 
 impl Default for Order {
@@ -145,64 +137,83 @@ impl Default for TrailingPriceBundle {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[repr(u16)]
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Clone,
+    Copy,
+    IntoPrimitive,
+    TryFromPrimitive,
+    EnumString,
+    Display,
+    EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
 pub enum OrderType {
-    EntryInitialNormalLong,
-    EntryInitialPartialLong,
-    EntryTrailingNormalLong,
-    EntryTrailingCroppedLong,
-    EntryGridNormalLong,
-    EntryGridCroppedLong,
-    EntryGridInflatedLong,
+    EntryInitialNormalLong = 0,
+    EntryInitialPartialLong = 1,
+    EntryTrailingNormalLong = 2,
+    EntryTrailingCroppedLong = 3,
+    EntryGridNormalLong = 4,
+    EntryGridCroppedLong = 5,
+    EntryGridInflatedLong = 6,
 
-    CloseGridLong,
-    CloseTrailingLong,
-    CloseUnstuckLong,
-    CloseAutoReduceLong,
+    CloseGridLong = 7,
+    CloseTrailingLong = 8,
+    CloseUnstuckLong = 9,
+    CloseAutoReduceLong = 10,
 
-    EntryInitialNormalShort,
-    EntryInitialPartialShort,
-    EntryTrailingNormalShort,
-    EntryTrailingCroppedShort,
-    EntryGridNormalShort,
-    EntryGridCroppedShort,
-    EntryGridInflatedShort,
+    EntryInitialNormalShort = 11,
+    EntryInitialPartialShort = 12,
+    EntryTrailingNormalShort = 13,
+    EntryTrailingCroppedShort = 14,
+    EntryGridNormalShort = 15,
+    EntryGridCroppedShort = 16,
+    EntryGridInflatedShort = 17,
 
-    CloseGridShort,
-    CloseTrailingShort,
-    CloseUnstuckShort,
-    CloseAutoReduceShort,
+    CloseGridShort = 18,
+    CloseTrailingShort = 19,
+    CloseUnstuckShort = 20,
+    CloseAutoReduceShort = 21,
 
-    Empty,
+    ClosePanicLong = 22,
+    ClosePanicShort = 23,
+
+    Empty = 65535,
 }
 
-impl fmt::Display for OrderType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            OrderType::EntryInitialNormalLong => write!(f, "entry_initial_normal_long"),
-            OrderType::EntryInitialPartialLong => write!(f, "entry_initial_partial_long"),
-            OrderType::EntryTrailingNormalLong => write!(f, "entry_trailing_normal_long"),
-            OrderType::EntryTrailingCroppedLong => write!(f, "entry_trailing_cropped_long"),
-            OrderType::EntryGridNormalLong => write!(f, "entry_grid_normal_long"),
-            OrderType::EntryGridCroppedLong => write!(f, "entry_grid_cropped_long"),
-            OrderType::EntryGridInflatedLong => write!(f, "entry_grid_inflated_long"),
-            OrderType::CloseGridLong => write!(f, "close_grid_long"),
-            OrderType::CloseTrailingLong => write!(f, "close_trailing_long"),
-            OrderType::CloseUnstuckLong => write!(f, "close_unstuck_long"),
-            OrderType::CloseAutoReduceLong => write!(f, "close_auto_reduce_long"),
-            OrderType::EntryInitialNormalShort => write!(f, "entry_initial_normal_short"),
-            OrderType::EntryInitialPartialShort => write!(f, "entry_initial_partial_short"),
-            OrderType::EntryTrailingNormalShort => write!(f, "entry_trailing_normal_short"),
-            OrderType::EntryTrailingCroppedShort => write!(f, "entry_trailing_cropped_short"),
-            OrderType::EntryGridNormalShort => write!(f, "entry_grid_normal_short"),
-            OrderType::EntryGridCroppedShort => write!(f, "entry_grid_cropped_short"),
-            OrderType::EntryGridInflatedShort => write!(f, "entry_grid_inflated_short"),
-            OrderType::CloseGridShort => write!(f, "close_grid_short"),
-            OrderType::CloseTrailingShort => write!(f, "close_trailing_short"),
-            OrderType::CloseUnstuckShort => write!(f, "close_unstuck_short"),
-            OrderType::CloseAutoReduceShort => write!(f, "close_auto_reduce_short"),
-            OrderType::Empty => write!(f, "empty"),
-        }
+impl OrderType {
+    #[inline]
+    pub const fn id(self) -> u16 {
+        self as u16
+    }
+    #[inline]
+    pub fn from_snake(s: &str) -> Option<Self> {
+        OrderType::from_str(s).ok()
+    }
+}
+
+impl OrderType {
+    #[inline]
+    pub const fn is_long(self) -> bool {
+        use OrderType::*;
+        matches!(
+            self,
+            EntryInitialNormalLong
+                | EntryInitialPartialLong
+                | EntryTrailingNormalLong
+                | EntryTrailingCroppedLong
+                | EntryGridNormalLong
+                | EntryGridCroppedLong
+                | EntryGridInflatedLong
+                | CloseGridLong
+                | CloseTrailingLong
+                | CloseUnstuckLong
+                | CloseAutoReduceLong
+                | ClosePanicLong
+        )
     }
 }
 

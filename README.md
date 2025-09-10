@@ -1,10 +1,10 @@
 ![Passivbot](docs/images/pbot_logo_full.svg)
 
-# Trading bot running on Bybit, OKX, Bitget, GateIO, Binance and Hyperliquid
+# Trading bot running on Bybit, OKX, Bitget, GateIO, Binance, Kucoin and Hyperliquid
 
 :warning: **Used at one's own risk** :warning:
 
-v7.3.13
+v7.3.21
 
 
 ## Overview
@@ -57,14 +57,31 @@ After installation, restart the terminal or command prompt.
 
 Create a virtual environment to manage dependencies:
 
+ **Linux/macOS:**
 ```sh
 python3 -m venv venv
 ```
 
+ **Windows (Command Prompt or PowerShell):**
+```cmd
+python -m venv venv
+```
+
 Activate the virtual environment:
 
+ **Linux/macOS:**
 ```sh
 source venv/bin/activate
+```
+
+ **Windows (Command Prompt):**
+```cmd
+venv\Scripts\activate
+```
+
+ **Windows (PowerShell):**
+```powershell
+.\venv\Scripts\Activate.ps1
 ```
 
 ### Step 4: Install Python Dependencies
@@ -142,9 +159,9 @@ For more detailed information about Passivbot, see documentation files here: [do
 
 ## Third Party Links, Referrals and Tip Jar
 
-**Passivbot Manager Service:**  
-There is a paid manager service to run Passivbot on the user's behalf:  
-www.passivbotmanager.com  
+**Hyperliquid Reference Vault**
+Passivbot's default template config running on a Hyperliquid Vault:  
+https://app.hyperliquid.xyz/vaults/0x490af7d4a048a81db0f677517ed6373565b42349
 
 **Passivbot GUI**
 A graphical user interface for Passivbot:  
@@ -155,9 +172,9 @@ Signing up using these referrals is appreciated:
 https://accounts.binance.com/register?ref=TII4B07C  
 https://partner.bybit.com/b/passivbot  
 https://partner.bitget.com/bg/Y8FU1W  
-https://www.okx.com/join/PASSIVBOT  (20% rebate)  
+https://www.okx.com/join/PASSIVBOT  
 https://app.hyperliquid.xyz/join/PASSIVBOT  
-https://app.defx.com/join/4DKR14  
+https://www.kucoin.com/r/rf/CX8Q6DUF  
 
 **Note on Binance**  
 To support continued Passivbot development, please use a Binance account which  
@@ -184,6 +201,27 @@ Bitcoin (BTC) via Strike:
 enarjord@strike.me
 
 ## License
+This is free and unencumbered software released into the public domain.
 
-Released freely without conditions.
-Anybody may copy, distribute, modify, use or misuse for commercial, non-commercial, educational or non-educational purposes, censor, claim as one's own or otherwise do whatever without permission from anybody.
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <https://unlicense.org/>
