@@ -17,15 +17,18 @@ WORKDIR /passivbot
 # Copy the current directory contents into the container at /passivbot
 COPY . .
 
-# Remove or update rust-toolchain file if it exists (this is what's causing the downgrade)
-RUN rm -f passivbot-rust/rust-toolchain passivbot-rust/rust-toolchain.toml || true
+# Fix the rust-toolchain issue by updating it to stable
+RUN if [ -f passivbot-rust/rust-toolchain ]; then echo "stable" > passivbot-rust/rust-toolchain; fi && \
+    if [ -f passivbot-rust/rust-toolchain.toml ]; then echo -e "[toolchain]\nchannel = \"stable\"" > passivbot-rust/rust-toolchain.toml; fi
 
 # Install Python dependencies
 RUN --mount=type=cache,target=/root/.cache/pip pip install --upgrade pip
 RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
 
-# Build the Rust code
+# Build the Rust code with explicit toolchain override
 RUN cd passivbot-rust && \
+    rustup override set stable && \
+    rustc --version && \
     maturin build --release && \
     pip install target/wheels/*.whl
 
