@@ -5,8 +5,11 @@ FROM python:3.10 AS builder
 RUN apt update && apt install -y build-essential curl git && apt clean
 
 # Install the latest version of Rust and Cargo
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Verify Rust installation
+RUN rustup --version && rustc --version
 
 # Create working directory
 WORKDIR /passivbot
@@ -32,3 +35,6 @@ WORKDIR /passivbot
 # Copy only necessary files from builder
 COPY --from=builder /usr/local/lib/python3.10/site-packages/ /usr/local/lib/python3.10/site-packages/
 COPY --from=builder /passivbot/ ./
+
+# Set working directory
+WORKDIR /passivbot
