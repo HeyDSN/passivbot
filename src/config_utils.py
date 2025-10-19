@@ -1,7 +1,7 @@
 import os
 import re
 from copy import deepcopy
-from typing import Any, Dict, Tuple, List, Union, Optional
+from typing import Any, Dict, Tuple, List, Union, Optional, Iterable
 import argparse
 import logging
 import hjson
@@ -691,7 +691,9 @@ def _sync_with_template(
         result["live"]["base_config_path"] = base_config_path
     template_with_extras = deepcopy(template)
     template_with_extras.setdefault("live", {})["base_config_path"] = ""
-    remove_unused_keys_recursively(template_with_extras, result, verbose=verbose)
+    remove_unused_keys_recursively(
+        template_with_extras, result, verbose=verbose, preserve=[("coin_overrides",)]
+    )
     remove_unused_keys_recursively(template["bot"], result["bot"], verbose=verbose)
     remove_unused_keys_recursively(
         template["optimize"]["bounds"], result["optimize"]["bounds"], verbose=verbose
@@ -843,21 +845,52 @@ def add_missing_keys_recursively(src, dst, parent=None, verbose=True):
                 dst[k] = src[k]
 
 
-def remove_unused_keys_recursively(src, dst, parent=None, verbose=True):
+def remove_unused_keys_recursively(
+    src, dst, parent=None, verbose=True, preserve: Optional[Iterable[Iterable[str]]] = None
+):
     if parent is None:
         parent = []
+        # normalize preserve spec only once at root invocation
+        if preserve is None:
+            preserve_set = set()
+        else:
+            preserve_set = {tuple(p) for p in preserve}
+    else:
+        preserve_set = getattr(remove_unused_keys_recursively, "_preserve_set", set())
+
+    def _path_is_preserved(path: Iterable[str]) -> bool:
+        if not preserve_set:
+            return False
+        path_tuple = tuple(path)
+        for preserved in preserve_set:
+            if path_tuple[: len(preserved)] == preserved:
+                return True
+        return False
+
+    # stash preserve set on the function so recursive calls can reuse it without recomputing
+    if parent == []:
+        remove_unused_keys_recursively._preserve_set = preserve_set
+
+    if _path_is_preserved(parent):
+        return
     if not isinstance(dst, dict) or not isinstance(src, dict):
         return
     for k in sorted(list(dst.keys())):
+        current_path = parent + [k]
+        if _path_is_preserved(current_path):
+            continue
         if k not in src:
             del dst[k]
             if verbose:
-                logging.info("Removed unused key from config: %s", ".".join(parent + [k]))
+                logging.info("Removed unused key from config: %s", ".".join(current_path))
             continue
         src_val = src[k]
         dst_val = dst[k]
         if isinstance(dst_val, dict) and isinstance(src_val, dict):
-            remove_unused_keys_recursively(src_val, dst_val, parent + [k], verbose=verbose)
+            remove_unused_keys_recursively(src_val, dst_val, current_path, verbose=verbose)
+
+    if parent == [] and hasattr(remove_unused_keys_recursively, "_preserve_set"):
+        delattr(remove_unused_keys_recursively, "_preserve_set")
 
 
 def comma_separated_values_float(x):
@@ -1241,11 +1274,15 @@ def get_template_config(passivbot_mode="v7"):
             },
             "compress_results_file": True,
             "crossover_probability": 0.7,
+            "crossover_eta": 20.0,
             "enable_overrides": [],
             "iters": 30000,
             "limits": "--drawdown_worst 0.333 --loss_profit_ratio: 0.9 --position_unchanged_hours_max 300.0",
             "mutation_probability": 0.45,
+            "mutation_eta": 20.0,
+            "mutation_indpb": 0.0,
             "n_cpus": 5,
+            "offspring_multiplier": 1.0,
             "population_size": 1000,
             "round_to_n_significant_digits": 5,
             "scoring": ["adg", "sharpe_ratio"],

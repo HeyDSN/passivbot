@@ -941,6 +941,23 @@ def apply_fine_tune_bounds(config: dict, fine_tune_params: list[str]) -> None:
                 f"fine-tune bounds: missing bot value for '{key}', leaving bounds unchanged"
             )
             continue
+        current_bounds = bounds.get(key)
+        target_value = None
+        if isinstance(current_bounds, (list, tuple)):
+            if len(current_bounds) == 1:
+                target_value = current_bounds[0]
+            elif len(current_bounds) >= 2:
+                low, high = current_bounds[0], current_bounds[1]
+                if low != high:
+                    # Explicit range provided (e.g. via CLI); respect it.
+                    continue
+                target_value = low
+        if target_value is not None:
+            try:
+                side_cfg[param] = float(target_value)
+            except (TypeError, ValueError):
+                side_cfg[param] = target_value
+            continue
         value = side_cfg[param]
         try:
             value_float = float(value)
@@ -1225,6 +1242,16 @@ async def main():
         # Define parameter bounds
         bounds = extract_bounds_tuple_list_from_config(config)
         sig_digits = config["optimize"]["round_to_n_significant_digits"]
+        crossover_eta = config["optimize"].get("crossover_eta", 20.0)
+        mutation_eta = config["optimize"].get("mutation_eta", 20.0)
+        mutation_indpb_raw = config["optimize"].get("mutation_indpb", 0.0)
+        if isinstance(mutation_indpb_raw, (int, float)) and mutation_indpb_raw > 0.0:
+            mutation_indpb = max(0.0, min(1.0, float(mutation_indpb_raw)))
+        else:
+            mutation_indpb = 1.0 / len(bounds) if bounds else 1.0
+        offspring_multiplier = config["optimize"].get("offspring_multiplier", 1.0)
+        if not isinstance(offspring_multiplier, (int, float)) or offspring_multiplier <= 0.0:
+            offspring_multiplier = 1.0
 
         # Register attribute generators
         for i, (low, high) in enumerate(bounds):
@@ -1243,17 +1270,17 @@ async def main():
         toolbox.register(
             "mate",
             cxSimulatedBinaryBoundedWrapper,
-            eta=20.0,
+            eta=crossover_eta,
             low=[low for low, high in bounds],
             up=[high for low, high in bounds],
         )
         toolbox.register(
             "mutate",
             mutPolynomialBoundedWrapper,
-            eta=20.0,
+            eta=mutation_eta,
             low=[low for low, high in bounds],
             up=[high for low, high in bounds],
-            indpb=1.0 / len(bounds),
+            indpb=mutation_indpb,
         )
         toolbox.register("select", tools.selNSGA2)
 
@@ -1307,11 +1334,12 @@ async def main():
 
         # Run the optimization
         logging.info(f"Starting optimize...")
+        lambda_size = max(1, int(round(config["optimize"]["population_size"] * offspring_multiplier)))
         population, logbook = algorithms.eaMuPlusLambda(
             population,
             toolbox,
             mu=config["optimize"]["population_size"],
-            lambda_=config["optimize"]["population_size"],
+            lambda_=lambda_size,
             cxpb=config["optimize"]["crossover_probability"],
             mutpb=config["optimize"]["mutation_probability"],
             ngen=max(1, int(config["optimize"]["iters"] / len(population))),
