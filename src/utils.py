@@ -12,6 +12,7 @@ from collections import defaultdict
 from typing import Dict, Any, List, Union, Optional
 import re
 import logging
+from copy import deepcopy
 from custom_endpoint_overrides import (
     apply_rest_overrides_to_ccxt,
     resolve_custom_endpoint_override,
@@ -479,24 +480,47 @@ def create_coin_symbol_map_cache(exchange: str, markets, verbose=True):
 
 def coin_to_symbol(coin, exchange):
     # caches coin_to_symbol_map in memory and reloads if file changes
+    if coin == "":
+        return ""
+    ex = normalize_exchange_name(exchange)
+    quote = get_quote(ex)
+    coin_sanitized = symbol_to_coin(coin)
+    fallback = f"{coin_sanitized}/{quote}:{quote}"
     try:
-        ex = normalize_exchange_name(exchange)
         loaded = _load_coin_to_symbol_map(ex)
-        if not loaded or coin not in loaded:
-            return ""
-        candidates = loaded.get(coin, [])
+        candidates = loaded.get(coin_sanitized, []) if loaded else []
         if len(candidates) == 1:
             return candidates[0]
-        elif len(candidates) == 0:
-            logging.info(f"No candidates for {coin}")
-            return ""
+        if len(candidates) > 1:
+            logging.info(
+                "Multiple candidates for %s (raw=%s): %s",
+                coin_sanitized,
+                coin,
+                candidates,
+            )
+            return candidates[0]
+        if loaded:
+            # map present but coin missing
+            logging.info(
+                "No mapping for %s (raw=%s) on %s; using fallback %s",
+                coin_sanitized,
+                coin,
+                ex,
+                fallback,
+            )
         else:
-            logging.info(f"Multiple candidates for {coin}: {candidates}")
-            return ""
+            logging.info(
+                "coin_to_symbol map for %s missing; using fallback for %s (raw=%s) -> %s",
+                ex,
+                coin_sanitized,
+                coin,
+                fallback,
+            )
     except Exception as e:
-        logging.error(f"error with coin_to_symbol {coin} {exchange} {e}")
-    quote = get_quote(normalize_exchange_name(exchange))
-    return f"{coin}/{quote}:{quote}"
+        logging.error(
+            "error with coin_to_symbol %s (raw=%s) %s: %s", coin_sanitized, coin, exchange, e
+        )
+    return fallback
 
 
 def get_caller_name():
@@ -543,8 +567,12 @@ def symbol_to_coin(symbol):
 async def format_approved_ignored_coins(config, exchanges: [str]):
     if isinstance(exchanges, str):
         exchanges = [exchanges]
-    path = _require_live_value(config, "approved_coins")
-    if path in [
+    coin_sources = config.setdefault("_coins_sources", {})
+    approved_source = coin_sources.get("approved_coins", config.get("live", {}).get("approved_coins"))
+    if approved_source is None:
+        approved_source = _require_live_value(config, "approved_coins")
+    coin_sources["approved_coins"] = deepcopy(approved_source)
+    if approved_source in [
         [""],
         [],
         None,
@@ -571,12 +599,16 @@ async def format_approved_ignored_coins(config, exchanges: [str]):
             # leave empty
             config["live"]["approved_coins"] = {"long": [], "short": []}
     else:
-        ac = normalize_coins_source(_require_live_value(config, "approved_coins"))
+        ac = normalize_coins_source(approved_source)
         config["live"]["approved_coins"] = {
             pside: [cf for x in ac[pside] if (cf := symbol_to_coin(x))] for pside in ac
         }
 
-    ic = normalize_coins_source(_require_live_value(config, "ignored_coins"))
+    ignored_source = coin_sources.get("ignored_coins", config.get("live", {}).get("ignored_coins"))
+    if ignored_source is None:
+        ignored_source = _require_live_value(config, "ignored_coins")
+    coin_sources["ignored_coins"] = deepcopy(ignored_source)
+    ic = normalize_coins_source(ignored_source)
     config["live"]["ignored_coins"] = {
         pside: [cf for x in ic[pside] if (cf := symbol_to_coin(x))] for pside in ic
     }
