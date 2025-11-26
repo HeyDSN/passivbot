@@ -1,5 +1,5 @@
 # First stage: builder
-FROM python:3.10 AS builder
+FROM python:3.12 AS builder
 
 # Install dependencies
 RUN apt update && apt install -y build-essential curl git && apt clean
@@ -33,7 +33,7 @@ RUN cd passivbot-rust && \
     pip install target/wheels/*.whl
 
 # Second stage: final
-FROM python:3.10
+FROM python:3.12
 
 # Create working directory
 WORKDIR /passivbot
