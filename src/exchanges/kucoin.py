@@ -104,7 +104,7 @@ class KucoinBot(Passivbot):
         super().__init__(config)
         self.custom_id_max_length = 40
         self.quote = "USDT"
-        self.hedge_mode = False
+        self.hedge_mode = True
 
     def _get_partner_signature(self, timestamp: str) -> str:
         prehash = f"{timestamp}{self.partner}{self.api_key}"
@@ -250,12 +250,9 @@ class KucoinBot(Passivbot):
             return False
 
     async def fetch_positions(self):
-        fetched_positions, fetched_balance = None, None
+        fetched_positions = None
         try:
-            fetched_positions, fetched_balance = await asyncio.gather(
-                self.cca.fetch_positions(),
-                self.cca.fetch_balance(),
-            )
+            fetched_positions = await self.cca.fetch_positions()
             positions = []
             for p in fetched_positions:
                 positions.append(
@@ -269,11 +266,20 @@ class KucoinBot(Passivbot):
                         },
                     }
                 )
-            balance = fetched_balance["info"]["data"]["marginBalance"]
-            return positions, balance
+            return positions
         except Exception as e:
-            logging.error(f"error fetching positions and balance {e}")
+            logging.error(f"error fetching positions {e}")
             print_async_exception(fetched_positions)
+            traceback.print_exc()
+            return False
+
+    async def fetch_balance(self):
+        fetched_balance = None
+        try:
+            fetched_balance = await self.cca.fetch_balance()
+            return fetched_balance["info"]["data"]["marginBalance"]
+        except Exception as e:
+            logging.error(f"error fetching balance {e}")
             print_async_exception(fetched_balance)
             traceback.print_exc()
             return False
@@ -493,6 +499,7 @@ class KucoinBot(Passivbot):
             "reduceOnly": order.get("reduce_only", False),
             "marginMode": "CROSS",
             "clientOid": order.get("custom_id", None),
+            "positionSide": order.get('position_side', '').upper(),
         }
 
     def did_cancel_order(self, executed, order=None) -> bool:
@@ -516,6 +523,20 @@ class KucoinBot(Passivbot):
         )
         if verbose:
             logging.info(f"Exchange time offset is {self.utc_offset}ms compared to UTC")
+
+
+    async def update_exchange_config(self):
+        """Ensure account-level settings (hedge mode) are applied."""
+        try:
+            # Hedge mode enabled so both long/short can coexist.
+            if hasattr(self.cca, "set_position_mode"):
+                res = await self.cca.set_position_mode(True)
+                logging.info(f"set_position_mode hedged=True {res}")
+            else:
+                logging.info("set_position_mode not supported by current KuCoin client; continuing")
+        except Exception as e:
+            logging.warning(f"set_position_mode hedged=True not applied: {e}")
+
 
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call = []
