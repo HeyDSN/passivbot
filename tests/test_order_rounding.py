@@ -23,6 +23,11 @@ def _is_step_aligned(value: float, step: float, tol: float = 1e-12) -> bool:
 
 
 @requires_extension
+def test_select_forager_candidates_py_is_exported():
+    assert hasattr(pbr, "select_forager_candidates_py")
+
+
+@requires_extension
 def test_calc_entries_long_py_quantizes_results():
     step_qty = 0.001
     step_price = 0.0001
@@ -56,7 +61,7 @@ def test_calc_entries_long_py_quantizes_results():
         max_since_open=0.0,
         min_since_max=0.0,
         ema_bands_lower=0.6545,
-        grid_log_range=0.0,
+        entry_volatility_logrange_ema_1h=0.0,
         order_book_bid=0.66,
     )
     result = pbr.calc_entries_long_py(**params)
@@ -117,6 +122,7 @@ def test_calc_twel_enforcer_orders_quantizes_results():
             "qty_step": 0.1,
             "price_step": 0.0005,
             "min_qty": 0.0,
+            "min_cost": 0.0,
         }
     ]
     actions = pbr.calc_twel_enforcer_orders_py(

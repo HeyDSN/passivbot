@@ -1,7 +1,13 @@
+import asyncio
+import json
+import logging
 import sys
 import types
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from passivbot_exceptions import FatalBotException
 
 # Stub passivbot_rust before importing passivbot to avoid native dependency during unit test.
 sys.modules.setdefault(
@@ -15,6 +21,178 @@ sys.modules.setdefault(
 )
 
 from passivbot import Passivbot
+
+
+@pytest.mark.asyncio
+async def test_shutdown_gracefully_awaits_cancelled_maintainers():
+    bot = Passivbot.__new__(Passivbot)
+    bot._shutdown_in_progress = False
+    bot.stop_signal_received = False
+    bot._monitor_emit_stop = lambda *args, **kwargs: None
+    bot._monitor_flush_snapshot = AsyncMock()
+    bot.monitor_publisher = None
+
+    seen = {"maintainer_cancelled": False, "ccp_closed": False, "cca_closed": False}
+
+    async def _maintainer():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            seen["maintainer_cancelled"] = True
+            raise
+
+    class _Closer:
+        def __init__(self, key):
+            self.key = key
+
+        async def close(self):
+            seen[self.key] = True
+
+    maintainer_task = asyncio.create_task(_maintainer())
+    bot.maintainers = {"watch_orders": maintainer_task}
+    bot.WS_ohlcvs_1m_tasks = {}
+    bot.ccp = _Closer("ccp_closed")
+    bot.cca = _Closer("cca_closed")
+
+    await asyncio.sleep(0)
+    await bot.shutdown_gracefully()
+
+    assert seen == {
+        "maintainer_cancelled": True,
+        "ccp_closed": True,
+        "cca_closed": True,
+    }
+    assert maintainer_task.done() is True
+
+
+def _set_pnl_lookback(bot, *, lookback_days: float, now_ms: int) -> None:
+    bot.config = {"live": {"pnls_max_lookback_days": float(lookback_days)}}
+    bot.get_exchange_time = lambda: now_ms
+
+
+@pytest.mark.asyncio
+async def test_update_pnls_all_lookback_backfills_when_cache_scope_is_narrower():
+    bot = Passivbot.__new__(Passivbot)
+    cached_events = [SimpleNamespace(timestamp=1_700_000_000_000, id="fill-1", source_ids=["fill-1"])]
+
+    class _Manager:
+        def __init__(self, events, *, history_scope="unknown"):
+            self._events = list(events)
+            self.refresh = AsyncMock()
+            self.refresh_latest = AsyncMock()
+            self.history_scope = history_scope
+
+        def get_events(self):
+            return list(self._events)
+
+        def get_history_scope(self):
+            return self.history_scope
+
+        def set_history_scope(self, scope):
+            self.history_scope = scope
+
+    bot.stop_signal_received = False
+    bot._pnls_manager = _Manager(cached_events, history_scope="window")
+    bot.init_pnls = AsyncMock()
+    bot.live_value = lambda key: "all" if key == "pnls_max_lookback_days" else None
+    bot.get_exchange_time = lambda: 1_700_000_060_000
+    bot._log_new_fill_events = lambda new_events: None
+    bot._monitor_record_event = lambda *args, **kwargs: None
+    bot._monitor_record_error = lambda *args, **kwargs: None
+    bot.logging_level = 0
+    bot._health_rate_limits = 0
+
+    result = await bot.update_pnls()
+
+    assert result is True
+    bot._pnls_manager.refresh.assert_awaited_once_with(start_ms=None, end_ms=None)
+    bot._pnls_manager.refresh_latest.assert_not_awaited()
+    assert bot._pnls_manager.history_scope == "all"
+
+
+@pytest.mark.asyncio
+async def test_update_pnls_all_lookback_uses_incremental_refresh_when_cache_is_full_history():
+    bot = Passivbot.__new__(Passivbot)
+    cached_events = [SimpleNamespace(timestamp=1_700_000_000_000, id="fill-1", source_ids=["fill-1"])]
+
+    class _Manager:
+        def __init__(self, events, *, history_scope="unknown"):
+            self._events = list(events)
+            self.refresh = AsyncMock()
+            self.refresh_latest = AsyncMock()
+            self.history_scope = history_scope
+
+        def get_events(self):
+            return list(self._events)
+
+        def get_history_scope(self):
+            return self.history_scope
+
+        def set_history_scope(self, scope):
+            self.history_scope = scope
+
+    bot.stop_signal_received = False
+    bot._pnls_manager = _Manager(cached_events, history_scope="all")
+    bot.init_pnls = AsyncMock()
+    bot.live_value = lambda key: "all" if key == "pnls_max_lookback_days" else None
+    bot.get_exchange_time = lambda: 1_700_000_060_000
+    bot._log_new_fill_events = lambda new_events: None
+    bot._monitor_record_event = lambda *args, **kwargs: None
+    bot._monitor_record_error = lambda *args, **kwargs: None
+    bot.logging_level = 0
+    bot._health_rate_limits = 0
+
+    result = await bot.update_pnls()
+
+    assert result is True
+    bot._pnls_manager.refresh.assert_not_awaited()
+    bot._pnls_manager.refresh_latest.assert_awaited_once_with(overlap=20)
+    assert bot._pnls_manager.history_scope == "all"
+
+
+@pytest.mark.asyncio
+async def test_update_pnls_propagates_unexpected_refresh_errors():
+    bot = Passivbot.__new__(Passivbot)
+    cached_events = [SimpleNamespace(timestamp=1_700_000_000_000, id="fill-1", source_ids=["fill-1"])]
+
+    class _Manager:
+        def __init__(self, events, *, history_scope="unknown"):
+            self._events = list(events)
+            self.refresh = AsyncMock()
+            self.refresh_latest = AsyncMock(side_effect=RuntimeError("fill refresh failed"))
+            self.history_scope = history_scope
+
+        def get_events(self):
+            return list(self._events)
+
+        def get_history_scope(self):
+            return self.history_scope
+
+        def set_history_scope(self, scope):
+            self.history_scope = scope
+
+    bot.stop_signal_received = False
+    bot._pnls_manager = _Manager(cached_events, history_scope="all")
+    bot.init_pnls = AsyncMock()
+    bot.live_value = lambda key: "all" if key == "pnls_max_lookback_days" else None
+    bot.get_exchange_time = lambda: 1_700_000_060_000
+    bot._log_new_fill_events = lambda new_events: None
+    bot._monitor_record_event = lambda *args, **kwargs: None
+    bot._monitor_record_error = lambda *args, **kwargs: None
+    bot.logging_level = 0
+    bot._health_rate_limits = 0
+
+    with pytest.raises(RuntimeError, match="fill refresh failed"):
+        await bot.update_pnls()
+
+
+def test_get_exchange_time_uses_direct_utc_ms(monkeypatch):
+    import passivbot as pb_mod
+
+    bot = Passivbot.__new__(Passivbot)
+    monkeypatch.setattr(pb_mod, "utc_ms", lambda: 123_456.0)
+
+    assert bot.get_exchange_time() == pytest.approx(123_456.0)
 
 
 @pytest.mark.asyncio
@@ -74,3 +252,681 @@ async def test_update_balance_uses_fetch_balance_when_no_cache():
     bot.handle_balance_update = fake_handle_balance_update
     await bot.handle_balance_update()
     assert calls["balance"] == 1
+
+
+@pytest.mark.asyncio
+async def test_update_balance_failure_keeps_previous():
+    """Test that when fetch_balance raises an exception, previous balance is preserved.
+
+    Per CLAUDE.md: exchange fetch methods should raise exceptions on failure,
+    not return False. The exception propagates to the caller who handles it.
+    """
+    bot = Passivbot.__new__(Passivbot)
+    bot.quote = "USDT"
+    bot.balance = 50.0
+    bot.previous_hysteresis_balance = 50.0
+
+    async def fake_fetch_balance():
+        raise Exception("network error")  # simulate failed fetch
+
+    bot.fetch_balance = fake_fetch_balance
+
+    with pytest.raises(Exception, match="network error"):
+        await bot.update_balance()
+    # Balance should remain unchanged because assignment was never reached
+    assert bot.balance == pytest.approx(50.0)
+    assert bot.previous_hysteresis_balance == pytest.approx(50.0)
+
+
+@pytest.mark.asyncio
+async def test_update_balance_override_does_not_reset_hysteresis_anchor():
+    bot = Passivbot.__new__(Passivbot)
+    bot.quote = "USDT"
+    bot.balance = 100.0
+    bot.balance_raw = 100.0
+    bot.balance_override = 250.0
+    bot._balance_override_logged = False
+    bot.previous_hysteresis_balance = 133.0
+    bot.balance_hysteresis_snap_pct = 0.02
+
+    ok = await bot.update_balance()
+    assert ok is True
+    assert bot.balance == pytest.approx(250.0)
+    assert bot.balance_raw == pytest.approx(250.0)
+    # Keep hysteresis anchor unchanged while override is active.
+    assert bot.previous_hysteresis_balance == pytest.approx(133.0)
+
+
+@pytest.mark.asyncio
+async def test_update_balance_nan_keeps_previous_and_logs_warning(caplog):
+    bot = Passivbot.__new__(Passivbot)
+    bot.quote = "USDT"
+    bot.balance = 50.0
+    bot.balance_raw = 50.0
+    bot.previous_hysteresis_balance = 50.0
+
+    async def fake_fetch_balance():
+        return float("nan")
+
+    bot.fetch_balance = fake_fetch_balance
+
+    with caplog.at_level(logging.WARNING):
+        ok = await bot.update_balance()
+    assert ok is False
+    assert bot.balance == pytest.approx(50.0)
+    assert bot.balance_raw == pytest.approx(50.0)
+    assert bot.previous_hysteresis_balance == pytest.approx(50.0)
+    assert "non-finite balance fetch result; keeping previous balance" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_update_balance_inf_keeps_previous_and_logs_warning(caplog):
+    bot = Passivbot.__new__(Passivbot)
+    bot.quote = "USDT"
+    bot.balance = 50.0
+    bot.balance_raw = 50.0
+    bot.previous_hysteresis_balance = 50.0
+
+    async def fake_fetch_balance():
+        return float("inf")
+
+    bot.fetch_balance = fake_fetch_balance
+
+    with caplog.at_level(logging.WARNING):
+        ok = await bot.update_balance()
+    assert ok is False
+    assert bot.balance == pytest.approx(50.0)
+    assert bot.balance_raw == pytest.approx(50.0)
+    assert bot.previous_hysteresis_balance == pytest.approx(50.0)
+    assert "non-finite balance fetch result; keeping previous balance" in caplog.text
+
+
+def test_accessor_fallback_when_balance_raw_absent():
+    """get_raw_balance() falls back to snapped balance when balance_raw is absent."""
+    bot = Passivbot.__new__(Passivbot)
+    bot.balance = 500.0
+    # Intentionally do NOT set balance_raw
+    if hasattr(bot, "balance_raw"):
+        del bot.balance_raw
+    assert bot.get_raw_balance() == pytest.approx(500.0)
+
+
+def test_accessor_returns_raw_when_present():
+    """get_raw_balance() returns balance_raw when it exists."""
+    bot = Passivbot.__new__(Passivbot)
+    bot.balance = 1000.0
+    bot.balance_raw = 1010.0
+    assert bot.get_raw_balance() == pytest.approx(1010.0)
+    assert bot.get_hysteresis_snapped_balance() == pytest.approx(1000.0)
+
+
+def test_get_wallet_exposure_limit_uses_configured_n_positions_only():
+    bot = Passivbot.__new__(Passivbot)
+    bot.coin_overrides = {}
+
+    def bot_value(pside, key):
+        if key == "total_wallet_exposure_limit":
+            return 1.4
+        if key == "n_positions":
+            return 7
+        raise KeyError(key)
+
+    bot.bot_value = bot_value
+    bot.get_max_n_positions = lambda pside: 1
+    bot.get_current_n_positions = lambda pside: 99
+
+    wel = bot.get_wallet_exposure_limit("long")
+    assert wel == pytest.approx(0.2)
+
+
+def test_balance_peak_uses_raw_not_snapped():
+    """Core bug regression: balance_peak must be derived from raw balance, not snapped.
+
+    After a profit fill, raw balance advances (e.g. 1010) but snapped balance
+    may remain stale (e.g. 1000) due to hysteresis. The peak calculation must
+    use raw balance so that balance_peak is correct.
+
+    balance_peak = balance_raw + (pnls_cumsum_max - pnls_cumsum_last)
+
+    With raw=1010, cumsum_max=100, cumsum_last=100:
+        peak_from_raw = 1010 + (100 - 100) = 1010  ← correct
+        peak_from_snap = 1000 + (100 - 100) = 1000  ← WRONG (stale)
+    """
+    import types
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    bot = Passivbot.__new__(Passivbot)
+    bot.balance = 1000.0  # snapped (stale)
+    bot.balance_raw = 1010.0  # raw (advanced after profit fill)
+    bot._pnls_manager = MagicMock()
+    bot._pnls_manager.get_events.return_value = [
+        types.SimpleNamespace(pnl=100.0, timestamp=1.0),
+    ]
+
+    # Simulate the calc_auto_unstuck_allowance_from_scratch peak calculation
+    events = bot._pnls_manager.get_events()
+    pnls_cumsum = np.array([ev.pnl for ev in events]).cumsum()
+    pnls_cumsum_max = float(pnls_cumsum.max())
+    pnls_cumsum_last = float(pnls_cumsum[-1])
+
+    # Using raw balance (correct)
+    balance_peak_raw = bot.get_raw_balance() + (pnls_cumsum_max - pnls_cumsum_last)
+    assert balance_peak_raw == pytest.approx(1010.0)
+
+    # Using snapped balance (would be wrong)
+    balance_peak_snapped = bot.get_hysteresis_snapped_balance() + (pnls_cumsum_max - pnls_cumsum_last)
+    assert balance_peak_snapped == pytest.approx(1000.0)
+
+    # The raw-based peak is correct and higher
+    assert balance_peak_raw > balance_peak_snapped
+
+
+def test_effective_min_cost_filter_uses_snapped_balance():
+    bot = Passivbot.__new__(Passivbot)
+    bot.balance = 100.0
+    bot.balance_raw = 10.0
+    bot.effective_min_cost = {"BTC/USDT:USDT": 40.0}
+    bot.live_value = lambda key: key == "filter_by_min_effective_cost"
+    bot.get_wallet_exposure_limit = lambda pside, symbol=None: 1.0
+    bot.bp = lambda pside, key, symbol=None: 0.5 if key == "entry_initial_qty_pct" else 0.0
+
+    # Passes only when snapped balance is used:
+    # 100 * 1.0 * 0.5 = 50 >= 40; raw path would fail (10 * 1.0 * 0.5 = 5).
+    assert bot.effective_min_cost_is_low_enough("long", "BTC/USDT:USDT") is True
+
+
+@pytest.mark.asyncio
+async def test_update_effective_min_cost_uses_executable_min_qty():
+    symbol = "SOL/USDT:USDT"
+    bot = Passivbot.__new__(Passivbot)
+    bot.effective_min_cost = {}
+    bot.min_qtys = {symbol: 0.0}
+    bot.qty_steps = {symbol: 1.0}
+    bot.min_costs = {symbol: 0.1}
+    bot.c_mults = {symbol: 1.0}
+    bot.cm = types.SimpleNamespace(
+        get_last_prices=lambda symbols, max_age_ms=600_000: {symbol: 88.165}
+    )
+    bot.get_symbols_approved_or_has_pos = lambda: [symbol]
+
+    async def fake_get_last_prices(symbols, max_age_ms=600_000):
+        return {symbol: 88.165}
+
+    bot.cm.get_last_prices = fake_get_last_prices
+
+    await bot.update_effective_min_cost()
+
+    assert bot.effective_min_cost[symbol] == pytest.approx(88.165)
+
+
+def test_unstuck_allowance_routes_raw_balance_to_rust(monkeypatch):
+    import passivbot as pb_mod
+
+    bot = Passivbot.__new__(Passivbot)
+    bot.balance = 100.0
+    bot.balance_raw = 200.0
+    bot._pnls_manager = types.SimpleNamespace(
+        get_events=lambda: [types.SimpleNamespace(pnl=10.0), types.SimpleNamespace(pnl=-4.0)]
+    )
+
+    def bot_value(pside, key):
+        if key == "unstuck_loss_allowance_pct":
+            return 0.2 if pside == "long" else 0.0
+        if key == "total_wallet_exposure_limit":
+            return 0.5
+        return 0.0
+
+    bot.bot_value = bot_value
+
+    calls = []
+
+    def fake_calc_auto_unstuck_allowance(
+        balance, loss_allowance_pct, pnl_cumsum_max, pnl_cumsum_last
+    ):
+        calls.append((balance, loss_allowance_pct, pnl_cumsum_max, pnl_cumsum_last))
+        return 123.45
+
+    monkeypatch.setattr(pb_mod.pbr, "calc_auto_unstuck_allowance", fake_calc_auto_unstuck_allowance)
+
+    out = bot._calc_unstuck_allowances(allow_new_unstuck=True)
+
+    assert out["long"] == pytest.approx(123.45)
+    assert out["short"] == pytest.approx(0.0)
+    assert len(calls) == 1
+    assert calls[0][0] == pytest.approx(200.0)  # raw balance
+
+
+def test_unstuck_allowance_uses_only_configured_pnl_lookback(monkeypatch):
+    import passivbot as pb_mod
+
+    now_ms = 10 * 86_400_000
+    bot = Passivbot.__new__(Passivbot)
+    bot.balance_raw = 1000.0
+    bot.get_raw_balance = lambda: float(bot.balance_raw)
+    _set_pnl_lookback(bot, lookback_days=1.0, now_ms=now_ms)
+    bot._pnls_manager = types.SimpleNamespace(
+        get_events=lambda start_ms=None, end_ms=None, symbol=None: [
+            ev
+            for ev in [
+                types.SimpleNamespace(pnl=100.0, timestamp=now_ms - 3 * 86_400_000),
+                types.SimpleNamespace(pnl=-80.0, timestamp=now_ms - 3 * 86_400_000 + 1),
+                types.SimpleNamespace(pnl=10.0, timestamp=now_ms - 60_000),
+            ]
+            if start_ms is None or ev.timestamp >= start_ms
+        ]
+    )
+
+    def bot_value(pside, key):
+        if key == "unstuck_loss_allowance_pct":
+            return 0.01 if pside == "long" else 0.0
+        if key == "total_wallet_exposure_limit":
+            return 1.0
+        return 0.0
+
+    bot.bot_value = bot_value
+
+    calls = []
+
+    def fake_calc_auto_unstuck_allowance(
+        balance, loss_allowance_pct, pnl_cumsum_max, pnl_cumsum_last
+    ):
+        calls.append((balance, loss_allowance_pct, pnl_cumsum_max, pnl_cumsum_last))
+        return 10.0
+
+    monkeypatch.setattr(pb_mod.pbr, "calc_auto_unstuck_allowance", fake_calc_auto_unstuck_allowance)
+
+    out = bot._calc_unstuck_allowances(allow_new_unstuck=True)
+
+    assert out["long"] == pytest.approx(10.0)
+    assert len(calls) == 1
+    assert calls[0] == pytest.approx((1000.0, 0.01, 10.0, 10.0))
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_snapshot_payload_routes_split_balances(monkeypatch):
+    import passivbot as pb_mod
+
+    class FakeBot:
+        positions = {}
+        balance = 120.0  # snapped
+        balance_raw = 175.0  # raw
+        PB_modes = {}
+        effective_min_cost = {}
+        _config_hedge_mode = False
+        hedge_mode = False
+        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
+        _monitor_record_price_ticks = pb_mod.Passivbot._monitor_record_price_ticks
+        _build_monitor_runtime_market_hints = pb_mod.Passivbot._build_monitor_runtime_market_hints
+        _build_monitor_runtime_unstuck_hints = pb_mod.Passivbot._build_monitor_runtime_unstuck_hints
+        _update_monitor_runtime_hints = pb_mod.Passivbot._update_monitor_runtime_hints
+
+        def config_get(self, keys):
+            return None
+
+        def _bot_params_to_rust_dict(self, pside, symbol):
+            return {}
+
+        def live_value(self, key):
+            return False
+
+        def _log_realized_loss_gate_blocks(self, out, idx_to_symbol):
+            return None
+
+        def _log_ema_gating(self, ideal_orders, m1_close_emas, last_prices, symbols):
+            return None
+
+        def _to_executable_orders(self, ideal_orders, last_prices):
+            return ideal_orders, []
+
+        def _finalize_reduce_only_orders(self, ideal_orders_f, last_prices):
+            return ideal_orders_f
+
+        def get_raw_balance(self):
+            return float(self.balance_raw)
+
+        def get_hysteresis_snapped_balance(self):
+            return float(self.balance)
+
+    snapshot = {
+        "symbols": [],
+        "last_prices": {},
+        "m1_close_emas": {},
+        "m1_volume_emas": {},
+        "m1_log_range_emas": {},
+        "h1_log_range_emas": {},
+        "unstuck_allowances": {"long": 0.0, "short": 0.0},
+        "realized_pnl_cumsum": {"max": 0.0, "last": 0.0},
+    }
+
+    captured = {}
+
+    def fake_compute(json_str):
+        captured["input"] = json.loads(json_str)
+        return json.dumps({"orders": [], "diagnostics": {"loss_gate_blocks": []}})
+
+    monkeypatch.setattr(pb_mod.pbr, "compute_ideal_orders_json", fake_compute)
+
+    bot = FakeBot()
+    method = pb_mod.Passivbot.calc_ideal_orders_orchestrator_from_snapshot
+    await method(bot, snapshot, return_snapshot=False)
+
+    assert captured["input"]["balance"] == pytest.approx(120.0)
+    assert captured["input"]["balance_raw"] == pytest.approx(175.0)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_snapshot_payload_includes_exchange_fees(monkeypatch):
+    import passivbot as pb_mod
+
+    symbol = "BTC/USDT:USDT"
+
+    class FakeBot:
+        positions = {}
+        balance = 120.0
+        balance_raw = 175.0
+        PB_modes = {"long": {symbol: "normal"}, "short": {symbol: "manual"}}
+        effective_min_cost = {symbol: 1.0}
+        _config_hedge_mode = False
+        hedge_mode = False
+        qty_steps = {symbol: 0.001}
+        price_steps = {symbol: 0.1}
+        min_qtys = {symbol: 0.001}
+        min_costs = {symbol: 5.0}
+        c_mults = {symbol: 1.0}
+        markets_dict = {symbol: {"maker": 0.0001, "taker": 0.0004}}
+        equity_hard_stop_loss = {"panic_close_order_type": "limit"}
+        trailing_prices = {}
+        _monitor_record_price_ticks = pb_mod.Passivbot._monitor_record_price_ticks
+        _build_monitor_runtime_market_hints = pb_mod.Passivbot._build_monitor_runtime_market_hints
+        _build_monitor_runtime_unstuck_hints = pb_mod.Passivbot._build_monitor_runtime_unstuck_hints
+        _update_monitor_runtime_hints = pb_mod.Passivbot._update_monitor_runtime_hints
+
+        def config_get(self, keys):
+            return None
+
+        def _bot_params_to_rust_dict(self, pside, symbol):
+            return {}
+
+        def live_value(self, key):
+            return False
+
+        def _log_realized_loss_gate_blocks(self, out, idx_to_symbol):
+            return None
+
+        def _log_ema_gating(self, ideal_orders, m1_close_emas, last_prices, symbols):
+            return None
+
+        def _to_executable_orders(self, ideal_orders, last_prices):
+            return ideal_orders, []
+
+        def _finalize_reduce_only_orders(self, ideal_orders_f, last_prices):
+            return ideal_orders_f
+
+        def get_raw_balance(self):
+            return float(self.balance_raw)
+
+        def get_hysteresis_snapped_balance(self):
+            return float(self.balance)
+
+        _orchestrator_exchange_params = pb_mod.Passivbot._orchestrator_exchange_params
+        _get_exchange_fee_rates = pb_mod.Passivbot._get_exchange_fee_rates
+
+        def _pb_mode_to_orchestrator_mode(self, mode):
+            return pb_mod.Passivbot._pb_mode_to_orchestrator_mode(self, mode)
+
+    snapshot = {
+        "symbols": [symbol],
+        "last_prices": {symbol: 100.0},
+        "m1_close_emas": {symbol: {10.0: 100.0}},
+        "m1_volume_emas": {symbol: {10.0: 1000.0}},
+        "m1_log_range_emas": {symbol: {10.0: 0.01}},
+        "h1_log_range_emas": {symbol: {10.0: 0.01}},
+        "unstuck_allowances": {"long": 0.0, "short": 0.0},
+        "realized_pnl_cumsum": {"max": 0.0, "last": 0.0},
+    }
+
+    captured = {}
+
+    def fake_compute(json_str):
+        captured["input"] = json.loads(json_str)
+        return json.dumps({"orders": [], "diagnostics": {"loss_gate_blocks": []}})
+
+    monkeypatch.setattr(pb_mod.pbr, "compute_ideal_orders_json", fake_compute)
+
+    method = pb_mod.Passivbot.calc_ideal_orders_orchestrator_from_snapshot
+    await method(FakeBot(), snapshot, return_snapshot=False)
+
+    exchange = captured["input"]["symbols"][0]["exchange"]
+    assert exchange["maker_fee"] == pytest.approx(0.0001)
+    assert exchange["taker_fee"] == pytest.approx(0.0004)
+
+
+def test_unstuck_logging_peak_stays_stable_when_profit_updates_both_balance_and_pnl():
+    """Regression for peak drift: peak must not decay when profits increase pnl_last and balance_raw."""
+    bot = Passivbot.__new__(Passivbot)
+    bot.balance = 100.0  # stale snapped value to simulate hysteresis lag
+
+    def bot_value(pside, key):
+        if key == "total_wallet_exposure_limit":
+            return 1.0
+        if key == "unstuck_loss_allowance_pct":
+            return 0.1
+        return 0.0
+
+    bot.bot_value = bot_value
+
+    # State A: peak = 100 + (100 - 0) = 200
+    bot.balance_raw = 100.0
+    bot._pnls_manager = types.SimpleNamespace(
+        get_events=lambda: [types.SimpleNamespace(pnl=100.0), types.SimpleNamespace(pnl=-100.0)]
+    )
+    info_a = bot._calc_unstuck_allowance_for_logging("long")
+
+    # State B (after net +50 realized since trough): peak should still be 200
+    # If snapped balance were incorrectly used here, peak would drift down to 150.
+    bot.balance_raw = 150.0
+    bot._pnls_manager = types.SimpleNamespace(
+        get_events=lambda: [types.SimpleNamespace(pnl=100.0), types.SimpleNamespace(pnl=-50.0)]
+    )
+    info_b = bot._calc_unstuck_allowance_for_logging("long")
+
+    assert info_a["status"] == "ok"
+    assert info_b["status"] == "ok"
+    assert info_a["peak"] == pytest.approx(200.0)
+    assert info_b["peak"] == pytest.approx(200.0)
+
+
+def test_unstuck_logging_uses_only_configured_pnl_lookback():
+    now_ms = 10 * 86_400_000
+    bot = Passivbot.__new__(Passivbot)
+    bot.balance = 1000.0
+    bot.balance_raw = 1000.0
+    _set_pnl_lookback(bot, lookback_days=1.0, now_ms=now_ms)
+
+    def bot_value(pside, key):
+        if key == "total_wallet_exposure_limit":
+            return 1.0
+        if key == "unstuck_loss_allowance_pct":
+            return 0.01
+        return 0.0
+
+    bot.bot_value = bot_value
+    bot._pnls_manager = types.SimpleNamespace(
+        get_events=lambda start_ms=None, end_ms=None, symbol=None: [
+            ev
+            for ev in [
+                types.SimpleNamespace(pnl=100.0, timestamp=now_ms - 3 * 86_400_000),
+                types.SimpleNamespace(pnl=-80.0, timestamp=now_ms - 3 * 86_400_000 + 1),
+                types.SimpleNamespace(pnl=10.0, timestamp=now_ms - 60_000),
+            ]
+            if start_ms is None or ev.timestamp >= start_ms
+        ]
+    )
+
+    info = bot._calc_unstuck_allowance_for_logging("long")
+
+    assert info["status"] == "ok"
+    assert info["peak"] == pytest.approx(1000.0)
+    assert info["pct_from_peak"] == pytest.approx(0.0)
+    assert info["allowance"] == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_update_balance_hysteresis_divergence():
+    """Calls update_balance() twice with values within snap threshold, verifies balance_raw != balance."""
+    bot = Passivbot.__new__(Passivbot)
+    bot.quote = "USDT"
+
+    call_count = [0]
+
+    async def fake_fetch_balance():
+        call_count[0] += 1
+        # First call: 100.0, second call: 100.5 (within 2% snap threshold)
+        return 100.0 if call_count[0] == 1 else 100.5
+
+    bot.fetch_balance = fake_fetch_balance
+
+    ok1 = await bot.update_balance()
+    assert ok1 is True
+    # After first call, both should be the same
+    assert bot.balance_raw == pytest.approx(100.0)
+    assert bot.balance == pytest.approx(100.0)
+
+    ok2 = await bot.update_balance()
+    assert ok2 is True
+    # Raw should update to 100.5, but snapped stays at 100.0 (within 2% threshold)
+    assert bot.balance_raw == pytest.approx(100.5)
+    assert bot.balance == pytest.approx(100.0)
+    # Verify divergence
+    assert bot.balance_raw != bot.balance
+
+
+@pytest.mark.asyncio
+async def test_update_balance_divergence_routes_to_orchestrator_input():
+    """After creating divergence, builds orchestrator input dict and asserts both values pass through."""
+    import passivbot as pb_mod
+
+    bot = Passivbot.__new__(Passivbot)
+    bot.quote = "USDT"
+
+    call_count = [0]
+
+    async def fake_fetch_balance():
+        call_count[0] += 1
+        return 1000.0 if call_count[0] == 1 else 1005.0
+
+    bot.fetch_balance = fake_fetch_balance
+
+    await bot.update_balance()
+    await bot.update_balance()
+
+    # Verify divergence exists
+    assert bot.balance_raw == pytest.approx(1005.0)
+    assert bot.balance == pytest.approx(1000.0)
+
+    # Now verify get_raw_balance / get_hysteresis_snapped_balance route correctly
+    assert bot.get_raw_balance() == pytest.approx(1005.0)
+    assert bot.get_hysteresis_snapped_balance() == pytest.approx(1000.0)
+
+
+@pytest.mark.asyncio
+async def test_ws_balance_update_sets_balance_raw_correctly():
+    """Simulate a WS-triggered balance update and verify balance_raw is set."""
+    bot = Passivbot.__new__(Passivbot)
+    bot.quote = "USDT"
+
+    # First establish a baseline via REST update_balance
+    call_count = [0]
+
+    async def fake_fetch_balance():
+        call_count[0] += 1
+        return 1000.0
+
+    bot.fetch_balance = fake_fetch_balance
+    await bot.update_balance()
+
+    assert bot.balance_raw == pytest.approx(1000.0)
+    assert bot.balance == pytest.approx(1000.0)
+
+    # Now simulate a WS balance update: exchange pushes a new raw balance
+    # directly onto the bot attributes (as exchange-specific subclasses do).
+    bot.balance_raw = 1002.0
+    # Snapped balance stays at 1000.0 since WS doesn't re-run hysteresis
+
+    # Verify handle_balance_update sees the divergence and schedules execution
+    async def fake_calc_upnl_sum():
+        return 50.0
+
+    bot.calc_upnl_sum = fake_calc_upnl_sum
+    bot.execution_scheduled = False
+
+    await bot.handle_balance_update(source="WS")
+
+    # After WS update, the raw accessor should return the new value
+    assert bot.get_raw_balance() == pytest.approx(1002.0)
+    # Snapped balance hasn't changed (no hysteresis re-snap via WS path)
+    assert bot.get_hysteresis_snapped_balance() == pytest.approx(1000.0)
+    # Execution should have been scheduled due to balance_raw change
+    assert bot.execution_scheduled is True
+
+
+@pytest.mark.asyncio
+async def test_run_execution_loop_stops_before_execute_when_signal_arrives_after_refresh():
+    bot = Passivbot.__new__(Passivbot)
+    executes = []
+
+    bot.stop_signal_received = False
+    bot.execution_scheduled = False
+    bot.state_change_detected_by_symbol = set()
+    bot.debug_mode = False
+    bot._equity_hard_stop_enabled = lambda *args, **kwargs: False
+    bot._set_log_silence_watchdog_context = lambda *args, **kwargs: None
+    bot._maybe_log_health_summary = lambda: None
+    bot._maybe_log_unstuck_status = lambda: None
+    bot._monitor_flush_snapshot = AsyncMock()
+    bot.restart_bot_on_too_many_errors = AsyncMock()
+    bot.live_value = lambda key: 0.0 if key == "execution_delay_seconds" else False
+
+    async def fake_update_pos_oos_pnls_ohlcvs():
+        bot.stop_signal_received = True
+        return True
+
+    async def fake_execute_to_exchange():
+        executes.append(True)
+        return {"unexpected": True}
+
+    bot.update_pos_oos_pnls_ohlcvs = fake_update_pos_oos_pnls_ohlcvs
+    bot.execute_to_exchange = fake_execute_to_exchange
+
+    result = await bot.run_execution_loop()
+
+    assert result is None
+    assert executes == []
+
+
+@pytest.mark.asyncio
+async def test_run_execution_loop_propagates_fatal_bot_exception():
+    bot = Passivbot.__new__(Passivbot)
+
+    bot.stop_signal_received = False
+    bot.execution_scheduled = False
+    bot.state_change_detected_by_symbol = set()
+    bot.debug_mode = False
+    bot._equity_hard_stop_enabled = lambda *args, **kwargs: False
+    bot._set_log_silence_watchdog_context = lambda *args, **kwargs: None
+    bot._maybe_log_health_summary = lambda: None
+    bot._maybe_log_unstuck_status = lambda: None
+    bot._monitor_flush_snapshot = AsyncMock()
+    bot.restart_bot_on_too_many_errors = AsyncMock()
+    bot.live_value = lambda key: 0.0 if key == "execution_delay_seconds" else False
+
+    async def fake_update_pos_oos_pnls_ohlcvs():
+        raise FatalBotException("fatal")
+
+    bot.update_pos_oos_pnls_ohlcvs = fake_update_pos_oos_pnls_ohlcvs
+    bot.execute_to_exchange = AsyncMock()
+
+    with pytest.raises(FatalBotException, match="fatal"):
+        await bot.run_execution_loop()

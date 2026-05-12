@@ -3,15 +3,52 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
+import time
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 TRACE_LEVEL = 5
 TRACE_LEVEL_NAME = "TRACE"
 
 DEFAULT_FORMAT = "%(asctime)s %(levelname)-8s %(message)s"
-DEFAULT_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+DEFAULT_FORMAT_WITH_PREFIX = "%(asctime)s %(levelname)-8s [%(log_prefix)s] %(message)s"
+DEFAULT_DATEFMT = "%Y-%m-%dT%H:%M:%SZ"
+_LAST_LOG_ACTIVITY_MONOTONIC = time.monotonic()
+DEFAULT_LOG_FILENAME_MAX_LEN = 100
+
+
+class PrefixFilter(logging.Filter):
+    """Filter that adds a log_prefix attribute to log records."""
+
+    def __init__(self, prefix: str = ""):
+        super().__init__()
+        self.prefix = prefix
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.log_prefix = self.prefix
+        return True
+
+
+class ActivityFilter(logging.Filter):
+    """Filter that tracks the most recent emitted log record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        mark_log_activity()
+        return True
+
+
+def mark_log_activity() -> None:
+    global _LAST_LOG_ACTIVITY_MONOTONIC
+    _LAST_LOG_ACTIVITY_MONOTONIC = time.monotonic()
+
+
+def get_last_log_activity_monotonic() -> float:
+    return _LAST_LOG_ACTIVITY_MONOTONIC
+
 
 _LOG_LEVEL_ALIASES = {
     "warning": 0,
@@ -89,40 +126,122 @@ def _debug_to_level(debug: int) -> int:
     return TRACE_LEVEL
 
 
+def sanitize_log_filename(text: str, *, max_len: int = DEFAULT_LOG_FILENAME_MAX_LEN) -> str:
+    """Return a filesystem-safe filename fragment."""
+    sanitized = re.sub(r"[\s/\\]", "_", text)
+    sanitized = re.sub(r'[<>:"|?*]', "", sanitized)
+    sanitized = sanitized.strip(". ")
+    if len(sanitized) > max_len:
+        sanitized = sanitized[:max_len]
+    return sanitized or "log"
+
+
+def create_command_log_filename(
+    command_args: Sequence[object], *, timestamp: Optional[datetime] = None
+) -> str:
+    """Return a timestamped log filename for a command invocation."""
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc)
+    elif timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    command_str = " ".join(str(part) for part in command_args)
+    sanitized_command = sanitize_log_filename(command_str)
+    prefix = timestamp.astimezone(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"{prefix}_{sanitized_command}.log"
+
+
+def build_command_log_path(
+    command_args: Sequence[object], log_dir: str | Path, *, timestamp: Optional[datetime] = None
+) -> Path:
+    """Return the log file path for a command invocation under the given directory."""
+    return Path(log_dir).expanduser() / create_command_log_filename(command_args, timestamp=timestamp)
+
+
+def update_stable_log_alias(alias_path: str | Path, target_path: str | Path) -> None:
+    """Point a stable log alias at the current run's timestamped logfile."""
+    alias = Path(alias_path).expanduser()
+    target = Path(target_path).expanduser()
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if alias.exists() or alias.is_symlink():
+        if alias.is_dir() and not alias.is_symlink():
+            raise RuntimeError(f"stable log alias path is a directory: {alias}")
+        alias.unlink()
+    relative_target = os.path.relpath(target, start=alias.parent)
+    try:
+        alias.symlink_to(relative_target)
+    except OSError as exc:
+        raise RuntimeError(
+            f"failed to create stable live log alias {alias} -> {target}: {exc}"
+        ) from exc
+
+
 def configure_logging(
     debug: Optional[int | str] = 1,
     *,
     log_file: Optional[str] = None,
+    current_log_file: Optional[str] = None,
     rotation: bool = False,
     max_bytes: int = 10 * 1024 * 1024,
     backup_count: int = 5,
     stream: bool = True,
-    fmt: str = DEFAULT_FORMAT,
+    fmt: Optional[str] = None,
     datefmt: str = DEFAULT_DATEFMT,
+    prefix: Optional[str] = None,
 ) -> None:
-    """Initialise the root logger based on Passivbot's debug settings."""
+    """Initialise the root logger based on Passivbot's debug settings.
+
+    Args:
+        debug: Logging level (0=warning, 1=info, 2=debug, 3=trace)
+        log_file: Optional path to canonical log file
+        current_log_file: Optional stable alias path pointing at the current log file
+        rotation: Enable log rotation
+        max_bytes: Max bytes per log file before rotation
+        backup_count: Number of backup files to keep
+        stream: Enable console output
+        fmt: Custom log format (defaults based on prefix)
+        datefmt: Date format string
+        prefix: Optional prefix to add to all log messages (e.g., exchange name)
+    """
     _ensure_trace_level()
     debug_level = _normalize_debug(debug)
     numeric_level = _debug_to_level(debug_level)
 
+    # Choose format based on prefix
+    if fmt is None:
+        fmt = DEFAULT_FORMAT_WITH_PREFIX if prefix else DEFAULT_FORMAT
+
     formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
+    formatter.converter = time.gmtime
     handlers: list[logging.Handler] = []
+
+    # Create prefix filter if needed
+    prefix_filter = PrefixFilter(prefix or "") if prefix else None
+    activity_filter = ActivityFilter()
 
     if stream:
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
         stream_handler.setLevel(numeric_level)
+        stream_handler.addFilter(activity_filter)
+        if prefix_filter:
+            stream_handler.addFilter(prefix_filter)
         handlers.append(stream_handler)
 
     if log_file:
         path = Path(log_file).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if current_log_file:
+            update_stable_log_alias(current_log_file, path)
         if rotation:
             file_handler = RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backup_count)
         else:
             file_handler = logging.FileHandler(path)
         file_handler.setFormatter(formatter)
         file_handler.setLevel(numeric_level)
+        file_handler.addFilter(activity_filter)
+        if prefix_filter:
+            file_handler.addFilter(prefix_filter)
         handlers.append(file_handler)
 
     root = logging.getLogger()
@@ -134,3 +253,48 @@ def configure_logging(
 
     for handler in handlers:
         root.addHandler(handler)
+
+    # Configure CCXT logger to only log at TRACE level.
+    # CCXT logs full API request/response payloads at DEBUG, which is too noisy.
+    # These payloads belong at TRACE (level 3) per log_analysis_prompt.md guidelines.
+    ccxt_logger = logging.getLogger("ccxt")
+    if debug_level >= 3:
+        # TRACE mode: allow CCXT logs through
+        ccxt_logger.setLevel(TRACE_LEVEL)
+    else:
+        # DEBUG and below: suppress CCXT's noisy API payloads
+        # Set to WARNING so only actual warnings/errors from CCXT are shown
+        ccxt_logger.setLevel(logging.WARNING)
+
+
+def resolve_live_log_file_settings(
+    config: dict[str, Any], *, user: str, command_args: Optional[Sequence[object]] = None
+) -> dict[str, Any]:
+    """Return configure_logging kwargs for canonical live file logging."""
+    logging_cfg = config.get("logging", {}) if isinstance(config, dict) else {}
+    if not isinstance(logging_cfg, dict):
+        logging_cfg = {}
+    if not bool(logging_cfg.get("persist_to_file", True)):
+        return {
+            "log_file": None,
+            "current_log_file": None,
+            "rotation": False,
+            "max_bytes": 10 * 1024 * 1024,
+            "backup_count": 5,
+        }
+
+    log_dir = str(logging_cfg.get("dir", "logs")).strip() or "logs"
+    max_bytes_mb = float(logging_cfg.get("max_bytes_mb", 10.0))
+    backup_count = int(logging_cfg.get("backup_count", 5))
+    effective_command_args: Sequence[object]
+    if command_args:
+        effective_command_args = command_args
+    else:
+        effective_command_args = ["passivbot live", "--user", user]
+    return {
+        "log_file": str(build_command_log_path(effective_command_args, log_dir)),
+        "current_log_file": str(Path(log_dir).expanduser() / f"{user}.log"),
+        "rotation": bool(logging_cfg.get("rotation", False)),
+        "max_bytes": max(1, int(max_bytes_mb * 1024 * 1024)),
+        "backup_count": max(0, backup_count),
+    }

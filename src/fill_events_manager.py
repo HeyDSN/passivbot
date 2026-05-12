@@ -12,28 +12,211 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import os
+import random
+import tempfile
+import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypedDict
 
 from ccxt.base.errors import RateLimitExceeded
+from config import load_input_config, prepare_config
 
 try:
     from utils import ts_to_date  # type: ignore
 except ImportError:  # pragma: no cover - fallback for package-relative execution
     from .utils import ts_to_date
 
-from config_utils import format_config, load_config
 from logging_setup import configure_logging
 from procedures import load_user_info
+from pure_funcs import ensure_millis
 
 logger = logging.getLogger(__name__)
+
+# Throttle state for spammy warnings
+_pnl_discrepancy_last_log: Dict[str, float] = {}  # exchange:user -> last log time
+_pnl_discrepancy_last_delta: Dict[str, float] = {}  # exchange:user -> last delta value
+_PNL_DISCREPANCY_THROTTLE_SECONDS = 3600.0  # Log at most once per hour if delta unchanged
+_PNL_DISCREPANCY_CHANGE_THRESHOLD = 0.10  # Consider delta "changed" if >10%
+_PNL_DISCREPANCY_MIN_SECONDS = 900.0  # Minimum seconds between logs even if delta changes
+
+
+# ---------------------------------------------------------------------------
+# Rate Limit Coordination
+# ---------------------------------------------------------------------------
+
+# Default rate limits per exchange (calls per minute)
+_DEFAULT_RATE_LIMITS: Dict[str, Dict[str, int]] = {
+    "binance": {"fetch_my_trades": 1200, "fetch_income_history": 120, "default": 1200},
+    "bybit": {"fetch_my_trades": 120, "fetch_positions_history": 120, "default": 120},
+    "bitget": {"fill_history": 120, "fetch_order": 60, "default": 120},
+    "hyperliquid": {"fetch_my_trades": 120, "default": 120},
+    "gateio": {"fetch_closed_orders": 120, "default": 120},
+    "kucoin": {
+        "fetch_my_trades": 120,
+        "fetch_positions_history": 120,
+        "fetch_order": 60,
+        "default": 120,
+    },
+    # OKX: /fills = 60 req/2s, /fills-history = 10 req/2s (conservative estimates)
+    "okx": {"fetch_my_trades": 1800, "fills_history": 300, "default": 300},
+}
+
+# Window for rate limit tracking (ms)
+_RATE_LIMIT_WINDOW_MS = 60_000
+
+# Default jitter range for staggered startup (seconds)
+_STARTUP_JITTER_MIN = 0.0
+_STARTUP_JITTER_MAX = 30.0
+
+
+class RateLimitCoordinator:
+    """Coordinates rate limiting across multiple bot instances via shared temp file.
+
+    Each exchange has a temp file that logs recent API calls. Instances check this
+    file before making API calls and add jitter if approaching rate limits.
+    """
+
+    def __init__(
+        self,
+        exchange: str,
+        user: str,
+        *,
+        temp_dir: Optional[Path] = None,
+        window_ms: int = _RATE_LIMIT_WINDOW_MS,
+        limits: Optional[Dict[str, int]] = None,
+    ) -> None:
+        self.exchange = exchange.lower()
+        self.user = user
+        self.window_ms = window_ms
+        self.limits = limits or _DEFAULT_RATE_LIMITS.get(self.exchange, {"default": 120})
+
+        if temp_dir is None:
+            temp_dir = Path(tempfile.gettempdir()) / "passivbot_rate_limits"
+        self.temp_dir = temp_dir
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_file = self.temp_dir / f"{self.exchange}.json"
+
+    def _load_calls(self) -> List[Dict[str, object]]:
+        """Load recent API calls from temp file."""
+        if not self.temp_file.exists():
+            return []
+        try:
+            with self.temp_file.open("r") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    data = json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                return data.get("calls", [])
+        except Exception as exc:
+            logger.debug("RateLimitCoordinator: failed to load %s: %s", self.temp_file, exc)
+            return []
+
+    def _save_calls(self, calls: List[Dict[str, object]]) -> None:
+        """Save API calls to temp file atomically."""
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+        # Prune old entries
+        cutoff = now_ms - self.window_ms
+        calls = [c for c in calls if c.get("timestamp_ms", 0) > cutoff]
+
+        data = {
+            "calls": calls,
+            "window_ms": self.window_ms,
+            "limits": self.limits,
+            "last_update": now_ms,
+        }
+
+        tmp_file = self.temp_file.with_suffix(".tmp")
+        try:
+            with tmp_file.open("w") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    json.dump(data, f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            os.replace(tmp_file, self.temp_file)
+        except Exception as exc:
+            logger.debug("RateLimitCoordinator: failed to save %s: %s", self.temp_file, exc)
+
+    def get_current_usage(self, endpoint: str) -> int:
+        """Get current call count for an endpoint in the current window."""
+        calls = self._load_calls()
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        cutoff = now_ms - self.window_ms
+        return sum(
+            1 for c in calls if c.get("endpoint") == endpoint and c.get("timestamp_ms", 0) > cutoff
+        )
+
+    def get_limit(self, endpoint: str) -> int:
+        """Get rate limit for an endpoint."""
+        return self.limits.get(endpoint, self.limits.get("default", 120))
+
+    def record_call(self, endpoint: str) -> None:
+        """Record an API call."""
+        calls = self._load_calls()
+        calls.append(
+            {
+                "endpoint": endpoint,
+                "timestamp_ms": int(datetime.now(tz=timezone.utc).timestamp() * 1000),
+                "user": self.user,
+            }
+        )
+        self._save_calls(calls)
+
+    async def wait_if_needed(self, endpoint: str) -> float:
+        """Check rate limit and wait if needed. Returns time waited (seconds)."""
+        current = self.get_current_usage(endpoint)
+        limit = self.get_limit(endpoint)
+
+        if current >= limit:
+            # At or over limit - wait for full window
+            wait_time = self.window_ms / 1000.0
+            logger.info(
+                "RateLimitCoordinator: %s:%s at limit (%d/%d), waiting %.1fs",
+                self.exchange,
+                endpoint,
+                current,
+                limit,
+                wait_time,
+            )
+            await asyncio.sleep(wait_time)
+            return wait_time
+        elif current >= limit * 0.8:
+            # Approaching limit - add jitter
+            jitter = random.uniform(0.1, 2.0)
+            logger.debug(
+                "RateLimitCoordinator: %s:%s approaching limit (%d/%d), jitter %.2fs",
+                self.exchange,
+                endpoint,
+                current,
+                limit,
+                jitter,
+            )
+            await asyncio.sleep(jitter)
+            return jitter
+
+        return 0.0
+
+    @staticmethod
+    async def startup_jitter(
+        min_seconds: float = _STARTUP_JITTER_MIN,
+        max_seconds: float = _STARTUP_JITTER_MAX,
+    ) -> float:
+        """Apply random jitter at startup to stagger multiple bot launches."""
+        jitter = random.uniform(min_seconds, max_seconds)
+        if jitter > 0:
+            logger.info("RateLimitCoordinator: startup jitter %.2fs", jitter)
+            await asyncio.sleep(jitter)
+        return jitter
 
 
 def _format_ms(ts: Optional[int]) -> str:
@@ -77,10 +260,243 @@ def _merge_fee_lists(
     return [dict(value) for value in merged.values()]
 
 
+def _fee_cost(fees: Optional[Sequence]) -> float:
+    """Sum fee costs defensively, tolerating missing/partial structures."""
+    total = 0.0
+    if not fees:
+        return total
+    items: Sequence
+    if isinstance(fees, dict):
+        items = [fees]
+    else:
+        try:
+            items = list(fees)
+        except Exception:
+            return total
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            total += float(entry.get("cost", 0.0))
+        except Exception:
+            continue
+    return total
+
+
+def ensure_qty_signage(events: List[Dict[str, object]]) -> None:
+    """Normalize qty sign convention: buys positive, sells negative."""
+    for ev in events:
+        side = str(ev.get("side") or "").lower()
+        qty = float(ev.get("qty") or ev.get("amount") or 0.0)
+        if qty == 0.0:
+            continue
+        if side == "buy" and qty < 0:
+            ev["qty"] = abs(qty)
+        elif side == "sell" and qty > 0:
+            ev["qty"] = -abs(qty)
+
+
+def _compute_add_reduce(pos_side: str, qty_signed: float) -> Tuple[float, float]:
+    """Compute add/reduce amounts based on position side and signed qty.
+
+    Args:
+        pos_side: "long" or "short"
+        qty_signed: Signed quantity (buy +, sell -)
+
+    Returns:
+        (add_amt, reduce_amt) tuple
+    """
+    if pos_side == "short":
+        add_amt = max(-qty_signed, 0.0)  # sells are negative -> add
+        reduce_amt = max(qty_signed, 0.0)  # buys positive -> reduce short
+    else:
+        add_amt = max(qty_signed, 0.0)  # buys add to long
+        reduce_amt = max(-qty_signed, 0.0)  # sells reduce long
+    return add_amt, reduce_amt
+
+
+def compute_psize_pprice(
+    events: List[Dict[str, object]],
+    initial_state: Optional[Dict[Tuple[str, str], Tuple[float, float]]] = None,
+) -> Dict[Tuple[str, str], Tuple[float, float]]:
+    """
+    Compute psize/pprice for each fill event using two-phase algorithm.
+
+    Phase 1: Forward iteration to compute final position state, storing
+             the state before each fill for use in phase 2.
+    Phase 2: Backward iteration to annotate each event with the "after" state.
+
+    This approach is cleaner than multi-pass reconciliation because working
+    backwards from a known final state is deterministic - no reconciliation needed.
+
+    Args:
+        events: List of fill event dicts (must have: symbol, position_side, side, qty, price)
+                Qty sign must be normalized (buy +, sell -).
+        initial_state: Optional starting positions {(symbol, pside): (size, price)}
+
+    Returns:
+        Final position state after all fills: {(symbol, pside): (size, price)}
+    """
+    if not events:
+        return {}
+
+    # Group events by (symbol, position_side)
+    grouped: Dict[Tuple[str, str], List[Dict[str, object]]] = defaultdict(list)
+    for ev in events:
+        key = (
+            str(ev.get("symbol") or ""),
+            str(ev.get("position_side") or ev.get("pside") or "long").lower(),
+        )
+        grouped[key].append(ev)
+
+    final_state: Dict[Tuple[str, str], Tuple[float, float]] = {}
+
+    for key, evs in grouped.items():
+        evs.sort(key=lambda x: x.get("timestamp", 0))
+
+        # Phase 1: Forward to compute final state, storing before-state for each fill
+        psize = initial_state.get(key, (0.0, 0.0))[0] if initial_state else 0.0
+        pprice = initial_state.get(key, (0.0, 0.0))[1] if initial_state else 0.0
+
+        # Store (before_psize, before_pprice, after_psize, after_pprice) for each fill
+        states: List[Tuple[float, float, float, float]] = []
+
+        for ev in evs:
+            qty_signed = float(ev.get("qty") or ev.get("amount") or 0.0) * float(
+                ev.get("c_mult", 1.0) or 1.0
+            )
+            price = float(ev.get("price") or 0.0)
+            add_amt, reduce_amt = _compute_add_reduce(key[1], qty_signed)
+
+            before_psize = psize
+            before_pprice = pprice
+
+            # Update position
+            if add_amt > 0:
+                if psize <= 0:
+                    pprice = price
+                else:
+                    pprice = ((psize * pprice) + (add_amt * price)) / (psize + add_amt)
+                psize += add_amt
+            if reduce_amt > 0:
+                psize = max(0.0, psize - reduce_amt)
+                if psize <= 1e-12:
+                    psize = 0.0
+                    pprice = 0.0
+
+            states.append((before_psize, before_pprice, psize, pprice))
+
+        final_state[key] = (psize, pprice)
+
+        # Phase 2: Annotate each event with its after-state
+        # The states list already contains the after-state for each fill
+        for ev, (_, _, after_psize, after_pprice) in zip(evs, states):
+            ev["psize"] = round(after_psize, 12)
+            ev["pprice"] = after_pprice
+
+    return final_state
+
+
+def annotate_positions_inplace(
+    events: List[Dict[str, object]],
+    state: Optional[Dict[Tuple[str, str], Tuple[float, float]]] = None,
+    *,
+    recompute_pnl: bool = False,
+) -> Dict[Tuple[str, str], Tuple[float, float]]:
+    """
+    Legacy wrapper around compute_psize_pprice for backward compatibility.
+
+    Note: recompute_pnl is no longer supported in the simplified algorithm.
+    Fetchers are responsible for computing correct PnL values during fetch.
+    """
+    if recompute_pnl:
+        logger.warning("annotate_positions_inplace: recompute_pnl=True is deprecated and ignored")
+    return compute_psize_pprice(events, state)
+
+
+def compute_realized_pnls_from_trades(
+    trades: List[Dict[str, object]],
+) -> Tuple[Dict[str, float], Dict[Tuple[str, str], Tuple[float, float]]]:
+    """
+    Compute realized PnL per trade by reconstructing positions from fills.
+
+    Tracks positions separately per (symbol, position_side) so hedged longs/shorts
+    do not interfere. Position_size is always kept as a positive magnitude for the
+    given side; reductions trigger realized PnL.
+
+    Returns:
+        per_trade_pnl: mapping trade_id -> realized pnl (gross, without fees)
+        final_positions: mapping (symbol, position_side) -> (pos_size, vwap)
+    """
+    per_trade: Dict[str, float] = {}
+    positions: Dict[Tuple[str, str], Tuple[float, float]] = {}
+
+    for trade in sorted(trades, key=lambda x: x.get("timestamp", 0)):
+        trade_id = str(trade.get("id") or "")
+        if not trade_id:
+            continue
+        symbol = str(trade.get("symbol") or "")
+        side = str(trade.get("side") or "").lower()
+        pos_side = str(trade.get("position_side") or trade.get("pside") or "long").lower()
+        qty = abs(float(trade.get("qty") or trade.get("amount") or 0.0))
+        price = float(trade.get("price") or 0.0)
+        if qty <= 0 or price <= 0 or not symbol:
+            per_trade[trade_id] = 0.0
+            continue
+
+        key = (symbol, pos_side)
+        pos_size, vwap = positions.get(key, (0.0, 0.0))
+
+        # Determine whether this trade adds or reduces for this side
+        if pos_side == "short":
+            adds = side == "sell"
+        else:  # long or unknown
+            adds = side == "buy"
+
+        realized = 0.0
+        if not adds:
+            # reducing position
+            if pos_size > 0:
+                closing_qty = min(pos_size, qty)
+                if pos_side == "short":
+                    realized += (vwap - price) * closing_qty
+                else:
+                    realized += (price - vwap) * closing_qty
+                pos_size -= closing_qty
+                if pos_size < 1e-12:
+                    pos_size = 0.0
+                    vwap = 0.0
+                leftover = qty - closing_qty
+                if leftover > 0:
+                    # trade overshoots and becomes a new position in trade direction
+                    pos_size = leftover
+                    vwap = price
+        else:
+            # adding to position
+            new_size = pos_size + qty
+            if pos_size == 0.0:
+                vwap = price
+            else:
+                vwap = ((pos_size * vwap) + (qty * price)) / (pos_size + qty)
+            pos_size = new_size
+
+        positions[key] = (pos_size, vwap)
+        per_trade[trade_id] = realized
+
+    return per_trade, positions
+
+
 def _coalesce_events(events: List[Dict[str, object]]) -> List[Dict[str, object]]:
     """Group events sharing timestamp/symbol/pb_type/side/position."""
     aggregated: Dict[Tuple, Dict[str, object]] = {}
     order: List[Tuple] = []
+
+    def _event_source_ids(ev: Dict[str, object]) -> List[str]:
+        ids = ev.get("source_ids")
+        if ids:
+            return [str(x) for x in ids if x]
+        return []
+
     for ev in events:
         key = (
             ev.get("timestamp"),
@@ -92,9 +508,13 @@ def _coalesce_events(events: List[Dict[str, object]]) -> List[Dict[str, object]]
         if key not in aggregated:
             aggregated[key] = dict(ev)
             aggregated[key]["id"] = str(ev.get("id", ""))
+            src_ids = _event_source_ids(ev)
+            if src_ids:
+                aggregated[key]["source_ids"] = src_ids
             aggregated[key]["qty"] = float(ev.get("qty", 0.0))
             aggregated[key]["pnl"] = float(ev.get("pnl", 0.0))
             aggregated[key]["fees"] = _merge_fee_lists(ev.get("fees"), None)
+            aggregated[key]["raw"] = _normalize_raw_field(ev.get("raw"))
             aggregated[key]["_price_numerator"] = float(ev.get("price", 0.0)) * float(
                 ev.get("qty", 0.0)
             )
@@ -102,9 +522,15 @@ def _coalesce_events(events: List[Dict[str, object]]) -> List[Dict[str, object]]
         else:
             agg = aggregated[key]
             agg["id"] = f"{agg['id']}+{ev.get('id', '')}".strip("+")
+            src_ids = _event_source_ids(ev)
+            if src_ids:
+                merged_ids = set(agg.get("source_ids") or [])
+                merged_ids.update(src_ids)
+                agg["source_ids"] = sorted(merged_ids)
             agg["qty"] = float(agg.get("qty", 0.0)) + float(ev.get("qty", 0.0))
             agg["pnl"] = float(agg.get("pnl", 0.0)) + float(ev.get("pnl", 0.0))
             agg["fees"] = _merge_fee_lists(agg.get("fees"), ev.get("fees"))
+            agg["raw"] = _normalize_raw_field(agg.get("raw")) + _normalize_raw_field(ev.get("raw"))
             agg["_price_numerator"] = float(agg.get("_price_numerator", 0.0)) + float(
                 ev.get("price", 0.0)
             ) * float(ev.get("qty", 0.0))
@@ -149,6 +575,91 @@ def _check_pagination_progress(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_raw_field(raw: object) -> List[Dict[str, object]]:
+    """Normalize raw field to List[Dict] format.
+
+    Handles migration from old Dict format to new List[Dict] format.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        # Already in new format - validate and return
+        return [dict(item) if isinstance(item, dict) else {"data": item} for item in raw]
+    if isinstance(raw, dict):
+        # Old format: single dict -> wrap in list with "legacy" source
+        return [{"source": "legacy", "data": raw}]
+    # Unknown format
+    return [{"source": "unknown", "data": str(raw)}]
+
+
+def _extract_source_ids(raw: object, fallback_id: Optional[object]) -> List[str]:
+    """Extract stable source IDs from raw payloads, with fallback to event id."""
+    ids: set[str] = set()
+    raw_items = _normalize_raw_field(raw)
+    for item in raw_items:
+        data = item.get("data") if isinstance(item, dict) else item
+        if isinstance(data, dict):
+            # Prefer canonical trade ids if present
+            for key in ("id", "tradeId", "trade_id", "execId"):
+                val = data.get(key)
+                if val:
+                    ids.add(str(val))
+            info = data.get("info")
+            if isinstance(info, dict):
+                for key in ("tid", "id", "tradeId", "trade_id", "execId"):
+                    val = info.get(key)
+                    if val:
+                        ids.add(str(val))
+    if not ids and fallback_id:
+        ids.add(str(fallback_id))
+    return sorted(ids)
+
+
+def _bybit_trade_dedupe_key(trade: Dict[str, object]) -> Optional[Tuple[object, ...]]:
+    """Build a stable dedupe key for Bybit fetch_my_trades rows."""
+    info = trade.get("info")
+    info = info if isinstance(info, dict) else {}
+    exec_id = trade.get("id") or info.get("execId")
+    if exec_id:
+        return ("exec_id", str(exec_id))
+    # Fallback for malformed rows missing explicit exec ids.
+    timestamp = int(trade.get("timestamp") or info.get("execTime") or 0)
+    symbol = str(trade.get("symbol") or info.get("symbol") or "")
+    side = str(trade.get("side") or info.get("side") or "").lower()
+    order_id = str(trade.get("order") or info.get("orderId") or "")
+    amount = float(trade.get("amount") or info.get("execQty") or 0.0)
+    price = float(trade.get("price") or info.get("execPrice") or 0.0)
+    if timestamp <= 0 or not symbol or not side or not order_id or amount <= 0.0 or price <= 0.0:
+        return None
+    return ("fallback", timestamp, symbol, side, order_id, amount, price)
+
+
+def _bybit_trade_qty_abs(trade: Dict[str, object]) -> float:
+    info = trade.get("info")
+    info = info if isinstance(info, dict) else {}
+    return abs(float(trade.get("amount") or info.get("execQty") or 0.0))
+
+
+def _bybit_trade_qty_signed(trade: Dict[str, object]) -> float:
+    info = trade.get("info")
+    info = info if isinstance(info, dict) else {}
+    side = str(trade.get("side") or info.get("side") or "").lower()
+    qty = _bybit_trade_qty_abs(trade)
+    if side == "sell":
+        return -qty
+    return qty
+
+
+def _bybit_event_group_key(event: FillEvent) -> Tuple[int, str, str, str, str]:
+    return (
+        int(event.timestamp),
+        str(event.symbol),
+        str(event.pb_order_type),
+        str(event.side).lower(),
+        str(event.position_side).lower(),
+    )
+
+
 @dataclass(frozen=True)
 class FillEvent:
     """Canonical representation of a single fill event."""
@@ -165,6 +676,10 @@ class FillEvent:
     pb_order_type: str
     position_side: str
     client_order_id: str
+    source_ids: List[str] = field(default_factory=list)
+    psize: float = 0.0
+    pprice: float = 0.0
+    raw: List[Dict[str, object]] = None  # List of raw payloads from multiple sources
 
     @property
     def key(self) -> str:
@@ -173,6 +688,7 @@ class FillEvent:
     def to_dict(self) -> Dict[str, object]:
         return {
             "id": self.id,
+            "source_ids": list(self.source_ids) if self.source_ids is not None else [],
             "timestamp": self.timestamp,
             "datetime": self.datetime,
             "symbol": self.symbol,
@@ -184,6 +700,9 @@ class FillEvent:
             "pb_order_type": self.pb_order_type,
             "position_side": self.position_side,
             "client_order_id": self.client_order_id,
+            "psize": self.psize,
+            "pprice": self.pprice,
+            "raw": self.raw if self.raw is not None else [],
         }
 
     @classmethod
@@ -205,6 +724,11 @@ class FillEvent:
             raise ValueError(f"Fill event missing required keys: {missing}")
         return cls(
             id=str(data["id"]),
+            source_ids=(
+                _extract_source_ids(data.get("raw"), data.get("id"))
+                if not data.get("source_ids")
+                else [str(x) for x in data.get("source_ids") if x]
+            ),
             timestamp=int(data["timestamp"]),
             datetime=str(data.get("datetime") or ts_to_date(int(data["timestamp"]))),
             symbol=str(data["symbol"]),
@@ -216,12 +740,52 @@ class FillEvent:
             pb_order_type=str(data["pb_order_type"]),
             position_side=str(data["position_side"]).lower(),
             client_order_id=str(data["client_order_id"]),
+            psize=float(data.get("psize", 0.0)),
+            pprice=float(data.get("pprice", 0.0)),
+            raw=_normalize_raw_field(data.get("raw")),
         )
 
 
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
+
+# Maximum retry attempts before marking gap as persistent
+_GAP_MAX_RETRIES = 3
+
+# Gap confidence levels
+GAP_CONFIDENCE_UNKNOWN = 0.0
+GAP_CONFIDENCE_SUSPICIOUS = 0.3
+GAP_CONFIDENCE_LIKELY_LEGITIMATE = 0.7
+GAP_CONFIDENCE_CONFIRMED = 1.0
+
+# Gap reasons
+GAP_REASON_AUTO = "auto_detected"
+GAP_REASON_FETCH_FAILED = "fetch_failed"
+GAP_REASON_CONFIRMED = "confirmed_legitimate"
+GAP_REASON_MANUAL = "manual"
+
+
+class KnownGap(TypedDict, total=False):
+    """Gap metadata stored in metadata.json known_gaps."""
+
+    start_ts: int  # Gap start timestamp (ms)
+    end_ts: int  # Gap end timestamp (ms)
+    retry_count: int  # Number of fetch attempts (max 3)
+    reason: str  # auto_detected, fetch_failed, confirmed_legitimate, manual
+    added_at: int  # Timestamp when gap was first detected
+    confidence: float  # 0.0=unknown, 0.3=suspicious, 0.7=likely_ok, 1.0=confirmed
+
+
+class CacheMetadata(TypedDict, total=False):
+    """Cache metadata stored in metadata.json."""
+
+    last_refresh_ms: int  # Timestamp of last successful refresh
+    oldest_event_ts: int  # Oldest event timestamp in cache
+    newest_event_ts: int  # Newest event timestamp in cache
+    covered_start_ms: int  # Earliest open-ended lookback start confirmed against exchange
+    known_gaps: List[KnownGap]  # List of known gaps
+    history_scope: str  # unknown, window, all
 
 
 class FillEventCache:
@@ -230,6 +794,7 @@ class FillEventCache:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
+        self._metadata: Optional[CacheMetadata] = None
 
     def load(self) -> List[FillEvent]:
         files = sorted(self.root.glob("*.json"))
@@ -239,16 +804,16 @@ class FillEventCache:
                 with path.open("r", encoding="utf-8") as fh:
                     payload = json.load(fh) or []
             except Exception as exc:
-                logger.warning("FillEventCache.load: failed to read %s (%s)", path, exc)
+                logger.warning("[fills] cache load: failed to read %s (%s)", path, exc)
                 continue
             for raw in payload:
                 try:
                     events.append(FillEvent.from_dict(raw))
                 except Exception:
-                    logger.debug("FillEventCache.load: skipping malformed record in %s", path)
+                    logger.debug("[fills] cache load: skipping malformed record in %s", path)
         events.sort(key=lambda ev: ev.timestamp)
-        logger.info(
-            "FillEventCache.load: loaded %d events from %d files in %s",
+        logger.debug(
+            "[fills] cache loaded: %d events from %d files in %s",
             len(events),
             len(files),
             self.root,
@@ -280,11 +845,241 @@ class FillEventCache:
             with tmp_path.open("w", encoding="utf-8") as fh:
                 json.dump(payload, fh)
             os.replace(tmp_path, path)
-            logger.info(
-                "FillEventCache.save_days: wrote %d events to %s",
+            logger.debug(
+                "[fills] cache wrote %d events to %s",
                 len(payload),
-                path,
+                path.name,
             )
+
+    @property
+    def metadata_path(self) -> Path:
+        return self.root / "metadata.json"
+
+    def load_metadata(self) -> CacheMetadata:
+        """Load cache metadata from disk."""
+        if self._metadata is not None:
+            return self._metadata
+
+        default: CacheMetadata = {
+            "last_refresh_ms": 0,
+            "oldest_event_ts": 0,
+            "newest_event_ts": 0,
+            "covered_start_ms": 0,
+            "known_gaps": [],
+            "history_scope": "unknown",
+        }
+
+        if not self.metadata_path.exists():
+            self._metadata = default
+            return self._metadata
+
+        try:
+            with self.metadata_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                data = default
+            # Ensure all keys exist
+            for key in default:
+                data.setdefault(key, default[key])
+            self._metadata = data
+        except Exception as exc:
+            logger.warning("[fills] cache metadata: failed to read %s (%s)", self.metadata_path, exc)
+            self._metadata = default
+
+        return self._metadata
+
+    def save_metadata(self, metadata: Optional[CacheMetadata] = None) -> None:
+        """Save cache metadata to disk atomically."""
+        if metadata is not None:
+            self._metadata = metadata
+
+        if self._metadata is None:
+            return
+
+        tmp_path = self.metadata_path.with_suffix(".tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                json.dump(self._metadata, fh, indent=2)
+            os.replace(tmp_path, self.metadata_path)
+            logger.debug("FillEventCache.save_metadata: wrote to %s", self.metadata_path)
+        except Exception as exc:
+            logger.error(
+                "FillEventCache.save_metadata: failed to write %s (%s)", self.metadata_path, exc
+            )
+
+    def update_metadata_from_events(self, events: Sequence[FillEvent]) -> None:
+        """Update metadata timestamps based on events."""
+        if not events:
+            return
+
+        metadata = self.load_metadata()
+        timestamps = [ev.timestamp for ev in events]
+        oldest = min(timestamps)
+        newest = max(timestamps)
+
+        current_oldest = metadata.get("oldest_event_ts", 0)
+        current_newest = metadata.get("newest_event_ts", 0)
+
+        if current_oldest == 0 or oldest < current_oldest:
+            metadata["oldest_event_ts"] = oldest
+        if newest > current_newest:
+            metadata["newest_event_ts"] = newest
+
+        metadata["last_refresh_ms"] = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        self.save_metadata(metadata)
+
+    def get_known_gaps(self) -> List[KnownGap]:
+        """Return list of known gaps."""
+        return self.load_metadata().get("known_gaps", [])
+
+    def get_covered_start_ms(self) -> int:
+        """Return earliest open-ended lookback start confirmed against exchange."""
+        metadata = self.load_metadata()
+        return int(metadata.get("covered_start_ms", 0) or 0)
+
+    def mark_covered_start(self, start_ts: int) -> None:
+        """Persist earliest open-ended lookback start confirmed against exchange."""
+        metadata = self.load_metadata()
+        start_ts = int(start_ts)
+        current = int(metadata.get("covered_start_ms", 0) or 0)
+        if current == 0 or start_ts < current:
+            metadata["covered_start_ms"] = start_ts
+        metadata["last_refresh_ms"] = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        self.save_metadata(metadata)
+
+    def get_history_scope(self) -> str:
+        """Return the cached history coverage contract."""
+        scope = str(self.load_metadata().get("history_scope", "unknown") or "unknown").lower()
+        return scope if scope in {"unknown", "window", "all"} else "unknown"
+
+    def set_history_scope(self, scope: str) -> None:
+        """Persist the cache history coverage contract."""
+        normalized = str(scope or "unknown").lower()
+        if normalized not in {"unknown", "window", "all"}:
+            raise ValueError(f"invalid history scope {scope!r}")
+        metadata = self.load_metadata()
+        if metadata.get("history_scope") == normalized:
+            return
+        metadata["history_scope"] = normalized
+        self.save_metadata(metadata)
+
+    def add_known_gap(
+        self,
+        start_ts: int,
+        end_ts: int,
+        *,
+        reason: str = GAP_REASON_AUTO,
+        confidence: float = GAP_CONFIDENCE_UNKNOWN,
+    ) -> None:
+        """Add or update a known gap."""
+        metadata = self.load_metadata()
+        gaps = metadata.get("known_gaps", [])
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+        # Check for overlapping gap to update
+        for gap in gaps:
+            if gap["start_ts"] <= end_ts and gap["end_ts"] >= start_ts:
+                # Overlapping - merge
+                gap["start_ts"] = min(gap["start_ts"], start_ts)
+                gap["end_ts"] = max(gap["end_ts"], end_ts)
+                gap["retry_count"] = gap.get("retry_count", 0) + 1
+                if gap["retry_count"] >= _GAP_MAX_RETRIES:
+                    gap["confidence"] = max(
+                        gap.get("confidence", 0), GAP_CONFIDENCE_LIKELY_LEGITIMATE
+                    )
+                logger.info(
+                    "FillEventCache.add_known_gap: updated gap %s → %s (retry_count=%d)",
+                    _format_ms(gap["start_ts"]),
+                    _format_ms(gap["end_ts"]),
+                    gap["retry_count"],
+                )
+                self.save_metadata(metadata)
+                return
+
+        # New gap
+        new_gap: KnownGap = {
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "retry_count": 0,
+            "reason": reason,
+            "added_at": now_ms,
+            "confidence": confidence,
+        }
+        gaps.append(new_gap)
+        metadata["known_gaps"] = gaps
+        logger.info(
+            "FillEventCache.add_known_gap: added new gap %s → %s (reason=%s)",
+            _format_ms(start_ts),
+            _format_ms(end_ts),
+            reason,
+        )
+        self.save_metadata(metadata)
+
+    def clear_gap(self, start_ts: int, end_ts: int) -> bool:
+        """Remove a gap that has been filled. Returns True if a gap was removed."""
+        metadata = self.load_metadata()
+        gaps = metadata.get("known_gaps", [])
+        original_count = len(gaps)
+
+        # Remove gaps that are fully contained in the filled range
+        remaining = []
+        for gap in gaps:
+            if gap["start_ts"] >= start_ts and gap["end_ts"] <= end_ts:
+                logger.info(
+                    "FillEventCache.clear_gap: removed gap %s → %s",
+                    _format_ms(gap["start_ts"]),
+                    _format_ms(gap["end_ts"]),
+                )
+                continue
+            # Partial overlap - trim the gap
+            if gap["start_ts"] < start_ts < gap["end_ts"]:
+                gap["end_ts"] = start_ts
+            if gap["start_ts"] < end_ts < gap["end_ts"]:
+                gap["start_ts"] = end_ts
+            if gap["start_ts"] < gap["end_ts"]:
+                remaining.append(gap)
+
+        if len(remaining) != original_count:
+            metadata["known_gaps"] = remaining
+            self.save_metadata(metadata)
+            return True
+        return False
+
+    def should_retry_gap(self, gap: KnownGap) -> bool:
+        """Check if a gap should be retried (retry_count < max)."""
+        return gap.get("retry_count", 0) < _GAP_MAX_RETRIES
+
+    def get_coverage_summary(self) -> Dict[str, object]:
+        """Return a summary of cache coverage for debugging."""
+        metadata = self.load_metadata()
+        gaps = metadata.get("known_gaps", [])
+
+        persistent_gaps = [g for g in gaps if not self.should_retry_gap(g)]
+        retryable_gaps = [g for g in gaps if self.should_retry_gap(g)]
+
+        total_gap_ms = sum(g["end_ts"] - g["start_ts"] for g in gaps)
+
+        return {
+            "oldest_event_ts": metadata.get("oldest_event_ts", 0),
+            "newest_event_ts": metadata.get("newest_event_ts", 0),
+            "covered_start_ms": metadata.get("covered_start_ms", 0),
+            "last_refresh_ms": metadata.get("last_refresh_ms", 0),
+            "history_scope": self.get_history_scope(),
+            "total_gaps": len(gaps),
+            "persistent_gaps": len(persistent_gaps),
+            "retryable_gaps": len(retryable_gaps),
+            "total_gap_hours": total_gap_ms / (1000 * 60 * 60) if total_gap_ms > 0 else 0,
+            "gaps": [
+                {
+                    "start": _format_ms(g["start_ts"]),
+                    "end": _format_ms(g["end_ts"]),
+                    "retry_count": g.get("retry_count", 0),
+                    "reason": g.get("reason", "unknown"),
+                    "confidence": g.get("confidence", 0),
+                }
+                for g in gaps
+            ],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +1098,33 @@ class BaseFetcher:
         on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
     ) -> List[Dict[str, object]]:
         raise NotImplementedError
+
+
+class FakeFetcher(BaseFetcher):
+    """Fetch canonical fill events from the fake exchange ledger."""
+
+    def __init__(self, api) -> None:
+        self.api = api
+
+    async def fetch(
+        self,
+        since_ms: Optional[int],
+        until_ms: Optional[int],
+        detail_cache: Dict[str, Tuple[str, str]],
+        on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    ) -> List[Dict[str, object]]:
+        events = list(self.api.get_fill_events(since_ms, until_ms))
+        for event in events:
+            cache_entry = detail_cache.get(event["id"])
+            if cache_entry:
+                event["client_order_id"], event["pb_order_type"] = cache_entry
+            elif event["client_order_id"]:
+                event["pb_order_type"] = custom_id_to_snake(event["client_order_id"])
+            if not event["pb_order_type"]:
+                event["pb_order_type"] = "unknown"
+        if on_batch and events:
+            on_batch(events)
+        return events
 
 
 class BitgetFetcher(BaseFetcher):
@@ -352,7 +1174,7 @@ class BitgetFetcher(BaseFetcher):
         max_fetches = 400
         fetch_count = 0
 
-        logger.info(
+        logger.debug(
             "BitgetFetcher.fetch: start (since=%s, until=%s, limit=%d)",
             _format_ms(since_ms),
             _format_ms(until_ms),
@@ -369,6 +1191,13 @@ class BitgetFetcher(BaseFetcher):
             fetch_count += 1
             payload = await self.api.private_mix_get_v2_mix_order_fill_history(dict(params))
             fill_list = payload.get("data", {}).get("fillList") or []
+            if fetch_count > 1:
+                logger.debug(
+                    "BitgetFetcher.fetch: fetch #%d endTime=%s size=%d",
+                    fetch_count,
+                    _format_ms(params.get("endTime")),
+                    len(fill_list),
+                )
             if not fill_list:
                 if since_ms is None:
                     logger.debug("BitgetFetcher.fetch: empty batch without start bound; stopping")
@@ -460,7 +1289,7 @@ class BitgetFetcher(BaseFetcher):
             ordered = [ev for ev in ordered if ev["timestamp"] >= since_ms]
         if until_ms is not None:
             ordered = [ev for ev in ordered if ev["timestamp"] <= until_ms]
-        logger.info(
+        logger.debug(
             "BitgetFetcher.fetch: done (events=%d, detail_cache_hits=%d, detail_fetches=%d)",
             len(ordered),
             detail_hits,
@@ -570,6 +1399,7 @@ class BitgetFetcher(BaseFetcher):
             "pb_order_type": raw.get("pb_order_type", ""),
             "position_side": position_side,
             "client_order_id": raw.get("client_order_id"),
+            "raw": [{"source": "fill_history", "data": dict(raw)}],
         }
 
     def _resolve_symbol(self, market_symbol: Optional[str]) -> str:
@@ -616,6 +1446,36 @@ class BinanceFetcher(BaseFetcher):
         self.income_limit = min(1000, max(1, income_limit))  # cap to max 1000
         self._now_func = now_func or (lambda: int(datetime.now(tz=timezone.utc).timestamp() * 1000))
         self.trade_limit = max(1, trade_limit)
+        self._unsupported_symbols: set[str] = set()
+        self._market_symbols: Optional[set[str]] = None
+        self._markets_loaded = False
+
+    async def _get_market_symbols(self) -> Optional[set[str]]:
+        if self._market_symbols is not None:
+            return self._market_symbols
+        symbols = getattr(self.api, "symbols", None)
+        markets = getattr(self.api, "markets", None)
+        if (not symbols and not markets) and not self._markets_loaded:
+            try:
+                await self.api.load_markets()
+                self._markets_loaded = True
+            except Exception:
+                return None
+            symbols = getattr(self.api, "symbols", None)
+            markets = getattr(self.api, "markets", None)
+        if symbols:
+            self._market_symbols = set(symbols)
+        elif markets:
+            self._market_symbols = set(markets.keys())
+        else:
+            self._market_symbols = None
+        return self._market_symbols
+
+    def _note_unsupported_symbol(self, symbol: str) -> None:
+        if symbol in self._unsupported_symbols:
+            return
+        self._unsupported_symbols.add(symbol)
+        logger.debug("[fills] BinanceFetcher skipping unsupported symbol %s", symbol)
 
     async def fetch(
         self,
@@ -624,7 +1484,7 @@ class BinanceFetcher(BaseFetcher):
         detail_cache: Dict[str, Tuple[str, str]],
         on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
     ) -> List[Dict[str, object]]:
-        logger.info(
+        logger.debug(
             "BinanceFetcher.fetch: start since=%s until=%s",
             _format_ms(since_ms),
             _format_ms(until_ms),
@@ -635,6 +1495,13 @@ class BinanceFetcher(BaseFetcher):
         symbol_pool.update(ev["symbol"] for ev in income_events if ev.get("symbol"))
         if detail_cache is None:
             detail_cache = {}
+
+        supported_symbols = await self._get_market_symbols()
+        if supported_symbols:
+            unsupported = [sym for sym in symbol_pool if sym not in supported_symbols]
+            for sym in unsupported:
+                self._note_unsupported_symbol(sym)
+            symbol_pool = {sym for sym in symbol_pool if sym in supported_symbols}
 
         trade_events: Dict[str, Dict[str, object]] = {}
         trade_tasks: Dict[str, asyncio.Task[List[Dict[str, object]]]] = {}
@@ -794,7 +1661,7 @@ class BinanceFetcher(BaseFetcher):
         if on_batch and ordered:
             on_batch(ordered)
 
-        logger.info(
+        logger.debug(
             "BinanceFetcher.fetch: done events=%d (symbols=%d)",
             len(ordered),
             len(symbol_pool),
@@ -845,6 +1712,7 @@ class BinanceFetcher(BaseFetcher):
         params["endTime"] = int(min(until_ms, since_ms + week_buffer_ms))
         events = []
         previous_key: Optional[Tuple[Tuple[str, object], ...]] = None
+        fetch_count = 0
         while True:
             key = _check_pagination_progress(
                 previous_key,
@@ -854,7 +1722,19 @@ class BinanceFetcher(BaseFetcher):
             if key is None:
                 break
             previous_key = key
+            fetch_count += 1
             payload = await self.api.fapiprivate_get_income(params=params)
+            if fetch_count > 1:
+                payload_size = len(payload) if payload else 0
+                # Only log at INFO when there's actual data; DEBUG otherwise
+                log_fn = logger.info if payload_size > 0 else logger.debug
+                log_fn(
+                    "BinanceFetcher._fetch_income: fetch #%d startTime=%s endTime=%s size=%d",
+                    fetch_count,
+                    _format_ms(params.get("startTime")),
+                    _format_ms(params.get("endTime")),
+                    payload_size,
+                )
             if payload == []:
                 if params["startTime"] + week_buffer_ms >= until_ms:
                     break
@@ -881,12 +1761,13 @@ class BinanceFetcher(BaseFetcher):
             if since_ms is None and until_ms is None:
                 return await self.api.fetch_my_trades(ccxt_symbol, limit=limit)
 
-            end_bound = until_ms or (self._now_func() + 60 * 60 * 1000)
+            end_bound = until_ms or self._now_func()
             start_bound = since_ms or max(0, end_bound - 7 * 24 * 60 * 60 * 1000)
-            week_span = int(7 * 24 * 60 * 60 * 1000 * 0.999)
+            week_span = int(7 * 24 * 60 * 60 * 1000 * 0.99)
             params: Dict[str, object] = {}
             fetched: Dict[str, Dict[str, object]] = {}
             previous_key: Optional[Tuple[Tuple[str, object], ...]] = None
+            fetch_count = 0
 
             cursor = int(start_bound)
             while cursor <= end_bound:
@@ -901,11 +1782,24 @@ class BinanceFetcher(BaseFetcher):
                 if param_key is None:
                     break
                 previous_key = param_key
+                fetch_count += 1
                 batch = await self.api.fetch_my_trades(
                     ccxt_symbol,
                     limit=limit,
                     params=dict(params),
                 )
+                if fetch_count > 1:
+                    batch_size = len(batch) if batch else 0
+                    # Only log at INFO when there's actual data; DEBUG otherwise
+                    log_fn = logger.info if batch_size > 0 else logger.debug
+                    log_fn(
+                        "BinanceFetcher._fetch_symbol_trades: fetch #%d symbol=%s start=%s end=%s size=%d",
+                        fetch_count,
+                        ccxt_symbol,
+                        _format_ms(params["startTime"]),
+                        _format_ms(params["endTime"]),
+                        batch_size,
+                    )
                 if not batch:
                     cursor = window_end + 1
                     continue
@@ -934,6 +1828,10 @@ class BinanceFetcher(BaseFetcher):
             )
             return ordered
         except Exception as exc:  # pragma: no cover - depends on live API
+            msg = str(exc).lower() if exc else ""
+            if "does not have market symbol" in msg or "market symbol" in msg:
+                self._note_unsupported_symbol(ccxt_symbol)
+                return []
             logger.error("BinanceFetcher._fetch_symbol_trades: error %s (%s)", ccxt_symbol, exc)
             return []
 
@@ -999,6 +1897,7 @@ class BinanceFetcher(BaseFetcher):
             "client_order_id": client_order_id,
             "order_id": str(order_id) if order_id else "",
             "info": info,
+            "raw": [{"source": "fetch_my_trades", "data": dict(trade)}],
         }
 
     def _collect_symbols(self, provider: Callable[[], Iterable[str]]) -> List[str]:
@@ -1041,11 +1940,13 @@ class FillEventsManager:
         user: str,
         fetcher: BaseFetcher,
         cache_path: Path,
+        rate_limit_coordinator: Optional[RateLimitCoordinator] = None,
     ) -> None:
         self.exchange = exchange
         self.user = user
         self.fetcher = fetcher
         self.cache = FillEventCache(cache_path)
+        self.rate_limiter = rate_limit_coordinator or RateLimitCoordinator(exchange, user)
         self._events: List[FillEvent] = []
         self._loaded = False
         self._lock = asyncio.Lock()
@@ -1057,12 +1958,366 @@ class FillEventsManager:
             if self._loaded:
                 return
             cached = self.cache.load()
-            self._events = list(cached)
-            logger.info(
-                "FillEventsManager.ensure_loaded: loaded %d cached events",
+            filtered = []
+            dropped = 0
+            for ev in cached:
+                if getattr(ev, "raw", None) is None:
+                    dropped += 1
+                    continue
+                filtered.append(ev)
+            self._events = sorted(filtered, key=lambda ev: ev.timestamp)
+
+            # Annotate psize/pprice for legacy caches that may lack these values
+            if self._events:
+                payload = [ev.to_dict() for ev in self._events]
+                ensure_qty_signage(payload)
+                compute_psize_pprice(payload)
+                self._events = [FillEvent.from_dict(ev) for ev in payload]
+
+            logger.debug(
+                "[fills] ensure_loaded: %d cached events (dropped %d without raw)",
                 len(self._events),
+                dropped,
             )
             self._loaded = True
+
+    @staticmethod
+    def _bybit_event_trade_rows(event: FillEvent) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        for item in _normalize_raw_field(getattr(event, "raw", None)):
+            if not isinstance(item, dict):
+                continue
+            if item.get("source") != "fetch_my_trades":
+                continue
+            data = item.get("data")
+            if isinstance(data, dict):
+                rows.append(data)
+        return rows
+
+    @staticmethod
+    def _bybit_event_non_trade_raw(event: FillEvent) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        for item in _normalize_raw_field(getattr(event, "raw", None)):
+            if not isinstance(item, dict):
+                continue
+            if item.get("source") == "fetch_my_trades":
+                continue
+            rows.append(item)
+        return rows
+
+    @staticmethod
+    def _bybit_group_stats(events: Sequence[FillEvent]) -> Dict[str, object]:
+        unique_rows: Dict[Tuple[object, ...], Dict[str, object]] = {}
+        fallback_idx = 0
+        duplicate_rows = 0
+        for ev in events:
+            for row in FillEventsManager._bybit_event_trade_rows(ev):
+                key = _bybit_trade_dedupe_key(row)
+                if key is None:
+                    key = ("__fallback__", fallback_idx)
+                    fallback_idx += 1
+                if key in unique_rows:
+                    duplicate_rows += 1
+                    continue
+                unique_rows[key] = row
+
+        unique_qty_abs = sum(_bybit_trade_qty_abs(row) for row in unique_rows.values())
+        side = str(events[0].side).lower() if events else "buy"
+        unique_qty_signed = -unique_qty_abs if side == "sell" else unique_qty_abs
+        group_qty = sum(float(ev.qty) for ev in events)
+        return {
+            "duplicate_rows": duplicate_rows,
+            "group_size": len(events),
+            "group_qty": group_qty,
+            "unique_qty_signed": unique_qty_signed,
+            "unique_row_count": len(unique_rows),
+        }
+
+    @staticmethod
+    def _scan_bybit_qty_inflation(events: Sequence[FillEvent]) -> List[Dict[str, object]]:
+        anomalies: List[Dict[str, object]] = []
+        tolerance = 1e-9
+
+        grouped: Dict[Tuple[int, str, str, str, str], List[FillEvent]] = defaultdict(list)
+        for ev in events:
+            grouped[_bybit_event_group_key(ev)].append(ev)
+
+        for key, group in grouped.items():
+            stats = FillEventsManager._bybit_group_stats(group)
+            group_size = int(stats["group_size"])
+            duplicate_rows = int(stats["duplicate_rows"])
+            group_qty = float(stats["group_qty"])
+            unique_qty_signed = float(stats["unique_qty_signed"])
+            if group_size <= 1 and duplicate_rows <= 0:
+                continue
+            if abs(group_qty - unique_qty_signed) <= tolerance and group_size == 1:
+                continue
+            anomalies.append(
+                {
+                    "key": key,
+                    "event_ids": [ev.id for ev in group],
+                    "group_size": group_size,
+                    "duplicate_rows": duplicate_rows,
+                    "group_qty": group_qty,
+                    "expected_qty": unique_qty_signed,
+                    "unique_trade_rows": int(stats["unique_row_count"]),
+                }
+            )
+        return anomalies
+
+    @staticmethod
+    def _normalize_fee_dict(fee: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+        if not isinstance(fee, dict):
+            return None
+        out: Dict[str, object] = {}
+        currency = fee.get("currency") or fee.get("code")
+        if currency:
+            out["currency"] = str(currency)
+        try:
+            out["cost"] = float(fee.get("cost", 0.0))
+        except Exception:
+            out["cost"] = 0.0
+        if fee.get("rate") is not None:
+            try:
+                out["rate"] = float(fee.get("rate"))
+            except Exception:
+                pass
+        return out
+
+    @staticmethod
+    def _extract_bybit_fee_from_trade_row(row: Dict[str, object]) -> Optional[Dict[str, object]]:
+        fee = FillEventsManager._normalize_fee_dict(row.get("fee"))
+        if fee is not None:
+            return fee
+        info = row.get("info")
+        info = info if isinstance(info, dict) else {}
+        fee_cost_raw = info.get("execFee")
+        fee_ccy = info.get("feeCurrency")
+        if fee_cost_raw is None:
+            return None
+        try:
+            fee_cost = float(fee_cost_raw)
+        except Exception:
+            return None
+        out: Dict[str, object] = {"cost": fee_cost}
+        if fee_ccy:
+            out["currency"] = str(fee_ccy)
+        fee_rate_raw = info.get("feeRate")
+        if fee_rate_raw is not None:
+            try:
+                out["rate"] = float(fee_rate_raw)
+            except Exception:
+                pass
+        return out
+
+    @staticmethod
+    def _dedupe_raw_payloads(items: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+        deduped: List[Dict[str, object]] = []
+        seen: set[str] = set()
+        for item in items:
+            try:
+                marker = json.dumps(item, sort_keys=True, separators=(",", ":"))
+            except Exception:
+                marker = str(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(item)
+        return deduped
+
+    @staticmethod
+    def _build_consolidated_bybit_event(group: Sequence[FillEvent]) -> FillEvent:
+        # Pick best baseline event (prefer internally deduped, then largest unique coverage).
+        best_event = group[0]
+        best_rank: Tuple[int, int, float] = (-1, -1, float("-inf"))
+        mt_unique_by_key: Dict[Tuple[object, ...], Dict[str, object]] = {}
+        non_mt_rows: List[Dict[str, object]] = []
+        fallback_idx = 0
+
+        for ev in group:
+            mt_rows = FillEventsManager._bybit_event_trade_rows(ev)
+            keys_seen: set[Tuple[object, ...]] = set()
+            duplicates = 0
+            unique_count = 0
+            signed_qty_sum = 0.0
+            for row in mt_rows:
+                key = _bybit_trade_dedupe_key(row)
+                if key is None:
+                    key = ("__fallback__", fallback_idx)
+                    fallback_idx += 1
+                if key in keys_seen:
+                    duplicates += 1
+                    continue
+                keys_seen.add(key)
+                unique_count += 1
+                signed_qty_sum += _bybit_trade_qty_signed(row)
+                if key not in mt_unique_by_key:
+                    mt_unique_by_key[key] = row
+            qty_delta = -abs(float(ev.qty) - signed_qty_sum)
+            rank = (1 if duplicates == 0 else 0, unique_count, qty_delta)
+            if rank > best_rank:
+                best_rank = rank
+                best_event = ev
+            non_mt_rows.extend(FillEventsManager._bybit_event_non_trade_raw(ev))
+
+        mt_rows_unique = list(mt_unique_by_key.values())
+        side = str(best_event.side).lower()
+        qty_abs_sum = sum(_bybit_trade_qty_abs(row) for row in mt_rows_unique)
+        qty_signed_sum = -qty_abs_sum if side == "sell" else qty_abs_sum
+
+        price_num = 0.0
+        for row in mt_rows_unique:
+            info = row.get("info")
+            info = info if isinstance(info, dict) else {}
+            price = float(row.get("price") or info.get("execPrice") or 0.0)
+            price_num += price * _bybit_trade_qty_abs(row)
+        price = float(best_event.price)
+        if qty_abs_sum > 0.0:
+            price = price_num / qty_abs_sum
+
+        fees_merged = None
+        for row in mt_rows_unique:
+            fee = FillEventsManager._extract_bybit_fee_from_trade_row(row)
+            fees_merged = _merge_fee_lists(fees_merged, fee)
+        fees_out: Optional[Sequence]
+        if isinstance(fees_merged, list) and len(fees_merged) == 1:
+            fees_out = fees_merged[0]
+        else:
+            fees_out = fees_merged
+
+        source_ids: set[str] = set(best_event.source_ids or [])
+        for row in mt_rows_unique:
+            info = row.get("info")
+            info = info if isinstance(info, dict) else {}
+            trade_id = row.get("id") or info.get("execId")
+            if trade_id:
+                source_ids.add(str(trade_id))
+        source_ids_sorted = sorted(source_ids)
+        event_id = "+".join(source_ids_sorted) if source_ids_sorted else best_event.id
+
+        # Recompute close PnL when possible from positions_history + unique fills.
+        pnl: Optional[float] = None
+        positions_items = [
+            row
+            for row in non_mt_rows
+            if isinstance(row, dict) and str(row.get("source")) == "positions_history"
+        ]
+        for pos_item in positions_items:
+            data = pos_item.get("data")
+            if not isinstance(data, dict):
+                continue
+            info = data.get("info")
+            info = info if isinstance(info, dict) else {}
+            avg_entry = float(info.get("avgEntryPrice") or data.get("entryPrice") or 0.0)
+            total_closed = float(info.get("closedSize") or data.get("contracts") or 0.0)
+            if avg_entry <= 0.0 or total_closed <= 0.0:
+                continue
+            total_fees = float(info.get("closeFee") or 0.0) + float(info.get("openFee") or 0.0)
+            recomputed = 0.0
+            used = False
+            for row in mt_rows_unique:
+                info_row = row.get("info")
+                info_row = info_row if isinstance(info_row, dict) else {}
+                closed_size = float(info_row.get("closedSize") or info_row.get("closeSize") or 0.0)
+                if closed_size <= 0.0:
+                    continue
+                exit_price = float(row.get("price") or info_row.get("execPrice") or 0.0)
+                if exit_price <= 0.0:
+                    continue
+                if str(best_event.position_side).lower() == "long":
+                    gross = (exit_price - avg_entry) * closed_size
+                else:
+                    gross = (avg_entry - exit_price) * closed_size
+                fee_portion = (closed_size / total_closed) * total_fees if total_closed > 0.0 else 0.0
+                recomputed += gross - fee_portion
+                used = True
+            if used:
+                pnl = recomputed
+                break
+        if pnl is None:
+            if abs(float(best_event.qty)) > 1e-12:
+                pnl = float(best_event.pnl) * (qty_signed_sum / float(best_event.qty))
+            else:
+                pnl = float(best_event.pnl)
+
+        raw_payload = [
+            {"source": "fetch_my_trades", "data": dict(row)} for row in mt_rows_unique
+        ] + FillEventsManager._dedupe_raw_payloads(non_mt_rows)
+
+        return FillEvent(
+            id=event_id,
+            source_ids=source_ids_sorted,
+            timestamp=int(best_event.timestamp),
+            datetime=str(best_event.datetime),
+            symbol=str(best_event.symbol),
+            side=str(best_event.side).lower(),
+            qty=float(qty_signed_sum),
+            price=float(price),
+            pnl=float(pnl),
+            fees=fees_out,
+            pb_order_type=str(best_event.pb_order_type),
+            position_side=str(best_event.position_side).lower(),
+            client_order_id=str(best_event.client_order_id),
+            psize=float(best_event.psize),
+            pprice=float(best_event.pprice),
+            raw=raw_payload,
+        )
+
+    async def run_doctor(self, *, auto_repair: bool = False) -> Dict[str, object]:
+        """Detect and optionally auto-repair known fill-event cache anomalies."""
+        await self.ensure_loaded()
+        report: Dict[str, object] = {
+            "exchange": self.exchange,
+            "user": self.user,
+            "events_scanned": len(self._events),
+            "anomaly_events": 0,
+            "anomaly_examples": [],
+            "auto_repair": bool(auto_repair),
+            "repaired": False,
+        }
+        if self.exchange.lower() != "bybit":
+            return report
+
+        anomalies = self._scan_bybit_qty_inflation(self._events)
+        report["anomaly_events"] = len(anomalies)
+        report["anomaly_examples"] = anomalies[:5]
+        if not anomalies or not auto_repair:
+            return report
+
+        grouped: Dict[Tuple[int, str, str, str, str], List[FillEvent]] = defaultdict(list)
+        for ev in self._events:
+            grouped[_bybit_event_group_key(ev)].append(ev)
+
+        repaired_events: List[FillEvent] = []
+        for key in sorted(grouped.keys()):
+            group = grouped[key]
+            if len(group) == 1:
+                stats = self._bybit_group_stats(group)
+                if int(stats["duplicate_rows"]) <= 0:
+                    repaired_events.extend(group)
+                    continue
+            repaired_events.append(self._build_consolidated_bybit_event(group))
+
+        repaired_events.sort(key=lambda ev: ev.timestamp)
+        payload = [ev.to_dict() for ev in repaired_events]
+        ensure_qty_signage(payload)
+        compute_psize_pprice(payload)
+        self._events = [FillEvent.from_dict(ev) for ev in payload]
+        self.cache.save(self._events)
+        self.cache.update_metadata_from_events(self._events)
+
+        remaining = self._scan_bybit_qty_inflation(self._events)
+        report["anomaly_events_after"] = len(remaining)
+        report["anomaly_examples_after"] = remaining[:5]
+        report["repaired"] = len(remaining) == 0
+        if remaining:
+            logger.warning(
+                "[fills-doctor] repair incomplete: %d anomalies remain (continuing)",
+                len(remaining),
+            )
+        else:
+            logger.info("[fills-doctor] repair complete; no remaining Bybit anomalies")
+        return report
 
     async def refresh(
         self,
@@ -1071,37 +2326,51 @@ class FillEventsManager:
         end_ms: Optional[int] = None,
     ) -> None:
         await self.ensure_loaded()
-        requested_start = start_ms
-        logger.info(
-            "FillEventsManager.refresh: start=%s end=%s current_cache=%d (requested_start=%s)",
+        logger.debug(
+            "[fills] refresh: start=%s end=%s current_cache=%d",
             _format_ms(start_ms),
             _format_ms(end_ms),
             len(self._events),
-            _format_ms(requested_start),
         )
         detail_cache = {
             ev.id: (ev.client_order_id, ev.pb_order_type) for ev in self._events if ev.client_order_id
         }
         updated_map: Dict[str, FillEvent] = {ev.id: ev for ev in self._events}
+        source_ids_index: Dict[Tuple[str, ...], set[str]] = defaultdict(set)
+        for ev in self._events:
+            if ev.source_ids:
+                source_ids_index[tuple(ev.source_ids)].add(ev.id)
         added_ids: set[str] = set()
+        all_days_persisted: set[str] = set()
 
         def handle_batch(batch: List[Dict[str, object]]) -> None:
+            ensure_qty_signage(batch)
             days_touched: set[str] = set()
             for raw in batch:
+                raw.setdefault("raw", [])
                 try:
                     event = FillEvent.from_dict(raw)
                 except ValueError as exc:
                     logger.warning(
-                        "FillEventsManager.refresh: skipping malformed event %s (error=%s)",
+                        "[fills] skipping malformed event %s (error=%s)",
                         raw.get("id"),
                         exc,
                     )
                     continue
+                source_key = tuple(event.source_ids) if event.source_ids else tuple()
+                replaced_ids: set[str] = set()
+                if source_key and source_key in source_ids_index:
+                    replaced_ids = {eid for eid in source_ids_index[source_key] if eid != event.id}
+                    for replaced_id in replaced_ids:
+                        updated_map.pop(replaced_id, None)
+                    source_ids_index[source_key] = {event.id}
                 prev = updated_map.get(event.id)
                 if prev is not None and event.timestamp < prev.timestamp:
                     continue
                 updated_map[event.id] = event
-                if prev is None:
+                if source_key:
+                    source_ids_index[source_key].add(event.id)
+                if prev is None and not replaced_ids:
                     added_ids.add(event.id)
                 day = _day_key(event.timestamp)
                 days_touched.add(day)
@@ -1109,35 +2378,154 @@ class FillEventsManager:
                 return
             day_payload = self._events_for_days(updated_map.values(), days_touched)
             self.cache.save_days(day_payload)
-            days_list = sorted(days_touched)
-            preview = ", ".join(days_list[:5])
-            if len(days_list) > 5:
-                preview += ", ..."
-            logger.info(
-                "FillEventsManager.refresh: persisted %d day files (%s)",
-                len(day_payload),
-                preview,
-            )
+            all_days_persisted.update(days_touched)
 
-        await self.fetcher.fetch(start_ms, end_ms, detail_cache, on_batch=handle_batch)
+        try:
+            await self.fetcher.fetch(start_ms, end_ms, detail_cache, on_batch=handle_batch)
+        except RateLimitExceeded:
+            # Preserve bounded-range failures as known gaps so retry logic can
+            # revisit them.  We still re-raise to fail loudly on critical input.
+            if start_ms is not None and end_ms is not None:
+                self.cache.add_known_gap(
+                    start_ms,
+                    end_ms,
+                    reason=GAP_REASON_FETCH_FAILED,
+                    confidence=GAP_CONFIDENCE_UNKNOWN,
+                )
+            raise
 
         self._events = sorted(updated_map.values(), key=lambda ev: ev.timestamp)
-        logger.info(
-            "FillEventsManager.refresh: merged events=%d (added=%d)",
-            len(self._events),
-            len(added_ids),
-        )
+
+        # Annotate psize/pprice for all events
+        if self._events:
+            payload = [ev.to_dict() for ev in self._events]
+            ensure_qty_signage(payload)
+            compute_psize_pprice(payload)
+            self._events = [FillEvent.from_dict(ev) for ev in payload]
+
+            # Re-persist touched days with annotated psize/pprice values
+            if all_days_persisted:
+                day_payload = self._events_for_days(self._events, all_days_persisted)
+                self.cache.save_days(day_payload)
+
+        # Update cache metadata with timestamps
+        if self._events:
+            self.cache.update_metadata_from_events(self._events)
+
+            # If we successfully fetched data for a gap range, clear it
+            if start_ms is not None and end_ms is not None and added_ids:
+                self.cache.clear_gap(start_ms, end_ms)
+
+        # Consolidated refresh summary log
+        # Only log at INFO when there are actually new fills; routine refreshes go to DEBUG
+        if added_ids:
+            days_list = sorted(all_days_persisted)
+            days_preview = ", ".join(days_list[:5])
+            if len(days_list) > 5:
+                days_preview += f", ... ({len(days_list)} total)"
+            logger.info(
+                "[fills] refresh: events=%d (+%d) | persisted %d days (%s)",
+                len(self._events),
+                len(added_ids),
+                len(all_days_persisted),
+                days_preview,
+            )
+        else:
+            logger.debug("[fills] refresh: events=%d (no changes)", len(self._events))
 
     async def refresh_latest(self, *, overlap: int = 20) -> None:
         """Fetch only the most recent fills, overlapping by `overlap` events."""
         await self.ensure_loaded()
         if not self._events:
-            logger.info("FillEventsManager.refresh_latest: cache empty, falling back to full refresh")
+            logger.debug("[fills] refresh_latest: cache empty, falling back to full refresh")
         start_ms = None
         if self._events:
             idx = max(0, len(self._events) - overlap)
             start_ms = self._events[idx].timestamp
         await self.refresh(start_ms=start_ms, end_ms=None)
+
+    async def refresh_for_lookback(
+        self,
+        start_ms: int,
+        *,
+        end_ms: Optional[int] = None,
+        overlap: int = 20,
+        gap_hours: float = 12.0,
+        force_refetch_gaps: bool = False,
+    ) -> None:
+        """Refresh fills for a requested lookback window using cache-derived coverage.
+
+        Open-ended lookbacks are tracked in cache metadata so bots can avoid
+        re-running the same expensive history bootstrap after restart when the
+        early portion of the lookback legitimately contains no fills.
+        """
+        await self.ensure_loaded()
+        start_ms = int(start_ms)
+        if end_ms is not None:
+            await self.refresh_range(
+                start_ms=start_ms,
+                end_ms=end_ms,
+                gap_hours=gap_hours,
+                overlap=overlap,
+                force_refetch_gaps=force_refetch_gaps,
+            )
+            return
+
+        metadata = self.cache.load_metadata()
+        covered_start_ms = int(metadata.get("covered_start_ms", 0) or 0)
+        oldest_event_ts = int(self._events[0].timestamp) if self._events else 0
+        metadata_oldest_event_ts = int(metadata.get("oldest_event_ts", 0) or 0)
+        metadata_newest_event_ts = int(metadata.get("newest_event_ts", 0) or 0)
+        metadata_indicates_no_cached_fills = (
+            metadata_oldest_event_ts <= 0 and metadata_newest_event_ts <= 0
+        )
+        metadata_claims_history_without_events = (
+            not self._events
+            and (metadata_oldest_event_ts > 0 or metadata_newest_event_ts > 0)
+            and covered_start_ms > 0
+            and covered_start_ms <= start_ms
+        )
+        lookback_covered = (
+            covered_start_ms > 0 and covered_start_ms <= start_ms and bool(self._events)
+        ) or (oldest_event_ts > 0 and oldest_event_ts <= start_ms) or (
+            covered_start_ms > 0
+            and covered_start_ms <= start_ms
+            and metadata_indicates_no_cached_fills
+        )
+
+        if lookback_covered:
+            logger.debug(
+                "[fills] lookback already covered from %s (covered_start=%s oldest_event=%s); refreshing latest",
+                _format_ms(start_ms),
+                _format_ms(covered_start_ms) if covered_start_ms else "None",
+                _format_ms(oldest_event_ts) if oldest_event_ts else "None",
+            )
+            await self.refresh_latest(overlap=overlap)
+            return
+
+        if metadata_claims_history_without_events:
+            logger.warning(
+                "[fills] cache metadata claims lookback coverage from %s, but no cached events were loaded; rebuilding from requested lookback",
+                _format_ms(covered_start_ms),
+            )
+
+        if self._events:
+            logger.info(
+                "[fills] lookback uncovered from %s; refreshing missing range before latest",
+                _format_ms(start_ms),
+            )
+            await self.refresh_range(
+                start_ms=start_ms,
+                end_ms=None,
+                gap_hours=gap_hours,
+                overlap=overlap,
+                force_refetch_gaps=force_refetch_gaps,
+            )
+        else:
+            logger.info("[fills] cache empty; refreshing full lookback from %s", _format_ms(start_ms))
+            await self.refresh(start_ms=start_ms, end_ms=None)
+
+        self.cache.mark_covered_start(start_ms)
 
     async def refresh_range(
         self,
@@ -1146,14 +2534,35 @@ class FillEventsManager:
         *,
         gap_hours: float = 12.0,
         overlap: int = 20,
+        force_refetch_gaps: bool = False,
     ) -> None:
-        """Fill missing data between `start_ms` and `end_ms` using gap heuristics."""
+        """Fill missing data between `start_ms` and `end_ms` using gap heuristics.
+
+        Args:
+            start_ms: Start timestamp in milliseconds
+            end_ms: End timestamp in milliseconds (or None for now)
+            gap_hours: Threshold for detecting gaps (default 12 hours)
+            overlap: Number of events to overlap when fetching latest
+            force_refetch_gaps: If True, retry even persistent gaps
+        """
         await self.ensure_loaded()
-        gap_ms = max(1, int(gap_hours * 60 * 60 * 1000))
         intervals: List[Tuple[int, int]] = []
 
+        # Get known gaps from cache metadata
+        known_gaps = self.cache.get_known_gaps()
+
+        def is_in_persistent_gap(ts_start: int, ts_end: int) -> bool:
+            """Check if interval is fully within a persistent (max retries) gap."""
+            if force_refetch_gaps:
+                return False
+            for gap in known_gaps:
+                if ts_start >= gap["start_ts"] and ts_end <= gap["end_ts"]:
+                    if not self.cache.should_retry_gap(gap):
+                        return True
+            return False
+
         if not self._events:
-            logger.info("FillEventsManager.refresh_range: cache empty, refreshing entire interval")
+            logger.debug("[fills] refresh_range: cache empty, refreshing entire interval")
             await self.refresh(start_ms=start_ms, end_ms=end_ms)
             await self.refresh_latest(overlap=overlap)
             return
@@ -1161,39 +2570,56 @@ class FillEventsManager:
         events_sorted = self._events
         earliest = events_sorted[0].timestamp
         latest = events_sorted[-1].timestamp
+        gap_ms = max(1, int(gap_hours * 60.0 * 60.0 * 1000.0))
 
+        # Fetch older data before earliest cached if requested
         if start_ms < earliest:
             upper = earliest if end_ms is None else min(earliest, end_ms)
-            if start_ms < upper:
+            if start_ms < upper and not is_in_persistent_gap(start_ms, upper):
                 intervals.append((start_ms, upper))
 
-        prev_ts = events_sorted[0].timestamp
+        # Detect large gaps in cached data
+        prev_ts = earliest
         for ev in events_sorted[1:]:
             cur_ts = ev.timestamp
-            if end_ms is not None and prev_ts >= end_ms:
+            if end_ms is not None and cur_ts > end_ms:
                 break
-            gap = cur_ts - prev_ts
-            if gap >= gap_ms:
+            if cur_ts - prev_ts >= gap_ms:
                 gap_start = max(prev_ts, start_ms)
-                gap_end = cur_ts if end_ms is None else min(cur_ts, end_ms)
+                gap_end = cur_ts
                 if gap_start < gap_end:
-                    intervals.append((gap_start, gap_end))
+                    if is_in_persistent_gap(gap_start, gap_end):
+                        logger.debug(
+                            "FillEventsManager.refresh_range: skipping persistent gap %s → %s",
+                            _format_ms(gap_start),
+                            _format_ms(gap_end),
+                        )
+                    else:
+                        intervals.append((gap_start, gap_end))
+                        # Record as potential gap for tracking
+                        self.cache.add_known_gap(
+                            gap_start,
+                            gap_end,
+                            reason=GAP_REASON_AUTO,
+                            confidence=GAP_CONFIDENCE_SUSPICIOUS,
+                        )
             prev_ts = cur_ts
 
-        if end_ms is not None and latest < end_ms:
+        # Fetch newer data after latest cached if requested (if not already covered)
+        if end_ms is not None and end_ms > latest and (not intervals or intervals[-1][1] != end_ms):
             lower = max(latest, start_ms)
-            if lower < end_ms:
+            if lower < end_ms and not is_in_persistent_gap(lower, end_ms):
                 intervals.append((lower, end_ms))
 
         merged = self._merge_intervals(intervals)
         if merged:
-            logger.info(
-                "FillEventsManager.refresh_range: refreshing %d intervals: %s",
+            logger.debug(
+                "[fills] refresh_range: refreshing %d intervals: %s",
                 len(merged),
                 ", ".join(f"{_format_ms(start)} → {_format_ms(end)}" for start, end in merged),
             )
         else:
-            logger.info("FillEventsManager.refresh_range: no gaps detected in requested interval")
+            logger.debug("[fills] refresh_range: no gaps detected in requested interval")
 
         for start, end in merged:
             await self.refresh(start_ms=start, end_ms=end)
@@ -1206,6 +2632,12 @@ class FillEventsManager:
         end_ms: Optional[int] = None,
         symbol: Optional[str] = None,
     ) -> List[FillEvent]:
+        """Get fill events with optional filtering.
+
+        Events are returned with pre-computed psize/pprice values based on full
+        history (computed during ensure_loaded/refresh). The values reflect
+        position state after each fill in chronological order.
+        """
         events = self._events
         if start_ms is not None:
             events = [ev for ev in events if ev.timestamp >= start_ms]
@@ -1251,9 +2683,8 @@ class FillEventsManager:
     ) -> Dict[str, float]:
         positions: Dict[str, float] = dict(current_positions or {})
         for ev in self._events:
-            sign = 1 if ev.side == "buy" else -1
             key = f"{ev.symbol}:{ev.position_side}"
-            positions[key] = positions.get(key, 0.0) + sign * ev.qty
+            positions[key] = positions.get(key, 0.0) + ev.qty
         return positions
 
     def reconstruct_equity_curve(self, starting_equity: float = 0.0) -> List[Tuple[int, float]]:
@@ -1263,6 +2694,27 @@ class FillEventsManager:
             total += ev.pnl
             points.append((ev.timestamp, total))
         return points
+
+    def get_coverage_summary(self) -> Dict[str, object]:
+        """Return a summary of cache coverage and known gaps."""
+        summary = self.cache.get_coverage_summary()
+        summary["events_count"] = len(self._events)
+        summary["exchange"] = self.exchange
+        summary["user"] = self.user
+        if self._events:
+            summary["first_event"] = _format_ms(self._events[0].timestamp)
+            summary["last_event"] = _format_ms(self._events[-1].timestamp)
+            # Count unique symbols
+            symbols = set(ev.symbol for ev in self._events)
+            summary["symbols_count"] = len(symbols)
+            summary["symbols"] = sorted(symbols)
+        return summary
+
+    def get_history_scope(self) -> str:
+        return self.cache.get_history_scope()
+
+    def set_history_scope(self, scope: str) -> None:
+        self.cache.set_history_scope(scope)
 
     @staticmethod
     def _events_for_days(
@@ -1345,7 +2797,7 @@ class BybitFetcher(BaseFetcher):
             for day in sorted(day_map):
                 on_batch(day_map[day])
 
-        logger.info(
+        logger.debug(
             "BybitFetcher.fetch: done (events=%d, trades=%d, positions=%d)",
             len(events),
             len(trades),
@@ -1375,6 +2827,13 @@ class BybitFetcher(BaseFetcher):
             prev_params = new_key
             fetch_count += 1
             batch = await self.api.fetch_my_trades(params=params)
+            if fetch_count > 1:
+                logger.debug(
+                    "BybitFetcher._fetch_my_trades: fetch #%d endTime=%s size=%d",
+                    fetch_count,
+                    _format_ms(params.get("endTime")),
+                    len(batch) if batch else 0,
+                )
             if not batch:
                 break
             batch.sort(key=lambda x: x["timestamp"])
@@ -1397,47 +2856,168 @@ class BybitFetcher(BaseFetcher):
             results,
             key=lambda x: int(x.get("info", {}).get("updatedTime") or x.get("timestamp") or 0),
         )
-        return ordered
+        deduped: List[Dict[str, object]] = []
+        seen_keys: set[Tuple[object, ...]] = set()
+        duplicate_rows = 0
+        for trade in ordered:
+            key = _bybit_trade_dedupe_key(trade)
+            if key is None:
+                deduped.append(trade)
+                continue
+            if key in seen_keys:
+                duplicate_rows += 1
+                continue
+            seen_keys.add(key)
+            deduped.append(trade)
+        if duplicate_rows:
+            logger.debug(
+                "BybitFetcher._fetch_my_trades: dropped %d duplicate fill rows before canonicalization",
+                duplicate_rows,
+            )
+        return deduped
 
     async def _fetch_positions_history(self, start_ms: int, end_ms: int) -> List[Dict[str, object]]:
-        params = {
+        """Fetch closed-pnl records using Bybit's raw API with hybrid pagination.
+
+        Uses a two-phase approach:
+        1. Cursor pagination for recent records (more efficient, no missed records)
+        2. Time-based sliding window for older records (cursor doesn't go back far enough)
+
+        This is necessary because:
+        - CCXT's fetch_positions_history uses time-based pagination which can miss records
+        - Bybit's cursor pagination only covers ~7 days of recent data
+        """
+        results: Dict[str, Dict[str, object]] = {}  # Dedupe by orderId
+        max_fetches = 500
+        fetch_count = 0
+
+        # Phase 1: Use cursor pagination for recent records
+        params: Dict[str, object] = {
+            "category": "linear",
             "limit": self.position_limit,
             "endTime": int(end_ms),
         }
-        results: List[Dict[str, object]] = []
-        max_fetches = 200
-        fetch_count = 0
-        prev_params = None
+
+        cursor_oldest_ts = end_ms
+
         while True:
-            new_key = _check_pagination_progress(
-                prev_params,
-                params,
-                "BybitFetcher._fetch_positions_history",
-            )
-            if new_key is None:
-                break
-            prev_params = new_key
             fetch_count += 1
-            batch = await self.api.fetch_positions_history(params=params)
+            if fetch_count > max_fetches:
+                logger.warning(
+                    "BybitFetcher._fetch_positions_history: max fetches reached (%d)", max_fetches
+                )
+                break
+
+            try:
+                response = await self.api.private_get_v5_position_closed_pnl(params)
+            except Exception as exc:
+                logger.warning("BybitFetcher._fetch_positions_history: API error: %s", exc)
+                break
+
+            batch = response.get("result", {}).get("list", [])
             if not batch:
                 break
-            batch.sort(key=lambda x: x["timestamp"])
-            results.extend(batch)
-            if len(batch) < self.position_limit:
-                if params["endTime"] - start_ms < self._max_span_ms:
+
+            self._process_closed_pnl_batch(batch, start_ms, results)
+
+            oldest_ts = int(batch[-1].get("updatedTime", 0)) if batch else 0
+            cursor_oldest_ts = oldest_ts
+
+            if oldest_ts <= start_ms:
+                break
+
+            cursor = response.get("result", {}).get("nextPageCursor")
+            if not cursor:
+                # Cursor exhausted - switch to time-based sliding window
+                break
+            params["cursor"] = cursor
+
+        # Phase 2: Time-based sliding window for older records (if cursor didn't reach start)
+        if cursor_oldest_ts > start_ms:
+            logger.debug(
+                "BybitFetcher._fetch_positions_history: cursor exhausted at %s, switching to time-based",
+                _format_ms(cursor_oldest_ts),
+            )
+            # Remove cursor and continue with time-based pagination
+            current_end = cursor_oldest_ts
+
+            while current_end > start_ms and fetch_count < max_fetches:
+                fetch_count += 1
+                params = {
+                    "category": "linear",
+                    "limit": self.position_limit,
+                    "endTime": int(current_end),
+                }
+
+                try:
+                    response = await self.api.private_get_v5_position_closed_pnl(params)
+                except Exception as exc:
+                    logger.warning("BybitFetcher._fetch_positions_history: API error: %s", exc)
                     break
-                params["endTime"] = max(start_ms, params["endTime"] - self._max_span_ms)
+
+                batch = response.get("result", {}).get("list", [])
+                if not batch:
+                    # No more records, slide window back
+                    current_end = max(start_ms, current_end - self._max_span_ms)
+                    continue
+
+                self._process_closed_pnl_batch(batch, start_ms, results)
+
+                oldest_ts = int(batch[-1].get("updatedTime", 0)) if batch else 0
+                if oldest_ts <= start_ms:
+                    break
+
+                # Slide window: if batch was full, use oldest ts; otherwise jump back
+                if len(batch) >= self.position_limit:
+                    current_end = oldest_ts
+                else:
+                    current_end = max(start_ms, oldest_ts - self._max_span_ms)
+
+        logger.debug(
+            "BybitFetcher._fetch_positions_history: fetched %d records in %d requests",
+            len(results),
+            fetch_count,
+        )
+        return list(results.values())
+
+    def _process_closed_pnl_batch(
+        self,
+        batch: List[Dict[str, object]],
+        start_ms: int,
+        results: Dict[str, Dict[str, object]],
+    ) -> None:
+        """Process a batch of closed-pnl records and add to results dict."""
+        for record in batch:
+            updated_ts = int(record.get("updatedTime", 0))
+            created_ts = int(record.get("createdTime", 0))
+            order_id = record.get("orderId", "")
+
+            # Skip records outside our time range or already processed
+            if updated_ts < start_ms or order_id in results:
                 continue
-            first_ts = batch[0]["timestamp"]
-            if first_ts <= start_ms:
-                break
-            if params["endTime"] == first_ts:
-                break
-            params["endTime"] = int(first_ts)
-            if fetch_count >= max_fetches:
-                logger.warning("BybitFetcher._fetch_positions_history: max fetches reached")
-                break
-        return results
+
+            # Convert Bybit symbol to CCXT format
+            raw_symbol = record.get("symbol", "")
+            ccxt_symbol = raw_symbol
+            if hasattr(self.api, "markets") and self.api.markets:
+                for market_symbol, market in self.api.markets.items():
+                    if market.get("id") == raw_symbol:
+                        ccxt_symbol = market_symbol
+                        break
+
+            results[order_id] = {
+                "info": record,
+                "symbol": ccxt_symbol,
+                "timestamp": created_ts,
+                "datetime": datetime.fromtimestamp(created_ts / 1000, tz=timezone.utc).isoformat(),
+                "lastUpdateTimestamp": updated_ts,
+                "realizedPnl": float(record.get("closedPnl", 0)),
+                "contracts": float(record.get("closedSize", 0)),
+                "entryPrice": float(record.get("avgEntryPrice", 0)),
+                "lastPrice": float(record.get("avgExitPrice", 0)),
+                "leverage": float(record.get("leverage", 1)),
+                "side": "long" if record.get("side", "").lower() == "sell" else "short",
+            }
 
     def _combine(
         self,
@@ -1445,70 +3025,46 @@ class BybitFetcher(BaseFetcher):
         positions: List[Dict[str, object]],
         detail_cache: Dict[str, Tuple[str, str]],
     ) -> List[Dict[str, object]]:
-        pnls: Dict[str, float] = defaultdict(float)
-        symbol_realized: Dict[str, float] = defaultdict(float)
-        symbol_closed_qty: Dict[str, float] = defaultdict(float)
+        """Combine trades with positions_history to compute per-fill PnL.
+
+        Strategy: For each close fill, use avgEntryPrice from its closed-pnl record
+        to compute accurate PnL as: (exitPrice - avgEntryPrice) * closedSize * direction.
+
+        This ensures each fill gets its correct PnL rather than distributing the
+        total order PnL proportionally (which is incorrect when fills have different
+        exit prices).
+        """
+        # Index closed-pnl records by orderId for fast lookup
+        # Each close fill has its own closed-pnl record with avgEntryPrice
+        pnl_by_order: Dict[str, Dict] = {}
+        raw_pnl_by_order: Dict[str, Dict] = {}  # Keep original data for raw field
         for entry in positions:
-            order_id = str(entry.get("info", {}).get("orderId", entry.get("orderId", "")))
+            info = entry.get("info", {})
+            order_id = str(info.get("orderId", entry.get("orderId", "")))
             if not order_id:
                 continue
-            pnl = float(entry.get("realizedPnl") or entry.get("info", {}).get("closedPnl") or 0.0)
-            pnls[order_id] += pnl
-            symbol = entry.get("symbol")
-            if symbol:
-                symbol_realized[symbol] += pnl
-                closed = float(
-                    entry.get("info", {}).get("closedSize") or entry.get("contracts") or 0.0
-                )
-                symbol_closed_qty[symbol] += closed
-
-        order_total_qty: Dict[str, float] = defaultdict(float)
-        symbol_order_qty: Dict[str, float] = defaultdict(float)
-        symbol_unknown_trade_qty: Dict[str, float] = defaultdict(float)
-        for trade in trades:
-            order_id = str(trade.get("info", {}).get("orderId", trade.get("order")))
-            qty = abs(float(trade.get("amount") or trade.get("info", {}).get("execQty") or 0.0))
-            symbol = trade.get("symbol") or trade.get("info", {}).get("symbol")
-            if order_id and order_id in pnls:
-                order_total_qty[order_id] += qty
-                if symbol:
-                    symbol_order_qty[symbol] += qty
-            elif symbol:
-                symbol_unknown_trade_qty[symbol] += qty
-
-        order_remaining_qty = dict(order_total_qty)
-        order_remaining_pnl = dict(pnls)
-        symbol_remaining_pnl = dict(symbol_realized)
-        symbol_remaining_qty: Dict[str, float] = {}
-        for sym, closed in symbol_closed_qty.items():
-            remaining = max(closed - symbol_order_qty.get(sym, 0.0), 0.0)
-            symbol_remaining_qty[sym] = remaining
-        for sym, qty in symbol_unknown_trade_qty.items():
-            symbol_remaining_qty[sym] = symbol_remaining_qty.get(sym, 0.0) + qty
+            pnl_by_order[order_id] = {
+                "closedPnl": float(entry.get("realizedPnl") or info.get("closedPnl") or 0.0),
+                "avgEntryPrice": float(info.get("avgEntryPrice") or 0.0),
+                "avgExitPrice": float(info.get("avgExitPrice") or 0.0),
+                "closedSize": float(info.get("closedSize") or entry.get("contracts") or 0.0),
+                "closeFee": float(info.get("closeFee") or 0.0),
+                "openFee": float(info.get("openFee") or 0.0),
+                "side": str(info.get("side") or "").lower(),
+                "symbol": entry.get("symbol") or info.get("symbol"),
+            }
+            raw_pnl_by_order[order_id] = dict(entry)
 
         events: List[Dict[str, object]] = []
+        matched_count = 0
+        computed_count = 0
+
         for trade in trades:
             event = self._normalize_trade(trade)
             order_id = event.get("order_id")
             cache_entry = detail_cache.get(event["id"])
-            allocated = False
-            if order_id and order_id in order_remaining_pnl and order_remaining_qty[order_id] > 0:
-                remaining_qty = order_remaining_qty[order_id]
-                remaining_pnl = order_remaining_pnl[order_id]
-                qty = abs(event["qty"])
-                if remaining_qty <= qty * 1.0000001:
-                    event["pnl"] = remaining_pnl
-                else:
-                    event["pnl"] = remaining_pnl * (qty / remaining_qty)
-                order_remaining_qty[order_id] = max(0.0, remaining_qty - qty)
-                order_remaining_pnl[order_id] = remaining_pnl - event["pnl"]
-                symbol_remaining_pnl[event["symbol"]] = (
-                    symbol_remaining_pnl.get(event["symbol"], 0.0) - event["pnl"]
-                )
-                symbol_remaining_qty[event["symbol"]] = max(
-                    0.0, symbol_remaining_qty.get(event["symbol"], 0.0) - qty
-                )
-                allocated = True
+
+            # Set pb_order_type from cache or client_order_id
             if cache_entry:
                 event["client_order_id"], event["pb_order_type"] = cache_entry
                 if not event["pb_order_type"]:
@@ -1518,39 +3074,58 @@ class BybitFetcher(BaseFetcher):
                 event["pb_order_type"] = pb_type or "unknown"
             else:
                 event["pb_order_type"] = "unknown"
-            if (
-                event["pb_order_type"] == "unknown"
-                and not allocated
-                and abs(event.get("pnl", 0.0)) < 1e-12
-            ):
-                symbol = event["symbol"]
-                remaining_symbol_qty = symbol_remaining_qty.get(symbol, 0.0)
-                remaining_symbol_pnl = symbol_remaining_pnl.get(symbol, 0.0)
-                qty = abs(event["qty"])
-                if remaining_symbol_qty > 0:
-                    if remaining_symbol_qty <= qty * 1.0000001:
-                        event["pnl"] = remaining_symbol_pnl
+
+            # Compute PnL for close fills using avgEntryPrice
+            closed_size = float(event.get("closed_size", 0))
+            if closed_size > 0 and order_id and order_id in pnl_by_order:
+                pnl_record = pnl_by_order[order_id]
+                avg_entry = pnl_record["avgEntryPrice"]
+                exit_price = event["price"]
+                position_side = event["position_side"]
+
+                if avg_entry > 0 and exit_price > 0:
+                    # Compute gross PnL based on position direction
+                    # Long close (sell): profit if exit > entry
+                    # Short close (buy): profit if entry > exit
+                    if position_side == "long":
+                        gross_pnl = (exit_price - avg_entry) * closed_size
                     else:
-                        event["pnl"] = remaining_symbol_pnl * (qty / remaining_symbol_qty)
-                    symbol_remaining_qty[symbol] = max(0.0, remaining_symbol_qty - qty)
-                    symbol_remaining_pnl[symbol] = remaining_symbol_pnl - event["pnl"]
+                        gross_pnl = (avg_entry - exit_price) * closed_size
+
+                    # Distribute fees proportionally if this fill is part of larger close
+                    total_closed = pnl_record["closedSize"]
+                    total_fees = pnl_record["closeFee"] + pnl_record["openFee"]
+                    if total_closed > 0:
+                        fee_portion = (closed_size / total_closed) * total_fees
+                    else:
+                        fee_portion = 0.0
+
+                    event["pnl"] = gross_pnl - fee_portion
+                    computed_count += 1
                 else:
-                    event["pnl"] = remaining_symbol_pnl
+                    # Fallback to closedPnl if avgEntryPrice unavailable
+                    event["pnl"] = pnl_record["closedPnl"]
+
+                matched_count += 1
+
+                # Append positions_history (closed-pnl) data to raw field
+                if order_id in raw_pnl_by_order:
+                    event["raw"].append(
+                        {
+                            "source": "positions_history",
+                            "data": raw_pnl_by_order[order_id],
+                        }
+                    )
+
             events.append(event)
 
-        remaining_orders = [k for k, v in order_remaining_pnl.items() if abs(v) > 1e-6]
-        if remaining_orders:
-            logger.warning(
-                "BybitFetcher._combine: residual PnL for orders %s (values=%s)",
-                remaining_orders,
-                [order_remaining_pnl[k] for k in remaining_orders],
-            )
-        remaining_symbols = [k for k, v in symbol_remaining_pnl.items() if abs(v) > 1e-6]
-        if remaining_symbols:
+        if matched_count > 0:
             logger.debug(
-                "BybitFetcher._combine: remaining symbol-level PnL after distribution %s",
-                {k: symbol_remaining_pnl[k] for k in remaining_symbols},
+                "[fills] PnL computed for %d/%d close fills using avgEntryPrice",
+                computed_count,
+                matched_count,
             )
+
         return events
 
     @staticmethod
@@ -1583,6 +3158,8 @@ class BybitFetcher(BaseFetcher):
             "pb_order_type": "",
             "position_side": position_side,
             "client_order_id": client_order_id or "",
+            "closed_size": closed_size,  # For PnL computation
+            "raw": [{"source": "fetch_my_trades", "data": dict(trade)}],
         }
 
     @staticmethod
@@ -1628,6 +3205,8 @@ class HyperliquidFetcher(BaseFetcher):
         fetch_count = 0
 
         prev_params = None
+        rate_limit_retries = 0
+        max_rate_limit_retries = 5
         while True:
             check_params = dict(params)
             check_params["_page"] = fetch_count
@@ -1642,13 +3221,33 @@ class HyperliquidFetcher(BaseFetcher):
             try:
                 trades = await self.api.fetch_my_trades(params=params)
             except RateLimitExceeded as exc:
+                rate_limit_retries += 1
+                if rate_limit_retries >= max_rate_limit_retries:
+                    msg = (
+                        "HyperliquidFetcher.fetch: too many consecutive rate-limit retries "
+                        f"({rate_limit_retries}/{max_rate_limit_retries}); aborting fetch"
+                    )
+                    logger.warning("%s", msg)
+                    raise RateLimitExceeded(msg) from exc
                 logger.debug(
-                    "HyperliquidFetcher.fetch: rate limit exceeded, sleeping briefly (%s)",
+                    "HyperliquidFetcher.fetch: rate limit exceeded (retry %d/%d), sleeping (%s)",
+                    rate_limit_retries,
+                    max_rate_limit_retries,
                     exc,
                 )
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(min(30.0, 2.0 ** rate_limit_retries))
+                # Reset prev_params so the retry is not flagged as repeated
+                prev_params = None
                 continue
+            rate_limit_retries = 0
             fetch_count += 1
+            if fetch_count > 1:
+                logger.debug(
+                    "HyperliquidFetcher.fetch: fetch #%d since=%s size=%d",
+                    fetch_count,
+                    _format_ms(params.get("since")),
+                    len(trades) if trades else 0,
+                )
             if not trades:
                 break
             before_count = len(collected)
@@ -1689,6 +3288,7 @@ class HyperliquidFetcher(BaseFetcher):
 
         events = sorted(collected.values(), key=lambda ev: ev["timestamp"])
         events = _coalesce_events(events)
+        # Note: psize/pprice annotation is done centrally in FillEventsManager.refresh()
 
         for event in events:
             cache_entry = detail_cache.get(event["id"])
@@ -1706,33 +3306,24 @@ class HyperliquidFetcher(BaseFetcher):
 
         return events
 
-    def _normalize_trade(self, trade: Dict[str, object]) -> Dict[str, object]:
+    @staticmethod
+    def _normalize_trade(trade: Dict[str, object]) -> Dict[str, object]:
         info = trade.get("info", {}) or {}
-        trade_id = str(trade.get("id") or info.get("tid") or info.get("hash") or info.get("oid"))
+        trade_id = str(trade.get("id") or info.get("hash") or info.get("tid") or "")
         order_id = str(trade.get("order") or info.get("oid") or "")
         timestamp = int(
             trade.get("timestamp")
             or info.get("time")
-            or info.get("updatedTime")
             or info.get("tradeTime")
+            or info.get("updatedTime")
             or 0
         )
         symbol_raw = trade.get("symbol") or info.get("symbol") or info.get("coin")
-        if self._symbol_resolver:
-            try:
-                symbol = self._symbol_resolver(symbol_raw)
-            except Exception:
-                symbol = str(symbol_raw) if symbol_raw is not None else ""
-        else:
-            symbol = str(symbol_raw) if symbol_raw is not None else ""
-        side = str(trade.get("side") or info.get("side", "")).lower()
+        side = str(trade.get("side") or info.get("side") or "").lower()
         qty = abs(float(trade.get("amount") or info.get("sz") or 0.0))
         price = float(trade.get("price") or info.get("px") or 0.0)
         pnl = float(trade.get("pnl") or info.get("closedPnl") or 0.0)
-        fee = trade.get("fee") or {
-            "currency": info.get("feeToken"),
-            "cost": info.get("fee"),
-        }
+        fee = trade.get("fee") or {"currency": info.get("feeToken"), "cost": info.get("fee")}
         client_order_id = trade.get("clientOrderId") or info.get("cloid") or info.get("clOrdId") or ""
         direction = str(info.get("dir", "")).lower()
         if "short" in direction:
@@ -1741,6 +3332,1182 @@ class HyperliquidFetcher(BaseFetcher):
             position_side = "long"
         else:
             position_side = "long" if side == "buy" else "short"
+        return {
+            "id": trade_id,
+            "order_id": order_id,
+            "timestamp": timestamp,
+            "datetime": ts_to_date(timestamp) if timestamp else "",
+            "symbol": str(symbol_raw or ""),
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "pnl": pnl,
+            "fees": fee,
+            "pb_order_type": "",
+            "position_side": position_side,
+            "client_order_id": str(client_order_id or ""),
+            "raw": [{"source": "fetch_my_trades", "data": trade}],
+            "c_mult": float(info.get("contractMultiplier") or info.get("multiplier") or 1.0),
+        }
+
+
+class GateioFetcher(BaseFetcher):
+    """Fetches fill events for Gate.io using trades + order PnL.
+
+    Uses the my_trades_timerange endpoint for fill-level data (fees, exact prices)
+    since the standard my_trades endpoint has a 7-day hard limit. Uses
+    fetch_closed_orders for PnL. Distributes order-level PnL proportionally
+    across fills when an order has multiple trades.
+    """
+
+    def __init__(
+        self,
+        api,
+        *,
+        trade_limit: int = 100,
+        now_func: Optional[Callable[[], int]] = None,
+    ) -> None:
+        self.api = api
+        self.trade_limit = max(1, min(100, trade_limit))
+        self._now_func = now_func or (lambda: int(datetime.now(tz=timezone.utc).timestamp() * 1000))
+
+    async def fetch(
+        self,
+        since_ms: Optional[int],
+        until_ms: Optional[int],
+        detail_cache: Dict[str, Tuple[str, str]],
+        on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    ) -> List[Dict[str, object]]:
+        logger.debug(
+            "GateioFetcher.fetch: start (since=%s, until=%s)",
+            _format_ms(since_ms),
+            _format_ms(until_ms),
+        )
+
+        # Step 1: Fetch trades (fill-level data with fees)
+        trades = await self._fetch_trades(since_ms, until_ms)
+        if not trades:
+            logger.debug("GateioFetcher.fetch: no trades found")
+            return []
+
+        # Step 2: Collect unique order IDs
+        order_ids: set[str] = set()
+        for t in trades:
+            oid = str(t.get("order") or t.get("info", {}).get("order_id") or "")
+            if oid:
+                order_ids.add(oid)
+
+        # Step 3: Fetch closed orders for PnL
+        orders_by_id = await self._fetch_orders_for_pnl(order_ids)
+
+        # Step 4: Merge trades with order PnL
+        events = self._merge_trades_with_orders(trades, orders_by_id, detail_cache)
+
+        # Filter by time bounds
+        if since_ms is not None:
+            events = [ev for ev in events if ev["timestamp"] >= since_ms]
+        if until_ms is not None:
+            events = [ev for ev in events if ev["timestamp"] <= until_ms]
+
+        ordered = sorted(events, key=lambda ev: ev["timestamp"])
+
+        if on_batch and ordered:
+            on_batch(ordered)
+
+        logger.debug(
+            "GateioFetcher.fetch: done (events=%d, trades=%d, orders=%d)",
+            len(ordered),
+            len(trades),
+            len(orders_by_id),
+        )
+        return ordered
+
+    async def _fetch_trades(
+        self, since_ms: Optional[int], until_ms: Optional[int]
+    ) -> List[Dict[str, object]]:
+        """Fetch trades using the my_trades_timerange endpoint.
+
+        The standard my_trades endpoint has a ~7 day hard limit, so we use
+        the timerange endpoint which allows fetching historical data by
+        specifying from/to timestamps.
+        """
+        now_ms = self._now_func()
+        # Default to 30 days if no since_ms provided
+        default_lookback_ms = 30 * 24 * 60 * 60 * 1000
+        from_s = int((since_ms or (now_ms - default_lookback_ms)) / 1000)
+        to_s = int((until_ms or now_ms) / 1000)
+
+        collected: Dict[str, Dict[str, object]] = {}
+        max_fetches = 400
+        fetch_count = 0
+        offset = 0
+        consecutive_rate_limits = 0
+
+        while fetch_count < max_fetches:
+            fetch_count += 1
+            try:
+                # Use the timerange endpoint directly via CCXT's private API
+                batch = await self.api.private_futures_get_settle_my_trades_timerange(
+                    {
+                        "settle": "usdt",
+                        "from": from_s,
+                        "to": to_s,
+                        "limit": self.trade_limit,
+                        "offset": offset,
+                    }
+                )
+                consecutive_rate_limits = 0
+            except RateLimitExceeded as exc:
+                consecutive_rate_limits += 1
+                sleep_time = min(2**consecutive_rate_limits, 30)
+                logger.debug(
+                    "GateioFetcher._fetch_trades: rate-limited (%s); sleeping %.1fs", exc, sleep_time
+                )
+                await asyncio.sleep(sleep_time)
+                continue
+            except Exception as exc:
+                # Check if it's a rate limit error in disguise
+                if "TOO_MANY_REQUESTS" in str(exc):
+                    consecutive_rate_limits += 1
+                    sleep_time = min(2**consecutive_rate_limits, 30)
+                    logger.debug(
+                        "GateioFetcher._fetch_trades: rate-limited (%s); sleeping %.1fs",
+                        exc,
+                        sleep_time,
+                    )
+                    await asyncio.sleep(sleep_time)
+                    continue
+                raise
+
+            if fetch_count > 1:
+                logger.info(
+                    "GateioFetcher._fetch_trades: fetch #%d offset=%s size=%d",
+                    fetch_count,
+                    offset,
+                    len(batch) if batch else 0,
+                )
+
+            if not batch:
+                break
+
+            for raw_trade in batch:
+                # Convert raw Gate.io response to CCXT-like format
+                trade = self._normalize_raw_trade(raw_trade)
+                ts = trade.get("timestamp", 0)
+                # Skip trades outside time bounds (safety check)
+                if since_ms is not None and ts < since_ms:
+                    continue
+                if until_ms is not None and ts > until_ms:
+                    continue
+                trade_id = str(trade.get("id") or "")
+                if trade_id:
+                    collected[trade_id] = trade
+
+            if len(batch) < self.trade_limit:
+                break
+
+            offset += self.trade_limit
+            # Small delay to avoid rate limits
+            await asyncio.sleep(0.15)
+
+        if fetch_count >= max_fetches:
+            logger.warning("GateioFetcher._fetch_trades: reached pagination cap (%d)", max_fetches)
+
+        return list(collected.values())
+
+    def _normalize_raw_trade(self, raw: Dict[str, object]) -> Dict[str, object]:
+        """Convert raw Gate.io my_trades_timerange response to CCXT-like format.
+
+        Raw format from my_trades_timerange:
+            price, text, fee, create_time (float seconds), point_fee,
+            trade_id, contract, role, order_id, size, close_size, biz_info, amend_text
+
+        CCXT-like format expected by _normalize_trade:
+            id, order, timestamp, symbol, side, amount, price, fee, info
+        """
+        # Parse timestamp from float seconds to ms
+        create_time = raw.get("create_time", 0)
+        timestamp_ms = int(float(create_time) * 1000) if create_time else 0
+
+        # Get contract and convert to CCXT symbol format (e.g., BNB_USDT -> BNB/USDT:USDT)
+        contract = str(raw.get("contract") or "")
+        symbol = contract.replace("_", "/") + ":USDT" if contract else ""
+
+        # Determine side from size sign (positive = buy, negative = sell)
+        size = float(raw.get("size") or 0)
+        side = "buy" if size >= 0 else "sell"
+
+        # Build fee structure
+        fee_cost = float(raw.get("fee") or 0)
+        fee = {"cost": fee_cost, "currency": "USDT"} if fee_cost else None
+
+        return {
+            "id": str(raw.get("trade_id") or raw.get("id") or ""),
+            "order": str(raw.get("order_id") or ""),
+            "timestamp": timestamp_ms,
+            "symbol": symbol,
+            "side": side,
+            "amount": abs(size),
+            "price": float(raw.get("price") or 0),
+            "fee": fee,
+            "info": raw,  # Keep raw data for _normalize_trade to access
+        }
+
+    async def _fetch_orders_for_pnl(self, order_ids: set[str]) -> Dict[str, Dict[str, object]]:
+        """Fetch closed orders to get PnL data."""
+        orders_by_id: Dict[str, Dict[str, object]] = {}
+        max_fetches = 400
+        fetch_count = 0
+        params: Dict[str, object] = {"status": "finished", "limit": 100, "offset": 0}
+
+        while fetch_count < max_fetches:
+            fetch_count += 1
+            try:
+                batch = await self.api.fetch_closed_orders(params=params)
+            except RateLimitExceeded as exc:
+                logger.debug("GateioFetcher._fetch_orders_for_pnl: rate-limited (%s); sleeping", exc)
+                await asyncio.sleep(1.0)
+                continue
+
+            if not batch:
+                break
+
+            for order in batch:
+                oid = str(order.get("id") or "")
+                if oid:
+                    orders_by_id[oid] = order
+
+            # Check if we've collected all needed orders
+            if order_ids and order_ids.issubset(orders_by_id.keys()):
+                break
+
+            if len(batch) < 100:
+                break
+
+            params["offset"] = int(params.get("offset", 0)) + 100
+
+        return orders_by_id
+
+    def _merge_trades_with_orders(
+        self,
+        trades: List[Dict[str, object]],
+        orders_by_id: Dict[str, Dict[str, object]],
+        detail_cache: Dict[str, Tuple[str, str]],
+    ) -> List[Dict[str, object]]:
+        """Merge trades with order-level PnL, distributing proportionally."""
+        # Group trades by order_id
+        trades_by_order: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+        for t in trades:
+            oid = str(t.get("order") or t.get("info", {}).get("order_id") or "")
+            trades_by_order[oid].append(t)
+
+        events = []
+        for order_id, order_trades in trades_by_order.items():
+            order = orders_by_id.get(order_id, {})
+            order_info = order.get("info", {}) if order else {}
+
+            # Get order-level PnL
+            order_pnl = float(order_info.get("pnl") or 0.0)
+
+            # Calculate total qty for proportional distribution
+            total_qty = sum(abs(float(t.get("amount", 0))) for t in order_trades)
+
+            for t in order_trades:
+                event = self._normalize_trade(t, order, order_pnl, total_qty, detail_cache)
+                events.append(event)
+
+        return events
+
+    def _normalize_trade(
+        self,
+        trade: Dict[str, object],
+        order: Dict[str, object],
+        order_pnl: float,
+        total_qty: float,
+        detail_cache: Dict[str, Tuple[str, str]],
+    ) -> Dict[str, object]:
+        """Normalize a trade to the canonical fill event format."""
+        info = trade.get("info", {}) or {}
+        order_info = order.get("info", {}) if order else {}
+
+        trade_id = str(trade.get("id") or info.get("trade_id") or "")
+        order_id = str(trade.get("order") or info.get("order_id") or "")
+
+        ts_raw = trade.get("timestamp") or info.get("create_time") or 0
+        try:
+            timestamp = int(ensure_millis(float(ts_raw)))
+        except Exception:
+            timestamp = int(float(ts_raw)) if ts_raw else 0
+
+        symbol = str(trade.get("symbol") or info.get("contract") or "")
+        side = str(trade.get("side") or info.get("side") or "").lower()
+        qty = abs(float(trade.get("amount") or info.get("size") or 0.0))
+        price = float(trade.get("price") or info.get("price") or 0.0)
+        fee = trade.get("fee")
+
+        # Distribute PnL proportionally
+        proportion = qty / total_qty if total_qty > 0 else 0
+        pnl = order_pnl * proportion
+
+        # Get client order ID from trade or order
+        client_order_id = str(
+            info.get("text") or order.get("clientOrderId") or order_info.get("text") or ""
+        )
+
+        # Check detail cache first
+        if trade_id and trade_id in detail_cache:
+            client_order_id, pb_type = detail_cache[trade_id]
+        else:
+            pb_type = custom_id_to_snake(client_order_id) if client_order_id else "unknown"
+            if trade_id and client_order_id:
+                detail_cache[trade_id] = (client_order_id, pb_type)
+
+        # Determine position side
+        close_size = float(info.get("close_size", 0))
+        is_reduce_only = order.get("reduceOnly", False) or order_info.get("is_reduce_only", False)
+        is_close = close_size > 0 or is_reduce_only or abs(order_pnl) > 0
+        position_side = self._determine_position_side(side, is_close)
+
+        return {
+            "id": trade_id,
+            "order_id": order_id,
+            "timestamp": timestamp,
+            "datetime": ts_to_date(timestamp) if timestamp else "",
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "pnl": pnl,
+            "fees": fee,
+            "pb_order_type": pb_type or "unknown",
+            "position_side": position_side,
+            "client_order_id": client_order_id,
+            "raw": [{"source": "my_trades_timerange", "data": dict(trade)}],
+        }
+
+    @staticmethod
+    def _determine_position_side(side: str, is_close: bool) -> str:
+        side = side.lower()
+        if is_close:
+            if side == "buy":
+                return "short"
+            if side == "sell":
+                return "long"
+        else:
+            if side == "buy":
+                return "long"
+            if side == "sell":
+                return "short"
+        return "long"
+
+
+class KucoinFetcher(BaseFetcher):
+    """Fetches fill events for Kucoin by combining trade and position history."""
+
+    def __init__(
+        self, api, *, trade_limit: int = 1000, now_func: Optional[Callable[[], int]] = None
+    ) -> None:
+        self.api = api
+        self.trade_limit = max(1, trade_limit)
+        self._symbol_resolver = None
+        self._now_func = now_func or (lambda: int(datetime.now(tz=timezone.utc).timestamp() * 1000))
+
+    async def fetch(
+        self,
+        since_ms: Optional[int],
+        until_ms: Optional[int],
+        detail_cache: Dict[str, Tuple[str, str]],
+        on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    ) -> List[Dict[str, object]]:
+        trades = await self._fetch_trades(since_ms, until_ms)
+        if not trades:
+            return []
+
+        # Compute local realized PnL from trades (gross), subtract fees when available
+        local_pnls, _ = compute_realized_pnls_from_trades(trades)
+
+        closes = [
+            t
+            for t in trades
+            if (t["side"] == "sell" and t["position_side"] == "long")
+            or (t["side"] == "buy" and t["position_side"] == "short")
+        ]
+        events: Dict[str, Dict[str, object]] = {}
+        for t in trades:
+            ev = dict(t)
+            fee_cost = _fee_cost(ev.get("fees"))
+            ev["pnl"] = local_pnls.get(ev["id"], 0.0) - fee_cost
+            events[ev["id"]] = ev
+
+        if closes:
+            ph = await self._fetch_positions_history(
+                start_ms=closes[0]["timestamp"] - 60_000,
+                end_ms=closes[-1]["timestamp"] + 60_000,
+            )
+            self._match_pnls(closes, ph, events)
+            self._log_discrepancies(local_pnls, ph)
+
+        ordered = sorted(events.values(), key=lambda ev: ev["timestamp"])
+        await self._enrich_with_order_details_bulk(ordered, detail_cache)
+        if on_batch and ordered:
+            on_batch(ordered)
+        return ordered
+
+    async def _fetch_trades(
+        self, since_ms: Optional[int], until_ms: Optional[int]
+    ) -> List[Dict[str, object]]:
+        now_ms = self._now_func()
+        until_ts = int(until_ms) if until_ms is not None else now_ms + 3_600_000
+        since_ts = int(since_ms) if since_ms is not None else until_ts - 24 * 60 * 60 * 1000
+        buffer_ms = int(24 * 60 * 60 * 1000 * 0.99)
+        limit = min(self.trade_limit, 1000)
+
+        collected: Dict[str, Dict[str, object]] = {}
+        max_fetches = 400
+        start_at = since_ts
+        prev_params = None
+        fetch_count = 0
+
+        while start_at < until_ts and fetch_count < max_fetches:
+            fetch_count += 1
+            end_at = min(start_at + buffer_ms, until_ts)
+            params: Dict[str, object] = {
+                "startAt": int(start_at),
+                "endAt": int(end_at),
+                "limit": limit,
+            }
+            key = _check_pagination_progress(prev_params, dict(params), "KucoinFetcher._fetch_trades")
+            if key is None:
+                break
+            prev_params = key
+            batch = await self.api.fetch_my_trades(params=params)
+            if fetch_count > 1:
+                logger.debug(
+                    "KucoinFetcher._fetch_trades: fetch #%d startAt=%s endAt=%s size=%d",
+                    fetch_count,
+                    _format_ms(params["startAt"]),
+                    _format_ms(params["endAt"]),
+                    len(batch) if batch else 0,
+                )
+            if not batch:
+                start_at += buffer_ms
+                continue
+
+            batch_sorted = sorted(batch, key=lambda x: x.get("timestamp", 0))
+            for trade in batch_sorted:
+                event = self._normalize_trade(trade)
+                ts = event["timestamp"]
+                if ts < since_ts or ts > until_ts:
+                    continue
+                key = (event.get("id") or "", event.get("order_id") or "")
+                collected[key] = event
+
+            last_ts = int(batch_sorted[-1].get("timestamp", start_at))
+            if last_ts <= start_at:
+                start_at = start_at + buffer_ms
+            else:
+                start_at = last_ts + 1
+
+        if fetch_count >= max_fetches:
+            logger.warning("KucoinFetcher._fetch_trades: reached pagination cap (%d)", max_fetches)
+
+        return sorted(collected.values(), key=lambda ev: ev["timestamp"])
+
+    async def _fetch_positions_history(self, start_ms: int, end_ms: int) -> List[Dict[str, object]]:
+        results: Dict[str, Dict[str, object]] = {}
+        max_fetches = 400
+        fetch_count = 0
+        buffer_ms = int(24 * 60 * 60 * 1000 * 0.99)
+        limit = 200
+        now_ms = self._now_func()
+        until_ts = int(end_ms) if end_ms is not None else now_ms + 3_600_000
+        since_ts = int(start_ms) if start_ms is not None else until_ts - 24 * 60 * 60 * 1000
+
+        start_at = since_ts
+        prev_params = None
+        while start_at < until_ts and fetch_count < max_fetches:
+            end_at = min(start_at + buffer_ms, until_ts)
+            params: Dict[str, object] = {"from": int(start_at), "to": int(end_at), "limit": limit}
+            key = _check_pagination_progress(
+                prev_params, dict(params), "KucoinFetcher._fetch_positions_history"
+            )
+            if key is None:
+                break
+            prev_params = key
+            fetch_count += 1
+            batch = await self.api.fetch_positions_history(params=params)
+            if fetch_count > 1:
+                logger.debug(
+                    "KucoinFetcher._fetch_positions_history: fetch #%d from=%s to=%s size=%d",
+                    fetch_count,
+                    _format_ms(params.get("from")),
+                    _format_ms(params.get("to")),
+                    len(batch) if batch else 0,
+                )
+            if not batch:
+                start_at += buffer_ms
+                continue
+            batch_sorted = sorted(batch, key=lambda x: x.get("lastUpdateTimestamp", 0))
+            for pos in batch_sorted:
+                close_id = str(pos.get("info", {}).get("closeId") or pos.get("id") or "")
+                results[close_id] = pos
+            last_ts = int(batch_sorted[-1].get("lastUpdateTimestamp", end_at))
+            if last_ts <= start_at:
+                start_at += buffer_ms
+            else:
+                start_at = last_ts + 1
+
+        if fetch_count >= max_fetches:
+            logger.warning(
+                "KucoinFetcher._fetch_positions_history: reached pagination cap (%d)", max_fetches
+            )
+
+        return sorted(results.values(), key=lambda x: x.get("lastUpdateTimestamp", 0))
+
+    def _match_pnls(
+        self,
+        closes: List[Dict[str, object]],
+        positions: List[Dict[str, object]],
+        events: Dict[str, Dict[str, object]],
+    ) -> None:
+        """Match position close PnL from positions_history to trade fills.
+
+        Uses a 5-minute window to find all fills that could be part of a position close.
+        When multiple fills match a single position close:
+        - The PnL is distributed proportionally by fill quantity
+        - This ensures the total PnL sums correctly regardless of how many fills closed the position
+        """
+        match_window_ms = 5 * 60 * 1000  # 5 minute window for matching
+
+        closes_by_symbol: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+        for c in closes:
+            closes_by_symbol[c["symbol"]].append(c)
+        positions_by_symbol: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+        for p in positions:
+            positions_by_symbol[p.get("symbol", "")].append(p)
+
+        # Track which trades have been assigned PnL
+        assigned_trade_ids: set[str] = set()
+        unmatched_positions = []
+
+        for symbol, pos_list in positions_by_symbol.items():
+            if symbol not in closes_by_symbol:
+                unmatched_positions.extend(pos_list)
+                continue
+
+            symbol_closes = closes_by_symbol[symbol]
+            for p in pos_list:
+                p_ts = p.get("lastUpdateTimestamp", 0)
+                p_pnl = float(p.get("realizedPnl", 0.0) or 0.0)
+
+                # Find all fills within the match window that haven't been assigned yet
+                matching_fills = [
+                    c
+                    for c in symbol_closes
+                    if c["id"] not in assigned_trade_ids
+                    and abs(c["timestamp"] - p_ts) < match_window_ms
+                ]
+
+                if not matching_fills:
+                    # Try expanding window for this position
+                    unmatched_positions.append(p)
+                    continue
+
+                # Compute total qty across matching fills
+                total_qty = sum(
+                    abs(float(f.get("qty", 0) or f.get("amount", 0) or 0)) for f in matching_fills
+                )
+
+                if total_qty <= 0:
+                    # Fallback: assign all PnL to closest fill
+                    closest = min(matching_fills, key=lambda c: abs(c["timestamp"] - p_ts))
+                    events[closest["id"]]["pnl"] = p_pnl
+                    assigned_trade_ids.add(closest["id"])
+                else:
+                    # Distribute PnL proportionally by qty
+                    for fill in matching_fills:
+                        fill_qty = abs(float(fill.get("qty", 0) or fill.get("amount", 0) or 0))
+                        proportion = fill_qty / total_qty if total_qty > 0 else 0
+                        events[fill["id"]]["pnl"] = p_pnl * proportion
+                        assigned_trade_ids.add(fill["id"])
+
+        # Set PnL to 0 for closes that weren't assigned any PnL from positions_history
+        for c in closes:
+            if c["id"] not in assigned_trade_ids:
+                # This close didn't match any position_history entry - set local_pnl to 0
+                # since we don't have reliable entry data to compute it
+                events[c["id"]]["pnl"] = 0.0
+
+        # Log unmatched positions for debugging
+        if unmatched_positions:
+            total_unmatched_pnl = sum(
+                float(p.get("realizedPnl", 0) or 0) for p in unmatched_positions
+            )
+            logger.debug(
+                "[pnl] KucoinFetcher._match_pnls: %d position closes (%s total PnL) "
+                "could not be matched to any trade fills",
+                len(unmatched_positions),
+                f"{total_unmatched_pnl:.4f}",
+            )
+
+    def _log_discrepancies(
+        self, local_pnls: Dict[str, float], positions: List[Dict[str, object]]
+    ) -> None:
+        if not positions or not local_pnls:
+            return
+        # Aggregate by symbol for a rough reconciliation
+        pos_sum: Dict[str, float] = defaultdict(float)
+        for p in positions:
+            sym = p.get("symbol") or p.get("info", {}).get("symbol") or ""
+            if not sym:
+                continue
+            try:
+                pos_sum[sym] += float(p.get("realizedPnl", 0.0))
+            except Exception:
+                continue
+        if not pos_sum:
+            return
+        # Local aggregate by symbol inferred from trade ids is not available here; report global sums
+        local_total = sum(local_pnls.values())
+        remote_total = sum(pos_sum.values())
+        if abs(local_total - remote_total) > max(1e-8, 0.05 * (abs(remote_total) + 1e-8)):
+            # Throttle: log once per hour, or immediately if delta changes significantly
+            now = time.time()
+            throttle_key = f"kucoin:{id(self.api)}"
+            last_log = _pnl_discrepancy_last_log.get(throttle_key, 0.0)
+            last_delta = _pnl_discrepancy_last_delta.get(throttle_key)
+            current_delta = local_total - remote_total
+            # Log if: (1) delta changed significantly, or (2) throttle window expired
+            delta_changed = last_delta is None or abs(
+                current_delta - last_delta
+            ) > _PNL_DISCREPANCY_CHANGE_THRESHOLD * (abs(last_delta) + 1.0)
+            time_since_last = now - last_log
+            should_log = (
+                delta_changed and time_since_last >= _PNL_DISCREPANCY_MIN_SECONDS
+            ) or time_since_last >= _PNL_DISCREPANCY_THROTTLE_SECONDS
+            if should_log:
+                _pnl_discrepancy_last_log[throttle_key] = now
+                _pnl_discrepancy_last_delta[throttle_key] = current_delta
+                logger.warning(
+                    "[pnl] KucoinFetcher: local sum %.2f differs from positions_history %.2f (delta=%.2f)",
+                    local_total,
+                    remote_total,
+                    current_delta,
+                )
+
+    @staticmethod
+    def _normalize_trade(trade: Dict[str, object]) -> Dict[str, object]:
+        info = trade.get("info", {}) or {}
+        trade_id = str(trade.get("id") or info.get("tradeId") or info.get("id") or "")
+        order_id = str(trade.get("order") or info.get("orderId") or "")
+        ts_raw = (
+            info.get("tradeTime")
+            or trade.get("timestamp")
+            or info.get("createdAt")
+            or info.get("updatedTime")
+            or 0
+        )
+        try:
+            timestamp = int(ensure_millis(float(ts_raw)))
+        except Exception:
+            try:
+                timestamp = int(float(ts_raw))
+            except Exception:
+                timestamp = 0
+        symbol = str(trade.get("symbol") or "")
+        side = str(trade.get("side") or info.get("side") or "").lower()
+        qty = abs(float(trade.get("amount") or info.get("size") or info.get("amount") or 0.0))
+        price = float(trade.get("price") or info.get("price") or 0.0)
+        fee = trade.get("fee")
+        reduce_only = bool(trade.get("reduceOnly") or info.get("closeOrder") or False)
+        close_fee_pay = float(info.get("closeFeePay") or 0.0)
+        position_side = KucoinFetcher._determine_position_side(side, reduce_only, close_fee_pay)
+
+        return {
+            "id": trade_id,
+            "order_id": order_id,
+            "timestamp": timestamp,
+            "datetime": ts_to_date(timestamp) if timestamp else "",
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "price": price,
+            "pnl": 0.0,
+            "fees": fee,
+            "pb_order_type": "",
+            "position_side": position_side,
+            "client_order_id": str(trade.get("clientOrderId") or info.get("clientOid") or ""),
+            "raw": [{"source": "fetch_my_trades", "data": dict(trade)}],
+        }
+
+    @staticmethod
+    def _determine_position_side(side: str, reduce_only: bool, close_fee_pay: float) -> str:
+        side = side.lower()
+        if side == "buy":
+            return "short" if close_fee_pay != 0.0 or reduce_only else "long"
+        if side == "sell":
+            return "long" if close_fee_pay != 0.0 or reduce_only else "short"
+        return "long"
+
+    async def _enrich_with_order_details_bulk(
+        self, events: List[Dict[str, object]], detail_cache: Dict[str, Tuple[str, str]]
+    ) -> None:
+        """Enrich events with clientOid from order details.
+
+        Optimized to:
+        1. Check cache by both tradeId and orderId
+        2. Group events by orderId to avoid duplicate fetch_order calls
+        3. Share results across events with the same orderId
+        """
+        if events is None:
+            return
+        detail_cache = detail_cache or {}
+
+        # Build an orderId -> clientOid lookup from cache (for events already enriched)
+        order_id_cache: Dict[str, Tuple[str, str]] = {}
+
+        # First pass: apply cached values and build orderId lookup
+        for ev in events:
+            ev_id = ev.get("id")
+            order_id = ev.get("order_id")
+
+            # Check cache by tradeId
+            cached = detail_cache.get(ev_id) if ev_id else None
+            if cached:
+                ev["client_order_id"], ev["pb_order_type"] = cached
+                # Also populate orderId cache for other events with same order
+                if order_id:
+                    order_id_cache[str(order_id)] = cached
+                continue
+
+            # Check if we already know this orderId's clientOid
+            if order_id and str(order_id) in order_id_cache:
+                client_oid, pb_type = order_id_cache[str(order_id)]
+                ev["client_order_id"] = client_oid
+                ev["pb_order_type"] = pb_type
+                if ev_id:
+                    detail_cache[ev_id] = (client_oid, pb_type)
+
+        # Second pass: collect events that still need enrichment, grouped by orderId
+        events_by_order: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+        for ev in events:
+            has_client = bool(ev.get("client_order_id"))
+            has_type = bool(ev.get("pb_order_type")) and ev["pb_order_type"] != "unknown"
+            if has_client and has_type:
+                continue
+            order_id = ev.get("order_id")
+            if not order_id:
+                ev.setdefault("pb_order_type", "unknown")
+                continue
+            # Skip if we already fetched this orderId
+            if str(order_id) in order_id_cache:
+                client_oid, pb_type = order_id_cache[str(order_id)]
+                ev["client_order_id"] = client_oid
+                ev["pb_order_type"] = pb_type
+                ev_id = ev.get("id")
+                if ev_id:
+                    detail_cache[ev_id] = (client_oid, pb_type)
+                continue
+            events_by_order[str(order_id)].append(ev)
+
+        unique_orders = list(events_by_order.keys())
+        if unique_orders:
+            # Get symbol for each orderId (use first event's symbol)
+            order_symbols = {oid: evs[0].get("symbol") for oid, evs in events_by_order.items()}
+
+            # Limit concurrency to avoid overwhelming the API
+            sem = asyncio.Semaphore(8)
+            total = len(unique_orders)
+            completed = 0
+            last_log_time = time.time()
+            log_interval = 5.0
+
+            async def throttled_fetch(order_id: str) -> Tuple[str, Optional[Tuple[str, str]]]:
+                nonlocal completed, last_log_time
+                async with sem:
+                    symbol = order_symbols.get(order_id)
+                    result = await self._enrich_with_order_details(order_id, symbol)
+                    completed += 1
+                    now = time.time()
+                    if total > 50 and (now - last_log_time >= log_interval):
+                        last_log_time = now
+                        pct = int(100 * completed / total)
+                        logger.info(
+                            "KucoinFetcher: enriching order details %d/%d (%d%%)",
+                            completed,
+                            total,
+                            pct,
+                        )
+                    return order_id, result
+
+            total_events = sum(len(evs) for evs in events_by_order.values())
+            if total > 50:
+                logger.info(
+                    "KucoinFetcher: enriching %d events via %d unique orders (concurrency=8)...",
+                    total_events,
+                    total,
+                )
+
+            tasks = [throttled_fetch(oid) for oid in unique_orders]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            if total > 50:
+                logger.info(
+                    "KucoinFetcher: enrichment complete (%d orders, %d events)", total, total_events
+                )
+
+            # Apply results to all events sharing the same orderId
+            for res in results:
+                if isinstance(res, Exception):
+                    continue
+                order_id, detail = res
+                if detail is None:
+                    # Mark all events with this orderId as unknown
+                    for ev in events_by_order.get(order_id, []):
+                        ev.setdefault("pb_order_type", "unknown")
+                    continue
+
+                client_oid, pb_type = detail
+                order_id_cache[order_id] = (client_oid, pb_type)
+
+                # Apply to all events with this orderId
+                for ev in events_by_order.get(order_id, []):
+                    ev["client_order_id"] = client_oid or ev.get("client_order_id") or ""
+                    ev["pb_order_type"] = pb_type or "unknown"
+                    ev_id = ev.get("id")
+                    if ev_id:
+                        detail_cache[ev_id] = (ev["client_order_id"], ev["pb_order_type"])
+
+        # Final pass: ensure all events have pb_order_type
+        for ev in events:
+            if not ev.get("pb_order_type"):
+                ev["pb_order_type"] = "unknown"
+
+    async def _enrich_with_order_details(
+        self, order_id: Optional[str], symbol: Optional[str]
+    ) -> Optional[Tuple[str, str]]:
+        if not order_id:
+            return None
+        try:
+            detail = await self.api.fetch_order(order_id, symbol)
+        except Exception as exc:  # pragma: no cover - live API dependent
+            logger.debug(
+                "KucoinFetcher._enrich_with_order_details: fetch_order failed for %s (%s)",
+                order_id,
+                exc,
+            )
+            return None
+        info = detail.get("info") if isinstance(detail, dict) else detail
+        if not isinstance(info, dict):
+            return None
+        client_oid = (
+            detail.get("clientOrderId")
+            or info.get("clientOrderId")
+            or info.get("clientOid")
+            or info.get("clientOid")
+        )
+        if not client_oid:
+            return None
+        client_oid = str(client_oid)
+        return client_oid, custom_id_to_snake(client_oid)
+
+
+# ---------------------------------------------------------------------------
+# Utilities for Bitget integration
+# ---------------------------------------------------------------------------
+
+
+class OkxFetcher(BaseFetcher):
+    """Fetches fill events from OKX using fills and fills-history endpoints.
+
+    OKX provides all required fields in a single endpoint:
+    - tradeId: unique fill identifier
+    - fillPnl: realized PnL
+    - posSide: position side (long/short/net)
+    - clOrdId: client order ID (passivbot order type)
+    - fillSz: fill quantity
+    - fillPx: fill price
+
+    Endpoints:
+    - /api/v5/trade/fills: last 3 days (higher rate limit)
+    - /api/v5/trade/fills-history: last 3 months (lower rate limit)
+
+    Pagination: Returns newest first; use 'after' param with billId for backward pagination.
+    """
+
+    # 3 days in ms - threshold for choosing between /fills and /fills-history
+    _THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000
+
+    def __init__(
+        self,
+        api,
+        *,
+        trade_limit: int = 100,
+        inst_type: str = "SWAP",
+    ) -> None:
+        self.api = api
+        self.trade_limit = max(1, min(100, trade_limit))  # OKX max is 100
+        self.inst_type = inst_type
+
+    async def fetch(
+        self,
+        since_ms: Optional[int],
+        until_ms: Optional[int],
+        detail_cache: Dict[str, Tuple[str, str]],
+        on_batch: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    ) -> List[Dict[str, object]]:
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        until_ms = until_ms or now_ms
+
+        # Determine which endpoint(s) to use based on time range
+        three_days_ago = now_ms - self._THREE_DAYS_MS
+
+        collected: Dict[str, Dict[str, object]] = {}
+        max_fetches = 400
+        fetch_count = 0
+
+        logger.debug(
+            "OkxFetcher.fetch: start (since=%s, until=%s)",
+            _format_ms(since_ms),
+            _format_ms(until_ms),
+        )
+
+        # If we need data older than 3 days, start with fills-history
+        if since_ms is not None and since_ms < three_days_ago:
+            # Use fills-history for older data
+            fetch_count, collected = await self._fetch_from_endpoint(
+                endpoint="history",
+                since_ms=since_ms,
+                until_ms=min(until_ms, three_days_ago),
+                collected=collected,
+                max_fetches=max_fetches,
+                start_fetch_count=fetch_count,
+                on_batch=on_batch,
+                detail_cache=detail_cache,
+            )
+
+        # Use /fills for recent data (last 3 days)
+        recent_since = max(since_ms or 0, three_days_ago) if since_ms else three_days_ago
+        if until_ms > three_days_ago:
+            fetch_count, collected = await self._fetch_from_endpoint(
+                endpoint="recent",
+                since_ms=recent_since if since_ms else None,
+                until_ms=until_ms,
+                collected=collected,
+                max_fetches=max_fetches,
+                start_fetch_count=fetch_count,
+                on_batch=on_batch,
+                detail_cache=detail_cache,
+            )
+
+        # Sort and filter results
+        events = sorted(collected.values(), key=lambda ev: ev["timestamp"])
+
+        # Apply time filters
+        if since_ms is not None:
+            events = [ev for ev in events if ev["timestamp"] >= since_ms]
+        if until_ms is not None:
+            events = [ev for ev in events if ev["timestamp"] <= until_ms]
+
+        # Coalesce duplicate events
+        events = _coalesce_events(events)
+        # Note: psize/pprice annotation is done centrally in FillEventsManager.refresh()
+
+        # Apply pb_order_type from cache or derive from clOrdId
+        for event in events:
+            cache_entry = detail_cache.get(event["id"])
+            if cache_entry:
+                event["client_order_id"], event["pb_order_type"] = cache_entry
+            elif event["client_order_id"]:
+                event["pb_order_type"] = custom_id_to_snake(event["client_order_id"])
+            else:
+                event["pb_order_type"] = "unknown"
+            if not event["pb_order_type"]:
+                event["pb_order_type"] = "unknown"
+
+        logger.debug(
+            "OkxFetcher.fetch: done (events=%d, fetches=%d)",
+            len(events),
+            fetch_count,
+        )
+        return events
+
+    async def _fetch_from_endpoint(
+        self,
+        endpoint: str,
+        since_ms: Optional[int],
+        until_ms: int,
+        collected: Dict[str, Dict[str, object]],
+        max_fetches: int,
+        start_fetch_count: int,
+        on_batch: Optional[Callable[[List[Dict[str, object]]], None]],
+        detail_cache: Dict[str, Tuple[str, str]],
+    ) -> Tuple[int, Dict[str, Dict[str, object]]]:
+        """Fetch fills from either /fills (recent) or /fills-history (history) endpoint."""
+        fetch_count = start_fetch_count
+        after_cursor: Optional[str] = None
+
+        endpoint_name = "fills" if endpoint == "recent" else "fills-history"
+        logger.debug(
+            "OkxFetcher: using /%s endpoint (since=%s, until=%s)",
+            endpoint_name,
+            _format_ms(since_ms),
+            _format_ms(until_ms),
+        )
+
+        while fetch_count < max_fetches:
+            params: Dict[str, object] = {
+                "instType": self.inst_type,
+                "limit": str(self.trade_limit),
+            }
+
+            # Time windowing
+            if since_ms is not None:
+                params["begin"] = str(since_ms)
+            if until_ms is not None:
+                params["end"] = str(until_ms)
+
+            # Pagination cursor
+            if after_cursor:
+                params["after"] = after_cursor
+
+            try:
+                if endpoint == "recent":
+                    response = await self.api.private_get_trade_fills(params)
+                else:
+                    response = await self.api.private_get_trade_fills_history(params)
+            except RateLimitExceeded as exc:
+                logger.debug("OkxFetcher: rate limit hit, sleeping (%s)", exc)
+                await asyncio.sleep(2.0)
+                continue
+
+            fetch_count += 1
+            fills = response.get("data", [])
+
+            if fetch_count > 1:
+                logger.debug(
+                    "OkxFetcher.fetch: /%s #%d after=%s size=%d",
+                    endpoint_name,
+                    fetch_count,
+                    after_cursor,
+                    len(fills),
+                )
+
+            if not fills:
+                break
+
+            batch_events = []
+            oldest_ts = None
+            for raw in fills:
+                event = self._normalize_fill(raw)
+                event_id = event["id"]
+                if not event_id:
+                    continue
+
+                # Ensure client_order_id/pb_order_type are populated before batch callbacks
+                cached = detail_cache.get(event_id)
+                if cached:
+                    cached_client, cached_pb = cached
+                    if cached_client:
+                        event["client_order_id"] = cached_client
+                    if cached_pb:
+                        event["pb_order_type"] = cached_pb
+                client_oid = str(event.get("client_order_id") or "")
+                pb_type = str(event.get("pb_order_type") or "")
+                if not pb_type and client_oid:
+                    pb_type = custom_id_to_snake(client_oid)
+                if not pb_type:
+                    pb_type = "unknown"
+                event["client_order_id"] = client_oid
+                event["pb_order_type"] = pb_type
+                if event_id and client_oid:
+                    detail_cache[event_id] = (client_oid, pb_type)
+
+                # Check time bounds
+                ts = event["timestamp"]
+                if since_ms is not None and ts < since_ms:
+                    continue
+                if until_ms is not None and ts > until_ms:
+                    continue
+
+                # Track oldest for boundary check
+                if oldest_ts is None or ts < oldest_ts:
+                    oldest_ts = ts
+
+                # Enrich from cache
+                if event_id in detail_cache:
+                    event["client_order_id"], event["pb_order_type"] = detail_cache[event_id]
+
+                collected[event_id] = event
+                batch_events.append(event)
+
+            # Callback for incremental processing
+            if on_batch and batch_events:
+                on_batch(batch_events)
+
+            # Check if we've reached the start boundary
+            if since_ms is not None and oldest_ts is not None and oldest_ts <= since_ms:
+                logger.debug("OkxFetcher: reached since_ms boundary, stopping")
+                break
+
+            # Short batch means no more data
+            if len(fills) < self.trade_limit:
+                break
+
+            # Get pagination cursor for next batch (use billId from oldest fill)
+            last_fill = fills[-1]
+            after_cursor = last_fill.get("billId")
+            if not after_cursor:
+                break
+
+        return fetch_count, collected
+
+    @staticmethod
+    def _normalize_fill(raw: Dict[str, object]) -> Dict[str, object]:
+        """Normalize a raw OKX fill to the canonical fill event format."""
+        trade_id = str(raw.get("tradeId") or "")
+        order_id = str(raw.get("ordId") or "")
+        timestamp = int(raw.get("ts") or raw.get("fillTime") or 0)
+        inst_id = str(raw.get("instId") or "")
+
+        # Convert instId (e.g., "BTC-USDT-SWAP") to CCXT symbol format
+        symbol = inst_id
+        if "-SWAP" in inst_id:
+            parts = inst_id.replace("-SWAP", "").split("-")
+            if len(parts) == 2:
+                base, quote = parts
+                symbol = f"{base}/{quote}:{quote}"
+        elif "-" in inst_id:
+            parts = inst_id.split("-")
+            if len(parts) >= 2:
+                base, quote = parts[0], parts[1]
+                symbol = f"{base}/{quote}:{quote}"
+
+        side = str(raw.get("side") or "").lower()
+        qty = abs(float(raw.get("fillSz") or 0.0))
+        price = float(raw.get("fillPx") or 0.0)
+        pnl = float(raw.get("fillPnl") or 0.0)
+
+        # Position side handling (supports both hedge and net modes)
+        pos_side_raw = str(raw.get("posSide") or "").lower()
+        if pos_side_raw == "net":
+            # Net mode: infer position side from side + pnl
+            # If closing (has PnL), opposite of trade side was the position
+            if pnl != 0:
+                position_side = "short" if side == "buy" else "long"
+            else:
+                # Opening: same as trade side
+                position_side = "long" if side == "buy" else "short"
+        elif pos_side_raw in ("long", "short"):
+            position_side = pos_side_raw
+        else:
+            # Fallback
+            position_side = "long" if side == "buy" else "short"
+
+        client_order_id = str(raw.get("clOrdId") or "")
+        fee_ccy = str(raw.get("feeCcy") or "")
+        fee_amt = float(raw.get("fee") or 0.0)
+        fee = {"currency": fee_ccy, "cost": abs(fee_amt)} if fee_ccy else None
 
         return {
             "id": trade_id,
@@ -1755,13 +4522,10 @@ class HyperliquidFetcher(BaseFetcher):
             "fees": fee,
             "pb_order_type": "",
             "position_side": position_side,
-            "client_order_id": str(client_order_id or ""),
+            "client_order_id": client_order_id,
+            "raw": [{"source": "okx_fills", "data": raw}],
+            "c_mult": 1.0,
         }
-
-
-# ---------------------------------------------------------------------------
-# Utilities for Bitget integration
-# ---------------------------------------------------------------------------
 
 
 def custom_id_to_snake(client_oid: str) -> str:
@@ -1794,7 +4558,11 @@ EXCHANGE_BOT_CLASSES: Dict[str, Tuple[str, str]] = {
     "binance": ("exchanges.binance", "BinanceBot"),
     "bitget": ("exchanges.bitget", "BitgetBot"),
     "bybit": ("exchanges.bybit", "BybitBot"),
+    "fake": ("exchanges.fake", "FakeBot"),
     "hyperliquid": ("exchanges.hyperliquid", "HyperliquidBot"),
+    "gateio": ("exchanges.gateio", "GateIOBot"),
+    "kucoin": ("exchanges.kucoin", "KucoinBot"),
+    "okx": ("exchanges.okx", "OKXBot"),
 }
 
 
@@ -1903,11 +4671,21 @@ def _build_fetcher_for_bot(bot, symbols: List[str]) -> BaseFetcher:
         )
     if exchange == "bybit":
         return BybitFetcher(api=bot.cca)
+    if exchange == "fake":
+        return FakeFetcher(api=bot.cca)
     if exchange == "hyperliquid":
         return HyperliquidFetcher(
             api=bot.cca,
             symbol_resolver=lambda value: resolver(value),
         )
+    if exchange == "gateio":
+        return GateioFetcher(
+            api=bot.cca,
+        )
+    if exchange == "kucoin":
+        return KucoinFetcher(api=bot.cca)
+    if exchange == "okx":
+        return OkxFetcher(api=bot.cca)
     raise ValueError(f"Unsupported exchange '{exchange}' for fill events CLI")
 
 
@@ -1929,8 +4707,15 @@ def _instantiate_bot(config: dict):
 
 
 async def _run_cli(args: argparse.Namespace) -> None:
-    config = load_config(args.config, verbose=False)
-    config = format_config(config, verbose=False)
+    source_config, base_config_path, raw_snapshot = load_input_config(args.config)
+    config = prepare_config(
+        source_config,
+        base_config_path=base_config_path,
+        verbose=False,
+        target="live",
+        runtime="live",
+        raw_snapshot=raw_snapshot,
+    )
     live = config.setdefault("live", {})
     if args.user:
         live["user"] = args.user
@@ -1973,30 +4758,40 @@ async def _run_cli(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fill events cache refresher")
-    parser.add_argument("--config", type=str, default="configs/template.json", help="Config path")
-    parser.add_argument("--user", type=str, required=True, help="Live user identifier")
-    parser.add_argument("--start", type=str, help="Start datetime (ms or ISO)")
-    parser.add_argument("--end", type=str, help="End datetime (ms or ISO)")
+    parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=None,
+        help="Config path (defaults to in-code schema defaults)",
+    )
+    parser.add_argument("--user", "-u", type=str, required=True, help="Live user identifier")
+    parser.add_argument("--start", "-s", type=str, help="Start datetime (ms or ISO)")
+    parser.add_argument("--end", "-e", type=str, help="End datetime (ms or ISO)")
     parser.add_argument(
         "--lookback-days",
+        "-d",
         type=float,
-        default=3.0,
+        default=30.0,
         help="Default lookback window in days when start is omitted",
     )
     parser.add_argument(
         "--log-level",
+        "-l",
         type=str,
         default="info",
         help="Logging verbosity (warning/info/debug/trace or 0-3)",
     )
     parser.add_argument(
         "--cache-root",
+        "-r",
         type=str,
         default="caches/fill_events",
         help="Root directory for fill events cache (default: caches/fill_events)",
     )
     parser.add_argument(
         "--symbols",
+        "-S",
         nargs="*",
         default=None,
         help="Optional explicit symbol list to fetch",
