@@ -37,19 +37,40 @@ import json
 import logging
 import math
 import os
+import shutil
+import sys
+
 import time
 import zlib
 import atexit
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, TypedDict, TYPE_CHECKING
 import threading
 from collections import OrderedDict
+
+if TYPE_CHECKING:
+    import aiohttp
+
+import warnings
+import time
+from datetime import datetime, timezone
 
 import numpy as np
 import portalocker  # type: ignore
 
+from legacy_data_migrator import (
+    standardize_cache_directories,
+    migrate_legacy_data_all_on_init,
+    merge_duplicate_symbol_directories,
+    normalize_ccxt_volume_to_base,
+)
+
+# Suppress portalocker's "timeout has no effect in blocking mode" warning
+warnings.filterwarnings(
+    "ignore", message="timeout has no effect in blocking mode", module="portalocker"
+)
 
 # ----- Constants and dtypes -----
 
@@ -59,6 +80,13 @@ _LOCK_TIMEOUT_SECONDS = 10.0
 _LOCK_STALE_SECONDS = 180.0
 _LOCK_BACKOFF_INITIAL = 0.1
 _LOCK_BACKOFF_MAX = 2.0
+_GATEIO_RECENT_1M_LIMIT_CANDLES = 9_990
+
+# See: https://github.com/enarjord/passivbot/issues/547
+# True if running on Windows (used for file/path compatible names)
+windows_compatibility = (
+    sys.platform.startswith("win") or os.environ.get("WINDOWS_COMPATIBILITY") == "1"
+)
 
 
 @dataclass
@@ -67,6 +95,33 @@ class _LockRecord:
     count: int
     acquired_at: float
     path: str
+
+
+class GapEntry(TypedDict, total=False):
+    """Enhanced gap metadata stored in index.json known_gaps."""
+
+    start_ts: int  # Gap start timestamp (ms)
+    end_ts: int  # Gap end timestamp (ms)
+    retry_count: int  # Number of fetch attempts (max 3 before marking persistent)
+    reason: str  # "auto_detected", "exchange_downtime", "no_archive", "fetch_failed", "manual", "no_trades"
+    added_at: int  # Timestamp when gap was first detected (ms)
+
+
+# Maximum fetch attempts before marking gap as persistent
+_GAP_MAX_RETRIES = 3
+
+# Valid gap reasons
+GAP_REASON_AUTO = "auto_detected"
+GAP_REASON_EXCHANGE_DOWNTIME = "exchange_downtime"
+GAP_REASON_NO_ARCHIVE = "no_archive"
+GAP_REASON_FETCH_FAILED = "fetch_failed"
+GAP_REASON_MANUAL = "manual"
+GAP_REASON_NO_TRADES = "no_trades"
+
+
+_FIRST_OHLCV_EXCHANGE_CACHE_ALIASES = {
+    "binance": "binanceusdm",
+}
 
 
 CANDLE_DTYPE = np.dtype(
@@ -89,6 +144,111 @@ EMA_SERIES_DTYPE = np.dtype(
 
 
 # ----- Utilities -----
+
+
+def _linear_interpolate(value0: float, value1: float, ratio: float) -> float:
+    return float(value0 + (value1 - value0) * ratio)
+
+
+def ohlcv_xm_to_1m(candle: np.void, minutes: int) -> np.ndarray:
+    """Expand one higher-timeframe OHLCV candle into deterministic synthetic 1m candles."""
+    if minutes <= 0:
+        raise ValueError(f"minutes must be > 0, got {minutes}")
+
+    ts = int(candle["ts"])
+    o = float(candle["o"])
+    h = float(candle["h"])
+    l = float(candle["l"])
+    c = float(candle["c"])
+    bv = float(candle["bv"])
+
+    if not all(math.isfinite(x) for x in (o, h, l, c, bv)):
+        raise ValueError("all OHLCV values must be finite")
+    if h < l:
+        h, l = l, h
+    o = min(max(o, l), h)
+    c = min(max(c, l), h)
+
+    out = np.zeros(minutes, dtype=CANDLE_DTYPE)
+    out["ts"] = np.arange(ts, ts + minutes * ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
+    out["bv"] = float(bv / minutes)
+
+    last_idx = minutes - 1
+    if last_idx == 0:
+        out[0]["o"] = o
+        out[0]["h"] = h
+        out[0]["l"] = l
+        out[0]["c"] = c
+        return out
+
+    pivot_a = min(last_idx, max(1, minutes // 3))
+    pivot_b = min(last_idx, max(pivot_a + 1, (2 * minutes) // 3))
+
+    if c >= o:
+        waypoints = [(0, o), (pivot_a, l), (pivot_b, h), (last_idx, c)]
+        low_idx = pivot_a
+        high_idx = pivot_b
+    else:
+        waypoints = [(0, o), (pivot_a, h), (pivot_b, l), (last_idx, c)]
+        high_idx = pivot_a
+        low_idx = pivot_b
+
+    deduped = [waypoints[0]]
+    for idx, value in waypoints[1:]:
+        if idx > deduped[-1][0]:
+            deduped.append((idx, value))
+        else:
+            deduped[-1] = (idx, value)
+
+    close_path = np.empty(minutes, dtype=np.float64)
+    close_path[0] = o
+    for (i0, v0), (i1, v1) in zip(deduped, deduped[1:]):
+        span = max(1, i1 - i0)
+        for minute_idx in range(i0, i1 + 1):
+            ratio = 0.0 if i1 == i0 else (minute_idx - i0) / span
+            close_path[minute_idx] = min(max(_linear_interpolate(v0, v1, ratio), l), h)
+
+    prev_close = o
+    for minute_idx in range(minutes):
+        minute_open = prev_close
+        minute_close = float(close_path[minute_idx])
+        minute_high = max(minute_open, minute_close)
+        minute_low = min(minute_open, minute_close)
+        if minute_idx == high_idx:
+            minute_high = max(minute_high, h)
+        if minute_idx == low_idx:
+            minute_low = min(minute_low, l)
+        out[minute_idx]["o"] = minute_open
+        out[minute_idx]["h"] = minute_high
+        out[minute_idx]["l"] = minute_low
+        out[minute_idx]["c"] = minute_close
+        prev_close = minute_close
+
+    return out
+
+
+def ohlcv_5m_to_1m(candle: np.void) -> np.ndarray:
+    return ohlcv_xm_to_1m(candle, 5)
+
+
+def ohlcv_15m_to_1m(candle: np.void) -> np.ndarray:
+    return ohlcv_xm_to_1m(candle, 15)
+
+
+def synthesize_1m_from_higher_tf(candles: np.ndarray, tf_minutes: int) -> np.ndarray:
+    """Expand a higher-timeframe candle array into synthetic 1m OHLCV candles."""
+    arr = _ensure_dtype(candles)
+    if arr.size == 0:
+        return np.empty((0,), dtype=CANDLE_DTYPE)
+    if tf_minutes == 5:
+        expanded = [ohlcv_5m_to_1m(row) for row in arr]
+    elif tf_minutes == 15:
+        expanded = [ohlcv_15m_to_1m(row) for row in arr]
+    else:
+        raise ValueError(f"unsupported tf_minutes={tf_minutes}")
+    if not expanded:
+        return np.empty((0,), dtype=CANDLE_DTYPE)
+    return np.sort(np.concatenate(expanded), order="ts")
 
 
 def get_caller_name(depth: int = 2, logger: Optional[logging.Logger] = None) -> str:
@@ -206,7 +366,131 @@ def _ts_index(a: np.ndarray) -> np.ndarray:
 
 
 def _sanitize_symbol(symbol: str) -> str:
-    return symbol.replace("/", "_")
+    sanitized = symbol.replace("/", "_")
+    # See: https://github.com/enarjord/passivbot/issues/547
+    # If running under "Windows Compatibility" mode,
+    # also replace ':' with '_' to ensure compatibility with Windows file naming restrictions.
+    if windows_compatibility:
+        sanitized = sanitized.replace(":", "_")
+    return sanitized
+
+
+def _quarantine_gateio_cache_if_stale(cache_base: str, cutoff_date: str) -> None:
+    """
+    Move gateio cache to a timestamped backup if any shard predates cutoff_date.
+    """
+    try:
+        cutoff = datetime.strptime(cutoff_date, "%Y-%m-%d").date()
+    except Exception:
+        logging.warning(
+            "Invalid GATEIO_CACHE_CUTOFF_DATE=%r; skipping gateio cache check", cutoff_date
+        )
+        return
+
+    gateio_root = os.path.join(cache_base, "gateio")
+    if not os.path.isdir(gateio_root):
+        return
+
+    tf_root = os.path.join(gateio_root, "1m")
+    if not os.path.isdir(tf_root):
+        return
+
+    for sym in os.listdir(tf_root):
+        sym_dir = os.path.join(tf_root, sym)
+        if not os.path.isdir(sym_dir):
+            continue
+        for fname in os.listdir(sym_dir):
+            if not fname.endswith(".npy"):
+                continue
+            try:
+                day = datetime.strptime(fname[:10], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if day < cutoff:
+                stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                backup = f"{gateio_root}_backup_{stamp}"
+                logging.warning(
+                    "GateIO cache has shards before %s; moving %s -> %s. "
+                    "Delete backup after confirming volumes are correct.",
+                    cutoff_date,
+                    gateio_root,
+                    backup,
+                )
+                try:
+                    os.rename(gateio_root, backup)
+                except Exception as exc:
+                    logging.error("Failed to move gateio cache to backup: %s", exc)
+                return
+
+
+def _looks_like_daily_shard_filename(name: str) -> bool:
+    if not isinstance(name, str) or not name.endswith(".npy"):
+        return False
+    stem = name[:-4]
+    if len(stem) != 10 or stem[4] != "-" or stem[7] != "-":
+        return False
+    try:
+        datetime.strptime(stem, "%Y-%m-%d")
+    except Exception:
+        return False
+    return True
+
+
+def _quarantine_root_level_timeframe_debris(cache_base: str) -> int:
+    """
+    Quarantine invalid files found directly under exchange/timeframe roots.
+
+    Valid OHLCV layout is:
+    `{cache_base}/{exchange}/{timeframe}/{symbol}/YYYY-MM-DD.npy`
+
+    Any daily shard files or index.json files found directly under
+    `{cache_base}/{exchange}/{timeframe}` are debris from older/corrupt layouts and
+    should not remain in place.
+    """
+    root = Path(cache_base)
+    if not root.is_dir():
+        return 0
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    moved = 0
+
+    for exchange_dir in root.iterdir():
+        if not exchange_dir.is_dir() or exchange_dir.name.startswith("."):
+            continue
+        if exchange_dir.name.startswith("_"):
+            continue
+
+        for tf_dir in exchange_dir.iterdir():
+            if not tf_dir.is_dir():
+                continue
+
+            debris: List[Path] = []
+            for child in tf_dir.iterdir():
+                if not child.is_file():
+                    continue
+                if child.name == "index.json" or _looks_like_daily_shard_filename(child.name):
+                    debris.append(child)
+
+            if not debris:
+                continue
+
+            quarantine_dir = (
+                root / "_quarantine_root_level" / stamp / exchange_dir.name / tf_dir.name
+            )
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+            for child in debris:
+                shutil.move(str(child), str(quarantine_dir / child.name))
+                moved += 1
+
+            logging.warning(
+                "Quarantined %d invalid root-level OHLCV cache artifact(s) from %s -> %s",
+                len(debris),
+                tf_dir,
+                quarantine_dir,
+            )
+
+    return moved
 
 
 # Parse timeframe string like '1m','5m','1h','1d' to milliseconds.
@@ -276,8 +560,18 @@ class CandlestickManager:
         max_memory_candles_per_symbol: int = 200_000,
         max_disk_candles_per_symbol_per_tf: int = 2_000_000,
         debug: int | bool = False,
+        # Optional progress logging (INFO, throttled). 0 disables, 30.0 recommended.
+        progress_log_interval_seconds: float = 10.0,
+        # Optional callback invoked for every external (network) fetch attempt.
+        remote_fetch_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         # Optional global concurrency limiter for remote ccxt calls
         max_concurrent_requests: int | None = None,
+        lock_timeout_seconds: float | None = None,
+        # Archive fetching: if False, only use ccxt REST API even if archives are available.
+        # Useful for live bots where archives may timeout; backtester enables by default.
+        archive_enabled: bool = True,
+        # Optional list of symbols to log per-page OHLCV ranges (debugging pagination).
+        page_debug_symbols: Optional[Iterable[str]] = None,
     ) -> None:
         self.exchange = exchange
         # If no explicit exchange_name provided, infer from ccxt instance id
@@ -285,17 +579,46 @@ class CandlestickManager:
             self.exchange_name = str(getattr(exchange, "id"))
         else:
             self.exchange_name = exchange_name
+        # Normalize ccxt IDs to standard cache names (e.g. "binanceusdm" -> "binance")
+        _en = self.exchange_name.lower()
+        for _suffix in ("usdm", "futures"):
+            if _en.endswith(_suffix):
+                self.exchange_name = _en[: -len(_suffix)]
+                break
         self.cache_dir = cache_dir
         self.default_window_candles = int(default_window_candles)
         self.overlap_candles = int(overlap_candles)
         self.max_memory_candles_per_symbol = int(max_memory_candles_per_symbol)
         self.max_disk_candles_per_symbol_per_tf = int(max_disk_candles_per_symbol_per_tf)
+        # Archive fetching: if False, only use ccxt REST API
+        self.archive_enabled = bool(archive_enabled)
         # Debug levels: 0=warnings, 1=network-only, 2=full debug, 3=trace
         try:
             dbg = int(float(debug))
         except Exception:
             dbg = 2 if bool(debug) else 0
         self.debug_level = max(0, min(int(dbg), 3))
+        try:
+            self._progress_log_interval_seconds = max(0.0, float(progress_log_interval_seconds))
+        except Exception:
+            self._progress_log_interval_seconds = 0.0
+        self._progress_last_log: Dict[Tuple[str, str, str], float] = {}
+        self._warning_last_log: Dict[str, float] = {}  # throttle repeated warnings
+        self._warning_throttle_seconds: float = 300.0  # 5 minutes between repeated warnings
+        self._persist_batch_observer: Optional[
+            Callable[[str, str, np.ndarray], None]
+        ] = None
+        # Summary tracking for strict gap warnings (logged once per 15 min instead of per-event)
+        self._strict_gaps_summary: Dict[str, int] = {}  # symbol -> missing count
+        self._strict_gaps_summary_last_log: float = 0.0
+        self._strict_gaps_summary_interval: float = 900.0  # 15 minutes
+        self._remote_fetch_callback = remote_fetch_callback
+        # Cache of legacy shard paths per (exchange, symbol, tf)
+        self._legacy_shard_paths_cache: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+        # Cache for legacy day quality decisions: (symbol, tf, date_key) -> legacy_is_complete
+        self._legacy_day_quality_cache: Dict[Tuple[str, str, str], bool] = {}
+        # Cache of primary shard paths per (symbol, tf) - avoids redundant glob scans
+        self._shard_paths_cache: Dict[Tuple[str, str], Dict[str, str]] = {}
 
         self._cache: Dict[str, np.ndarray] = {}
         self._index: Dict[str, dict] = {}
@@ -311,8 +634,29 @@ class CandlestickManager:
         )
         self._tf_range_cache_cap = 8
         self._step_warning_keys: set[Tuple[str, str, str]] = set()
+        # Deduplication for zero-candle synthesis warnings - only warn once per unique gap
+        # Key: (symbol, first_ts) to identify a gap by its starting point
+        # The end timestamp changes as time passes, but the start identifies the gap origin
+        self._synth_gap_warned: set[Tuple[str, int]] = set()
+        # Batch mode for startup: when enabled, collect warnings and log summary later
+        self._synth_candle_batch_mode: bool = False
+        # symbol -> {"count": int, "min_ts": int, "max_ts": int} during batch
+        self._synth_candle_batch: Dict[str, Dict[str, int]] = {}
+        # Batch mode for candle replacement logs: collect replacements and log summary at INFO
+        self._candle_replace_batch_mode: bool = False
+        self._candle_replace_batch: Dict[str, int] = {}  # symbol -> count replaced during batch
+        # Track which timestamps were synthesized (per symbol) for EMA recomputation detection
+        # When real data arrives for a previously synthetic timestamp, EMAs should be recomputed
+        self._synthetic_timestamps: Dict[str, set[int]] = {}  # symbol -> set of synthetic ts (ms)
         # Timeout parameters for cross-process fetch locks
         self._lock_timeout_seconds = float(_LOCK_TIMEOUT_SECONDS)
+        if lock_timeout_seconds is not None:
+            try:
+                candidate = float(lock_timeout_seconds)
+                if candidate > 0.0 and math.isfinite(candidate):
+                    self._lock_timeout_seconds = candidate
+            except Exception:
+                pass
         self._lock_stale_seconds = float(_LOCK_STALE_SECONDS)
         self._lock_backoff_initial = float(_LOCK_BACKOFF_INITIAL)
         self._lock_backoff_max = float(_LOCK_BACKOFF_MAX)
@@ -321,6 +665,54 @@ class CandlestickManager:
         self._shutdown_guard = threading.Lock()
         self._closed = False
         atexit.register(self._cleanup_on_exit)
+
+        # Standardize cache directory names (e.g., binanceusdm -> binance),
+        # migrate any legacy data from historical_data/ to caches/ohlcv/,
+        # and merge any duplicate symbol directories from inconsistent sanitization
+        ohlcv_cache_base = os.path.join(self.cache_dir, "ohlcv")
+        os.makedirs(ohlcv_cache_base, exist_ok=True)
+        historical_data_path = os.path.join(
+            os.path.dirname(os.path.abspath(self.cache_dir)),
+            "historical_data",
+        )
+        GATEIO_CACHE_CUTOFF_DATE = "2026-02-07"
+        if self.exchange_name == "gateio" and GATEIO_CACHE_CUTOFF_DATE:
+            _quarantine_gateio_cache_if_stale(
+                ohlcv_cache_base,
+                GATEIO_CACHE_CUTOFF_DATE,
+            )
+        migration_lock = os.path.join(ohlcv_cache_base, ".migration.lock")
+        migration_done = os.path.join(ohlcv_cache_base, ".migration_done")
+        try:
+            with portalocker.Lock(migration_lock, timeout=0.1, fail_when_locked=True):
+                try:
+                    _quarantine_root_level_timeframe_debris(ohlcv_cache_base)
+                except Exception as exc:
+                    logging.exception(
+                        "Root-level OHLCV cache cleanup failed (non-fatal). Continuing: %s",
+                        exc,
+                    )
+                if not os.path.exists(migration_done):
+                    try:
+                        standardize_cache_directories(ohlcv_cache_base)
+                        migrate_legacy_data_all_on_init(
+                            cache_base=ohlcv_cache_base,
+                            historical_data_path=historical_data_path,
+                        )
+                        merge_duplicate_symbol_directories(ohlcv_cache_base)
+                        try:
+                            with open(migration_done, "w", encoding="utf-8") as handle:
+                                handle.write(str(int(time.time())))
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        logging.exception(
+                            "Cache migration failed (non-fatal). Continuing without migration: %s",
+                            exc,
+                        )
+        except portalocker.exceptions.LockException:
+            # Another process is handling migrations; skip.
+            pass
 
         self._setup_logging()
         self._cleanup_stale_locks()
@@ -332,15 +724,63 @@ class CandlestickManager:
         except Exception:
             self._net_sem = None
 
+        # Global rate limit coordination: when a rate limit is hit, all concurrent
+        # requests pause until this timestamp (prevents thundering herd retries)
+        self._rate_limit_until: float = 0.0
+        self._rate_limit_lock = asyncio.Lock()
+        self._rate_limit_count: int = 0
+
+        # Persistent HTTP session for archive fetches (created lazily)
+        self._http_session: Optional["aiohttp.ClientSession"] = None
+        self._http_session_lock = asyncio.Lock()
+
         # fetch controls
         # Base timeframe for storage/fetching is always 1m; higher TFs are per-call
         self._ccxt_timeframe = "1m"
         # Determine exchange id and adjust defaults per exchange quirks
         self._ex_id = getattr(self.exchange, "id", self.exchange_name) or self.exchange_name
         self._ccxt_limit_default = 1000
+        self._ccxt_page_overlap_candles = 0
+        self._record_payload_gaps_as_known = False
+        self._ccxt_since_exclusive = False
+        self._ccxt_limit_probe_done = False
+        self._gateio_recent_window_clip_warned: set[str] = set()
         if isinstance(self._ex_id, str) and "bitget" in self._ex_id.lower():
             # Bitget often serves 1m klines with 200 limit per page
             self._ccxt_limit_default = 200
+            # Overlap page boundaries to avoid missing the boundary candle
+            self._ccxt_page_overlap_candles = 1
+            # Bitget since parameter behaves as exclusive for 1m OHLCV
+            self._ccxt_since_exclusive = True
+            # Probe at runtime to see if Bitget now accepts >200 rows per page
+            self._ccxt_limit_probe_done = False
+        if isinstance(self._ex_id, str) and "kucoin" in self._ex_id.lower():
+            # KuCoin futures returns max 200 rows per OHLCV call and can be sparse (trade-only minutes).
+            self._ccxt_limit_default = 200
+            # Overlap page boundaries to validate gaps between fetches.
+            self._ccxt_page_overlap_candles = 1
+            # Gaps inside a single payload are considered verified no-trade gaps.
+            self._record_payload_gaps_as_known = True
+            # KuCoin since behaves as exclusive for 1m OHLCV.
+            self._ccxt_since_exclusive = True
+
+        # Optional per-page range logging for selected symbols (debug pagination)
+        self._page_debug_all = False
+        self._page_debug_symbols: set[str] = set()
+        if page_debug_symbols:
+            try:
+                for sym in page_debug_symbols:
+                    if sym is None:
+                        continue
+                    sym_str = str(sym).strip()
+                    if not sym_str:
+                        continue
+                    if sym_str == "*":
+                        self._page_debug_all = True
+                    else:
+                        self._page_debug_symbols.add(sym_str)
+            except Exception:
+                self._page_debug_symbols = set()
 
     # ----- Logging -----
 
@@ -359,6 +799,104 @@ class CandlestickManager:
         desired_level = level_map.get(self.debug_level, logging.INFO)
         self.log = logging.getLogger("passivbot.candlestick_manager")
         self.log.setLevel(desired_level)
+
+    def start_synth_candle_batch(self) -> None:
+        """Start batching zero-candle synthesis warnings for later aggregated logging."""
+        self._synth_candle_batch_mode = True
+        self._synth_candle_batch.clear()
+
+    def flush_synth_candle_batch(self) -> None:
+        """Log aggregated zero-candle synthesis summary and exit batch mode."""
+        self._synth_candle_batch_mode = False
+        if not self._synth_candle_batch:
+            return
+        total_symbols = len(self._synth_candle_batch)
+        total_candles = sum(v.get("count", 0) for v in self._synth_candle_batch.values())
+        # Use WARNING only for large amounts of synthesized candles (>1000), otherwise INFO
+        # This is expected behavior on illiquid pairs during warmup
+        log_fn = self.log.warning if total_candles > 1000 else self.log.info
+
+        def _fmt_range(min_ts: Optional[int], max_ts: Optional[int]) -> str:
+            try:
+                from datetime import datetime, timezone
+
+                if min_ts is None or max_ts is None:
+                    return "-"
+                start = datetime.fromtimestamp(int(min_ts) / 1000, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M"
+                )
+                end = datetime.fromtimestamp(int(max_ts) / 1000, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M"
+                )
+                return f"{start} to {end}" if start != end else start
+            except Exception:
+                return "-"
+
+        if total_symbols == 1:
+            symbol, meta = next(iter(self._synth_candle_batch.items()))
+            count = int(meta.get("count", 0))
+            rng = _fmt_range(meta.get("min_ts"), meta.get("max_ts"))
+            log_fn(
+                "[candle] synthesized %d zero-candle%s for %s at %s (no data for requested minutes)",
+                count,
+                "s" if count > 1 else "",
+                symbol,
+                rng,
+            )
+        else:
+            # Log top symbols by synthesized count (limit to keep logs concise)
+            top_n = 5
+            sorted_syms = sorted(
+                self._synth_candle_batch.items(),
+                key=lambda kv: int(kv[1].get("count", 0)),
+                reverse=True,
+            )
+            top_parts = []
+            for sym, meta in sorted_syms[:top_n]:
+                count = int(meta.get("count", 0))
+                rng = _fmt_range(meta.get("min_ts"), meta.get("max_ts"))
+                top_parts.append(f"{sym}:{count}@{rng}")
+            extra = total_symbols - min(top_n, total_symbols)
+            top_str = ", ".join(top_parts)
+            if extra > 0:
+                top_str = f"{top_str} (+{extra} more)"
+            log_fn(
+                "[candle] synthesized %d zero-candle%s across %d symbols (no data for requested minutes) top=%s",
+                total_candles,
+                "s" if total_candles > 1 else "",
+                total_symbols,
+                top_str,
+            )
+        self._synth_candle_batch.clear()
+
+    def start_candle_replace_batch(self) -> None:
+        """Start batching candle replacement logs for later aggregated logging."""
+        self._candle_replace_batch_mode = True
+        self._candle_replace_batch.clear()
+
+    def flush_candle_replace_batch(self) -> None:
+        """Log aggregated candle replacement summary at INFO and exit batch mode."""
+        self._candle_replace_batch_mode = False
+        if not self._candle_replace_batch:
+            return
+        total_symbols = len(self._candle_replace_batch)
+        total_candles = sum(self._candle_replace_batch.values())
+        if total_symbols == 1:
+            symbol, count = next(iter(self._candle_replace_batch.items()))
+            self.log.info(
+                "[candle] %s: real data replaced %d synthetic candle%s, EMA cache invalidated",
+                symbol,
+                count,
+                "s" if count > 1 else "",
+            )
+        else:
+            self.log.info(
+                "[candle] real data replaced %d synthetic candle%s across %d symbols, EMA caches invalidated",
+                total_candles,
+                "s" if total_candles > 1 else "",
+                total_symbols,
+            )
+        self._candle_replace_batch.clear()
 
     # ----- Retention helpers -----
 
@@ -384,7 +922,7 @@ class CandlestickManager:
             if age > threshold:
                 try:
                     lock_path.unlink()
-                    self.log.warning("removed stale candle lock %s (age %.1fs)", lock_path, age)
+                    self.log.info("removed stale candle lock %s (age %.1fs)", lock_path, age)
                 except FileNotFoundError:
                     continue
                 except Exception as exc:
@@ -537,7 +1075,7 @@ class CandlestickManager:
             ex = getattr(self, "_ex_id", self.exchange_name)
         except Exception:
             ex = self.exchange_name
-        base = [f"event={event}"]
+        base = [f"[candle] event={event}"]
         # In debug modes, include caller info for traceability
         if self.debug_level >= 1:
             try:
@@ -557,7 +1095,9 @@ class CandlestickManager:
             # Apply debug filtering: level 0 -> drop; level 1 -> only ccxt_* events; level 2 -> all
             if self.debug_level <= 0:
                 return
-            is_network = isinstance(event, str) and event.startswith("ccxt_")
+            is_network = isinstance(event, str) and (
+                event.startswith("ccxt_") or event.startswith("archive_")
+            )
             if self.debug_level == 1 and not is_network:
                 return
             self.log.debug(msg)
@@ -567,6 +1107,94 @@ class CandlestickManager:
             self.log.warning(msg)
         else:
             self.log.error(msg)
+
+    def _progress_log(self, key: Tuple[str, str, str], event: str, **fields) -> None:
+        """Emit throttled DEBUG progress logs when enabled."""
+        if self._progress_log_interval_seconds <= 0.0:
+            return
+        now = time.monotonic()
+        last = self._progress_last_log.get(key, 0.0)
+        if (now - last) < self._progress_log_interval_seconds:
+            return
+        self._progress_last_log[key] = now
+        self._log("debug", event, **fields)
+
+    def _log_persistent_gap_summary(self) -> None:
+        """Log accumulated persistent gap summary if any, throttled to once per 30 min."""
+        if not hasattr(self, "_persistent_gap_summary") or not self._persistent_gap_summary:
+            return
+        now = time.monotonic()
+        last = getattr(self, "_persistent_gap_summary_last_log", 0.0)
+        if (now - last) < 1800.0:  # Only log summary once per 30 minutes
+            return
+        self._persistent_gap_summary_last_log = now
+        summary = self._persistent_gap_summary
+        total = sum(summary.values())
+        symbols = ", ".join(f"{s}:{c}" for s, c in sorted(summary.items())[:5])
+        if len(summary) > 5:
+            symbols += f", +{len(summary) - 5} more"
+        self.log.info(
+            "[candle] persistent gaps: %d across %d symbols (%s). Use --force-refetch-gaps to retry.",
+            total,
+            len(summary),
+            symbols,
+        )
+        self._persistent_gap_summary.clear()
+
+    def _throttled_warning(self, throttle_key: str, event: str, **fields) -> None:
+        """Emit a warning at most once per throttle window (default 5 min).
+
+        Use this for warnings that may repeat frequently but only need to
+        inform the user once. After the throttle window expires, the warning
+        will be emitted again if the condition persists.
+        """
+        now = time.monotonic()
+        last = self._warning_last_log.get(throttle_key, 0.0)
+        if (now - last) < self._warning_throttle_seconds:
+            return
+        self._warning_last_log[throttle_key] = now
+        self._log("warning", event, **fields)
+
+    def _record_strict_gap(self, symbol: str, missing_count: int) -> None:
+        """Accumulate strict gap counts for summary logging."""
+        self._strict_gaps_summary[symbol] = self._strict_gaps_summary.get(symbol, 0) + missing_count
+
+    def _log_strict_gaps_summary(self) -> None:
+        """Log accumulated strict gap summary if any, throttled to once per 15 min."""
+        if not self._strict_gaps_summary:
+            return
+        now = time.monotonic()
+        if (now - self._strict_gaps_summary_last_log) < self._strict_gaps_summary_interval:
+            return
+        self._strict_gaps_summary_last_log = now
+        summary = self._strict_gaps_summary
+        total = sum(summary.values())
+        symbols = ", ".join(f"{s}:{c}" for s, c in sorted(summary.items(), key=lambda x: -x[1])[:5])
+        if len(summary) > 5:
+            symbols += f", +{len(summary) - 5} more"
+        self.log.debug(
+            "[candle] strict mode gaps: %d missing candles across %d symbols (%s)",
+            total,
+            len(summary),
+            symbols,
+        )
+        self._strict_gaps_summary.clear()
+
+    def _emit_remote_fetch(self, payload: Dict[str, Any]) -> None:
+        cb = getattr(self, "_remote_fetch_callback", None)
+        if cb is None:
+            return
+        try:
+            cb(payload)
+        except Exception:
+            # Must never break the fetch path due to logging/progress UI.
+            return
+
+    def set_persist_batch_observer(
+        self,
+        observer: Optional[Callable[[str, str, np.ndarray], None]],
+    ) -> None:
+        self._persist_batch_observer = observer
 
     # ----- Paths and index -----
 
@@ -591,6 +1219,53 @@ class CandlestickManager:
         tf: Optional[str] = None,
     ) -> str:
         return str(Path(self._symbol_dir(symbol, timeframe=timeframe, tf=tf)) / f"{date_key}.npy")
+
+    def _prune_missing_shards_from_index(self, idx: dict) -> int:
+        """Remove shard entries whose files are missing; refresh derived meta fields."""
+        try:
+            shards = idx.get("shards", {})
+            if not isinstance(shards, dict) or not shards:
+                return 0
+            removed = 0
+            for day_key, shard_meta in list(shards.items()):
+                if not isinstance(shard_meta, dict):
+                    continue
+                path = shard_meta.get("path")
+                if not path:
+                    continue
+                if not os.path.exists(str(path)):
+                    shards.pop(day_key, None)
+                    removed += 1
+            if not removed:
+                return 0
+            idx["shards"] = shards
+            meta = idx.setdefault("meta", {})
+            try:
+                last_ts = 0
+                observed_start_ts: Optional[int] = None
+                for shard_meta in shards.values():
+                    if not isinstance(shard_meta, dict):
+                        continue
+                    mt = shard_meta.get("max_ts")
+                    if mt is not None:
+                        last_ts = max(last_ts, int(mt))
+                    mi = shard_meta.get("min_ts")
+                    if mi is not None:
+                        observed_start_ts = (
+                            int(mi)
+                            if observed_start_ts is None
+                            else min(observed_start_ts, int(mi))
+                        )
+                meta["last_final_ts"] = int(last_ts)
+                meta["observed_start_ts"] = observed_start_ts
+                meta["inception_ts"] = observed_start_ts
+            except Exception:
+                meta["last_final_ts"] = 0
+                meta["observed_start_ts"] = None
+                meta["inception_ts"] = None
+            return int(removed)
+        except Exception:
+            return 0
 
     def _ensure_symbol_index(
         self, symbol: str, timeframe: Optional[str] = None, *, tf: Optional[str] = None
@@ -628,11 +1303,50 @@ class CandlestickManager:
                 idx = {"shards": {}, "meta": {}}
             idx.setdefault("shards", {})
             meta = idx.setdefault("meta", {})
+            legacy_history_bounds = (
+                "observed_start_ts" not in meta and "authoritative_start_ts" not in meta
+            )
             meta.setdefault("known_gaps", [])  # list of [start_ts, end_ts]
             meta.setdefault("last_refresh_ms", 0)
             meta.setdefault("last_final_ts", 0)
+            observed_start_ts = meta.get("observed_start_ts", meta.get("inception_ts"))
+            meta["observed_start_ts"] = int(observed_start_ts) if observed_start_ts is not None else None
+            meta["inception_ts"] = meta["observed_start_ts"]  # legacy alias for earliest observed candle
+            meta.setdefault("authoritative_start_ts", None)
+            meta.setdefault("authoritative_start_source", None)
+            meta.setdefault("inception_ts_probe_ms", 0)
+            meta.setdefault("inception_ts_probe_end_ts", 0)
+            migrated_pre_inception = False
+            if legacy_history_bounds and meta.get("authoritative_start_ts") is None:
+                legacy_authoritative_start = self._infer_legacy_authoritative_start_ts(meta)
+                if legacy_authoritative_start is not None:
+                    meta["authoritative_start_ts"] = int(legacy_authoritative_start)
+                    meta["authoritative_start_source"] = "legacy_pre_inception_gap"
+                else:
+                    original_gaps = list(meta.get("known_gaps", []))
+                    retained_gaps = []
+                    for gap in original_gaps:
+                        if isinstance(gap, dict) and str(gap.get("reason", "")) == "pre_inception":
+                            migrated_pre_inception = True
+                            continue
+                        retained_gaps.append(gap)
+                    if migrated_pre_inception:
+                        meta["known_gaps"] = retained_gaps
+
+            # Keep index consistent if shard files were deleted.
+            removed = self._prune_missing_shards_from_index(idx)
+            if removed:
+                self._log(
+                    "warning",
+                    "index_pruned_missing_shards",
+                    symbol=symbol,
+                    timeframe=tf_norm,
+                    removed=removed,
+                )
             self._index[key] = idx
             self._index_mtime[key] = current_mtime
+            if migrated_pre_inception:
+                self._save_index(symbol, tf=tf_norm)
             self._log(
                 "debug",
                 "index_reload",
@@ -647,11 +1361,48 @@ class CandlestickManager:
         # Ensure meta keys even for cached entries (in case earlier versions lacked them)
         idx.setdefault("shards", {})
         meta = idx.setdefault("meta", {})
+        legacy_history_bounds = (
+            "observed_start_ts" not in meta and "authoritative_start_ts" not in meta
+        )
         meta.setdefault("known_gaps", [])
         meta.setdefault("last_refresh_ms", 0)
         meta.setdefault("last_final_ts", 0)
+        observed_start_ts = meta.get("observed_start_ts", meta.get("inception_ts"))
+        migrated_pre_inception = False
+        meta["observed_start_ts"] = int(observed_start_ts) if observed_start_ts is not None else None
+        meta["inception_ts"] = meta["observed_start_ts"]
+        meta.setdefault("authoritative_start_ts", None)
+        meta.setdefault("authoritative_start_source", None)
+        if legacy_history_bounds and meta.get("authoritative_start_ts") is None:
+            legacy_authoritative_start = self._infer_legacy_authoritative_start_ts(meta)
+            if legacy_authoritative_start is not None:
+                meta["authoritative_start_ts"] = int(legacy_authoritative_start)
+                meta["authoritative_start_source"] = "legacy_pre_inception_gap"
+            else:
+                original_gaps = list(meta.get("known_gaps", []))
+                retained_gaps = []
+                for gap in original_gaps:
+                    if isinstance(gap, dict) and str(gap.get("reason", "")) == "pre_inception":
+                        migrated_pre_inception = True
+                        continue
+                    retained_gaps.append(gap)
+                if migrated_pre_inception:
+                    meta["known_gaps"] = retained_gaps
+
+        # Keep cached index consistent if shard files were deleted while running.
+        removed = self._prune_missing_shards_from_index(idx)
+        if removed:
+            self._log(
+                "warning",
+                "index_pruned_missing_shards",
+                symbol=symbol,
+                timeframe=tf_norm,
+                removed=removed,
+            )
         self._index[key] = idx
         self._index_mtime[key] = current_mtime
+        if migrated_pre_inception:
+            self._save_index(symbol, tf=tf_norm)
         if current_mtime is not None:
             self._log("debug", "index_cached", symbol=symbol, timeframe=tf_norm, mtime=current_mtime)
         return idx
@@ -831,16 +1582,36 @@ class CandlestickManager:
     def _iter_shard_paths(
         self, symbol: str, timeframe: Optional[str] = None, *, tf: Optional[str] = None
     ) -> Dict[str, str]:
-        """Return mapping date_key -> path for available shard files on disk."""
+        """Return mapping date_key -> path for available shard files on disk.
+
+        Results are cached per (symbol, tf) to avoid redundant glob scans.
+        Call _invalidate_shard_paths_cache(symbol, tf) after saving new shards.
+        """
+        tf_norm = self._normalize_timeframe_arg(timeframe, tf)
+        cache_key = (symbol, tf_norm)
+        if cache_key in self._shard_paths_cache:
+            return self._shard_paths_cache[cache_key]
+
         sd = Path(self._symbol_dir(symbol, timeframe=timeframe, tf=tf))
         if not sd.exists():
+            # Cache empty result to avoid repeated directory checks
+            self._shard_paths_cache[cache_key] = {}
             return {}
         out: Dict[str, str] = {}
         for p in sd.glob("*.npy"):
             name = p.stem  # YYYY-MM-DD
             if len(name) == 10 and name[4] == "-" and name[7] == "-":
                 out[name] = str(p)
+        self._shard_paths_cache[cache_key] = out
         return out
+
+    def _invalidate_shard_paths_cache(
+        self, symbol: str, timeframe: Optional[str] = None, *, tf: Optional[str] = None
+    ) -> None:
+        """Invalidate the cached shard paths for a symbol/tf after saving new shards."""
+        tf_norm = self._normalize_timeframe_arg(timeframe, tf)
+        cache_key = (symbol, tf_norm)
+        self._shard_paths_cache.pop(cache_key, None)
 
     def _date_range_of_key(self, date_key: str) -> Tuple[int, int]:
         """Return [start_ms, end_ms] inclusive for a date key YYYY-MM-DD in UTC."""
@@ -872,14 +1643,171 @@ class CandlestickManager:
             t = de + ONE_MIN_MS
         return res
 
+    def _legacy_coin_from_symbol(self, symbol: str) -> str:
+        """Return the coin key used by legacy downloader caches."""
+        symbol = str(symbol or "")
+        if not symbol:
+            return ""
+        if "/" in symbol:
+            base = symbol.split("/", 1)[0]
+        elif ":" in symbol:
+            base = symbol.split(":", 1)[0]
+        else:
+            base = symbol
+        base = base.strip()
+        # Some exchanges encode symbols like "HYPE_USDT:USDT".
+        # Legacy downloader caches typically use the base coin only ("HYPE").
+        if "_" in base:
+            left, right = base.rsplit("_", 1)
+            if right in {"USDT", "USDC", "USD", "BUSD"}:
+                base = left
+        return base
+
+    def _legacy_symbol_code_from_symbol(self, symbol: str) -> str:
+        """Return legacy symbol codes used in some historical_data subtrees."""
+        try:
+            return self._archive_symbol_code(symbol)
+        except Exception:
+            return ""
+
+    def _legacy_shard_candidates(self, symbol: str, date_key: str, tf: str) -> List[str]:
+        if tf != "1m":
+            return []
+        ex = str(self.exchange_name or "").lower()
+        coin = self._legacy_coin_from_symbol(symbol)
+        sym_code = self._legacy_symbol_code_from_symbol(symbol)
+        out: List[str] = []
+
+        if coin:
+            out.append(os.path.join("historical_data", f"ohlcvs_{ex}", coin, f"{date_key}.npy"))
+        if ex == "binanceusdm" and sym_code:
+            out.append(os.path.join("historical_data", "ohlcvs_futures", sym_code, f"{date_key}.npy"))
+        if ex == "bybit" and sym_code:
+            out.append(os.path.join("historical_data", "ohlcvs_bybit", sym_code, f"{date_key}.npy"))
+        return out
+
+    def _legacy_shard_dirs(self, symbol: str, tf: str) -> List[str]:
+        if tf != "1m":
+            return []
+        ex = str(self.exchange_name or "").lower()
+        coin = self._legacy_coin_from_symbol(symbol)
+        sym_code = self._legacy_symbol_code_from_symbol(symbol)
+        out: List[str] = []
+        if coin:
+            out.append(os.path.join("historical_data", f"ohlcvs_{ex}", coin))
+        if ex == "binanceusdm" and sym_code:
+            out.append(os.path.join("historical_data", "ohlcvs_futures", sym_code))
+        if ex == "bybit" and sym_code:
+            out.append(os.path.join("historical_data", "ohlcvs_bybit", sym_code))
+        return out
+
+    def _get_legacy_shard_paths(self, symbol: str, tf: str) -> Dict[str, str]:
+        """Return mapping date_key -> legacy shard path for a symbol+tf (cached)."""
+        ex = str(self.exchange_name or "").lower()
+        key = (ex, str(symbol), str(tf))
+        cached = self._legacy_shard_paths_cache.get(key)
+        if cached is not None:
+            return cached
+        mapping: Dict[str, str] = {}
+        scanned_dirs: List[str] = []
+        for d in self._legacy_shard_dirs(symbol, tf):
+            try:
+                dp = Path(d)
+                if not dp.exists():
+                    continue
+                scanned_dirs.append(str(dp))
+                for p in dp.glob("*.npy"):
+                    name = p.stem
+                    if len(name) == 10 and name[4] == "-" and name[7] == "-":
+                        # Prefer earlier directories in the list if duplicates exist.
+                        mapping.setdefault(name, str(p))
+            except Exception:
+                continue
+        self._legacy_shard_paths_cache[key] = mapping
+        if mapping:
+            self._log(
+                "debug",
+                "legacy_index_built",
+                symbol=symbol,
+                timeframe=tf,
+                legacy_days=len(mapping),
+                legacy_dirs=";".join(scanned_dirs[:3]) + (";..." if len(scanned_dirs) > 3 else ""),
+            )
+        return mapping
+
     def _load_shard(self, path: str) -> np.ndarray:
+        if not os.path.exists(path):
+            # Missing file is expected for pre-inception dates - log at debug level
+            self.log.debug(f"Shard not found (expected for pre-inception): {path}")
+            return np.empty((0,), dtype=CANDLE_DTYPE)
         try:
             with open(path, "rb") as f:
                 arr = np.load(f, allow_pickle=False)
+            if isinstance(arr, np.ndarray) and arr.dtype == CANDLE_DTYPE:
+                return arr
+            # Legacy downloader shards are often stored as 2D float arrays:
+            # [timestamp, open, high, low, close, volume]
+            if isinstance(arr, np.ndarray) and arr.ndim == 2 and arr.shape[1] >= 6:
+                raw = np.asarray(arr[:, :6], dtype=np.float64)
+                out = np.empty((raw.shape[0],), dtype=CANDLE_DTYPE)
+                out["ts"] = raw[:, 0].astype(np.int64)
+                out["o"] = raw[:, 1].astype(np.float32)
+                out["h"] = raw[:, 2].astype(np.float32)
+                out["l"] = raw[:, 3].astype(np.float32)
+                out["c"] = raw[:, 4].astype(np.float32)
+                out["bv"] = raw[:, 5].astype(np.float32)
+                return out
             return _ensure_dtype(arr)
         except Exception as e:  # pragma: no cover - best effort
             self.log.warning(f"Failed loading shard {path}: {e}")
             return np.empty((0,), dtype=CANDLE_DTYPE)
+
+    def _legacy_day_is_complete(self, symbol: str, tf: str, date_key: str) -> bool:
+        """Return True if legacy has a continuous shard for this day.
+
+        "Complete" is defined as a full UTC-day of 1m candles:
+        - exactly 1440 minutes
+        - spanning [00:00, 23:59] UTC for the given date_key
+        - strictly 1m-continuous with no duplicates
+
+        This is intentionally strict because this flag gates whether we skip writing a
+        primary shard overlay. If we mistakenly treat a partial legacy shard as complete,
+        we will keep re-downloading the missing minutes every run but never persist them.
+        """
+        cache_key = (str(symbol), str(tf), str(date_key))
+        cached = self._legacy_day_quality_cache.get(cache_key)
+        if cached is not None:
+            return bool(cached)
+        ok = False
+        try:
+            legacy_paths = self._get_legacy_shard_paths(symbol, tf)
+            legacy_path = legacy_paths.get(date_key)
+            if not legacy_path or not os.path.exists(str(legacy_path)):
+                ok = False
+            else:
+                arr = self._load_shard(str(legacy_path))
+                if arr.size == 0:
+                    ok = False
+                else:
+                    day_start, day_end = self._date_range_of_key(str(date_key))
+                    expected_len = int((day_end - day_start) // ONE_MIN_MS) + 1  # 1440
+                    if int(arr.shape[0]) != int(expected_len):
+                        ok = False
+                    else:
+                        ts = np.sort(arr["ts"].astype(np.int64, copy=False))
+                        if int(ts[0]) != int(day_start) or int(ts[-1]) != int(day_end):
+                            ok = False
+                        else:
+                            diffs = np.diff(ts)
+                            ok = bool(
+                                diffs.size
+                                and int(diffs.min()) == ONE_MIN_MS
+                                and int(diffs.max()) == ONE_MIN_MS
+                            )
+        except Exception:
+            ok = False
+        self._legacy_day_quality_cache[cache_key] = bool(ok)
+        return bool(ok)
 
     def _load_from_disk(
         self,
@@ -890,39 +1818,159 @@ class CandlestickManager:
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
     ) -> Optional[np.ndarray]:
-        """Load any shards intersecting [start_ts, end_ts] and merge into cache."""
+        """Load any shards intersecting [start_ts, end_ts] and merge into cache.
+
+        Primary cache: `{cache_dir}/ohlcv/{exchange}/{tf}/{symbol}/YYYY-MM-DD.npy`
+
+        Note: Legacy data from `historical_data/` is automatically migrated to the
+        primary cache on CandlestickManager initialization. The legacy fallback below
+        remains as a safety net for any data that wasn't migrated.
+        """
         try:
             tf_norm = self._normalize_timeframe_arg(timeframe, tf)
-            shards = self._iter_shard_paths(symbol, tf=tf_norm)
-            if not shards:
-                return
-            load_keys = []
-            # Select shards by filename key intersection to range
-            for key, path in shards.items():
-                try:
-                    y, m, d = map(int, key.split("-"))
-                except Exception:
+            shard_paths = self._iter_shard_paths(symbol, tf=tf_norm)
+            legacy_paths = self._get_legacy_shard_paths(symbol, tf_norm)
+            days = self._date_keys_between(start_ts, end_ts)
+            load_keys: List[Tuple[str, str]] = []
+            day_ctx: Dict[str, Dict[str, Any]] = {}
+            legacy_hits = 0
+            primary_hits = 0
+            merged_hits = 0
+            for key, (day_start, day_end) in days.items():
+                if day_end < start_ts or day_start > end_ts:
                     continue
-                # midnight UTC of date
-                tm = time.struct_time((y, m, d, 0, 0, 0, 0, 0, 0))
-                day_start = int(calendar.timegm(tm)) * 1000
-                day_end = day_start + 24 * 60 * 60 * 1000 - ONE_MIN_MS
-                if not (day_end < start_ts or day_start > end_ts):
-                    load_keys.append((key, path))
+                primary_path = shard_paths.get(key)
+                legacy_path = legacy_paths.get(key)
+                if primary_path is None and legacy_path is None:
+                    continue
+
+                chosen_path: Optional[str] = None
+                chosen_source: str = ""
+
+                # For 1m, treat legacy downloader shards as canonical and use primary as an
+                # overlay only when legacy is missing/incomplete.
+                if tf_norm == "1m" and legacy_path is not None:
+                    legacy_complete = False
+                    try:
+                        legacy_complete = self._legacy_day_is_complete(symbol, tf_norm, key)
+                    except Exception:
+                        legacy_complete = False
+
+                    if legacy_complete:
+                        chosen_path = legacy_path
+                        chosen_source = "legacy"
+                        legacy_hits += 1
+                    else:
+                        if primary_path is not None:
+                            # Load both and merge to maximize coverage (reduces slow refetch paths).
+                            chosen_path = legacy_path
+                            chosen_source = "merge"
+                            merged_hits += 1
+                        else:
+                            chosen_path = legacy_path
+                            chosen_source = "legacy"
+                            legacy_hits += 1
+                else:
+                    if primary_path is not None:
+                        chosen_path = primary_path
+                        chosen_source = "primary"
+                        primary_hits += 1
+                    else:
+                        chosen_path = legacy_path
+                        chosen_source = "legacy"
+                        legacy_hits += 1
+
+                if chosen_path is not None:
+                    load_keys.append((key, chosen_path))
+                    day_ctx[key] = {
+                        "day_start": int(day_start),
+                        "day_end": int(day_end),
+                        "source": chosen_source,
+                        "primary_path": primary_path,
+                        "legacy_path": legacy_path,
+                    }
             if not load_keys:
                 return
-            # Load and merge
-            arrays = [self._load_shard(p) for _, p in sorted(load_keys)]
+            self._log(
+                "debug",
+                "disk_load_plan",
+                symbol=symbol,
+                timeframe=tf_norm,
+                days_total=len(days),
+                primary_days=primary_hits,
+                legacy_days=legacy_hits,
+                merged_days=merged_hits,
+            )
+            # Load and merge with coarse progress updates to show activity for large ranges.
+            arrays: List[np.ndarray] = []
+            t0 = time.monotonic()
+            last_progress_log = t0
+            for i, (day_key, path) in enumerate(sorted(load_keys), start=1):
+                ctx = day_ctx.get(day_key, {})
+                src = str(ctx.get("source") or "")
+                if tf_norm == "1m" and src == "merge":
+                    legacy_arr = self._load_shard(path)
+                    primary_arr = np.empty((0,), dtype=CANDLE_DTYPE)
+                    try:
+                        pp = ctx.get("primary_path")
+                        if pp:
+                            primary_arr = self._load_shard(str(pp))
+                    except Exception:
+                        primary_arr = np.empty((0,), dtype=CANDLE_DTYPE)
+                    # Keep legacy canonical: primary should only fill legacy gaps.
+                    a = self._merge_overwrite(primary_arr, legacy_arr)
+                else:
+                    a = self._load_shard(path)
+
+                # NOTE: We intentionally do NOT write legacy data into primary shards.
+                # Primary is only used to fill gaps where legacy is missing/incomplete.
+                arrays.append(a)
+                now = time.monotonic()
+                if now - last_progress_log >= 5.0 or i == len(load_keys):
+                    last_progress_log = now
+                    self._log(
+                        "debug",
+                        "disk_load_progress",
+                        symbol=symbol,
+                        timeframe=tf_norm,
+                        loaded=i,
+                        total=len(load_keys),
+                        current_day=day_key,
+                        elapsed_s=f"{(now - t0):.1f}",
+                    )
             arrays = [a for a in arrays if a.size]
             if not arrays:
                 return
             merged_disk = np.sort(np.concatenate(arrays), order="ts")
+
+            # If legacy data revealed earlier candles than our stored inception_ts,
+            # update inception_ts now so archive prefetch logic doesn't skip.
+            if tf_norm == "1m":
+                try:
+                    self._maybe_update_inception_ts(symbol, merged_disk, save=True)
+                except Exception as exc:
+                    self._log(
+                        "warning",
+                        "maybe_update_inception_ts_failed",
+                        symbol=symbol,
+                        error=str(exc),
+                    )
+            self._log(
+                "debug",
+                "disk_load_done",
+                symbol=symbol,
+                timeframe=tf_norm,
+                rows=int(merged_disk.shape[0]),
+                elapsed_s=f"{(time.monotonic() - t0):.1f}",
+            )
             self._log(
                 "debug",
                 "load_from_disk",
                 symbol=symbol,
                 timeframe=tf_norm,
                 days=len(load_keys),
+                primary_days=primary_hits,
+                legacy_days=legacy_hits,
                 rows=int(merged_disk.shape[0]),
                 start_ts=start_ts,
                 end_ts=end_ts,
@@ -983,15 +2031,21 @@ class CandlestickManager:
         *,
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
+        defer_index: bool = False,
     ) -> None:
-        """Persist candles by merging with existing shards on disk."""
+        """Persist candles by merging with existing shards on disk.
+
+        Args:
+            defer_index: If True, defer index.json write until flush_deferred_index is called.
+        """
         if arr.size == 0:
             return
         arr = np.sort(_ensure_dtype(arr), order="ts")
         tf_norm = self._normalize_timeframe_arg(timeframe, tf)
         shard_paths = self._iter_shard_paths(symbol, tf=tf_norm)
+        shards_saved = []
 
-        def flush_bucket(key: Optional[str], bucket: List[Tuple]) -> None:
+        def flush_bucket(key: Optional[str], bucket: List[Tuple], is_last: bool = False) -> None:
             if key is None or not bucket:
                 return
             chunk = np.array(bucket, dtype=CANDLE_DTYPE)
@@ -1000,21 +2054,37 @@ class CandlestickManager:
             if path and os.path.exists(path):
                 existing = self._load_shard(path)
             merged = self._merge_overwrite(existing, chunk)
-            self._save_shard(symbol, key, merged, tf=tf_norm)
+            # Defer index write for all but the last shard (or all if defer_index=True)
+            should_defer = defer_index or not is_last
+            self._save_shard(symbol, key, merged, tf=tf_norm, defer_index=should_defer)
             shard_paths[key] = self._shard_path(symbol, key, tf=tf_norm)
+            shards_saved.append(key)
 
         current_key: Optional[str] = None
         bucket: List[Tuple] = []
+        keys_to_process = []
+
+        # First pass: collect all keys
         for row in arr:
             key = self._date_key(int(row["ts"]))
             if current_key is None:
                 current_key = key
             if key != current_key:
-                flush_bucket(current_key, bucket)
+                keys_to_process.append((current_key, bucket))
                 bucket = []
                 current_key = key
             bucket.append(tuple(row.tolist()))
-        flush_bucket(current_key, bucket)
+        if current_key is not None:
+            keys_to_process.append((current_key, bucket))
+
+        # Second pass: flush with is_last flag
+        for i, (key, bucket_data) in enumerate(keys_to_process):
+            is_last = i == len(keys_to_process) - 1
+            flush_bucket(key, bucket_data, is_last=is_last)
+
+        # Invalidate shard paths cache so subsequent lookups see newly saved files
+        if shards_saved:
+            self._invalidate_shard_paths_cache(symbol, tf=tf_norm)
 
     def _persist_batch(
         self,
@@ -1025,28 +2095,211 @@ class CandlestickManager:
         tf: Optional[str] = None,
         merge_cache: bool = False,
         last_refresh_ms: Optional[int] = None,
+        defer_index: bool = False,
+        skip_memory_retention: bool = False,
     ) -> None:
-        """Merge `batch` into memory (optional) and persist incrementally to disk."""
+        """Merge `batch` into memory (optional) and persist incrementally to disk.
+
+        Args:
+            defer_index: If True, defer index.json write until flush_deferred_index is called.
+            skip_memory_retention: If True, skip memory retention enforcement to preserve
+                full historical data in cache (useful for backtest data preparation).
+        """
         if batch.size == 0:
             return
         arr = np.sort(_ensure_dtype(batch), order="ts")
         tf_norm = self._normalize_timeframe_arg(timeframe, tf)
 
+        # Update inception_ts if this is new earliest data for 1m (defer save until end)
+        if tf_norm == "1m":
+            self._maybe_update_inception_ts(symbol, arr, save=not defer_index)
+
         if merge_cache or tf_norm == "1m":
             merged_cache = self._merge_overwrite(self._ensure_symbol_cache(symbol), arr)
             self._cache[symbol] = merged_cache
-            try:
-                self._enforce_memory_retention(symbol)
-            except Exception:
-                pass
+            if not skip_memory_retention:
+                try:
+                    self._enforce_memory_retention(symbol)
+                except Exception:
+                    pass
             if last_refresh_ms is not None and merged_cache.size:
                 self._set_last_refresh_meta(
                     symbol,
                     last_refresh_ms=last_refresh_ms,
                     last_final_ts=int(merged_cache[-1]["ts"]),
                 )
+            # Check if real data has replaced any previously synthetic timestamps
+            # If so, mark that EMAs should be recomputed for this symbol
+            self._check_synthetic_replacement(symbol, arr)
 
-        self._save_range_incremental(symbol, arr, timeframe=tf_norm)
+        self._save_range_incremental(symbol, arr, timeframe=tf_norm, defer_index=defer_index)
+        observer = self._persist_batch_observer
+        if observer is not None:
+            try:
+                observer(symbol, tf_norm, arr)
+            except Exception:
+                # Observability hooks must never break persistence or trading.
+                return
+
+    def _check_synthetic_replacement(self, symbol: str, real_data: np.ndarray) -> None:
+        """Check if real data replaces previously synthetic timestamps and invalidate EMA cache if so."""
+        if symbol not in self._synthetic_timestamps or not self._synthetic_timestamps[symbol]:
+            return
+        if real_data.size == 0:
+            return
+
+        real_ts_set = set(real_data["ts"].astype(np.int64).tolist())
+        replaced = self._synthetic_timestamps[symbol] & real_ts_set
+        if replaced:
+            # Real data arrived for previously synthetic timestamps - invalidate EMA cache
+            self._synthetic_timestamps[symbol] -= replaced
+            self._invalidate_ema_cache(symbol)
+            count = len(replaced)
+            if self._candle_replace_batch_mode:
+                # Batch mode: collect for aggregated summary later
+                self._candle_replace_batch[symbol] = self._candle_replace_batch.get(symbol, 0) + count
+            else:
+                # Normal operation: log at DEBUG (individual messages are noisy)
+                self.log.debug(
+                    "[candle] %s: real data replaced %d synthetic candle%s, EMA cache invalidated",
+                    symbol,
+                    count,
+                    "s" if count > 1 else "",
+                )
+
+    def _track_synthetic_timestamps(self, symbol: str, timestamps: List[int]) -> None:
+        """Track runtime synthetic timestamps for replacement detection."""
+        if not symbol or not timestamps:
+            return
+        ts_set = {int(ts) for ts in timestamps if int(ts) > 0}
+        if not ts_set:
+            return
+        if symbol not in self._synthetic_timestamps:
+            self._synthetic_timestamps[symbol] = set()
+        self._synthetic_timestamps[symbol].update(ts_set)
+        # Keep only the most recent week to bound memory usage.
+        cutoff = _utc_now_ms() - 7 * 24 * 60 * ONE_MIN_MS
+        self._synthetic_timestamps[symbol] = {
+            ts for ts in self._synthetic_timestamps[symbol] if ts > cutoff
+        }
+
+    def _materialize_runtime_synthetic_gap(self, symbol: str, through_ts: int) -> int:
+        """Fill finalized-minute gaps in memory only (never persisted to disk).
+
+        Returns number of synthesized candles added to in-memory cache.
+        """
+        through_ts = _floor_minute(int(through_ts))
+        if through_ts <= 0:
+            return 0
+
+        arr = _ensure_dtype(self._cache.get(symbol, np.empty((0,), dtype=CANDLE_DTYPE)))
+        if arr.size == 0:
+            # Try loading a broader historical slice so we can seed from last known close.
+            try:
+                seed_start = max(0, through_ts - 30 * 24 * 60 * ONE_MIN_MS)
+                loaded = self._load_from_disk(symbol, seed_start, through_ts, timeframe="1m")
+                if isinstance(loaded, np.ndarray) and loaded.size:
+                    arr = _ensure_dtype(loaded)
+            except Exception as exc:
+                self._log(
+                    "debug",
+                    "runtime_synthetic_seed_load_failed",
+                    symbol=symbol,
+                    error=str(exc),
+                )
+        if arr.size == 0:
+            return 0
+
+        arr = np.sort(arr, order="ts")
+        ts_arr = arr["ts"].astype(np.int64, copy=False)
+        idx = int(np.searchsorted(ts_arr, through_ts, side="right")) - 1
+        if idx < 0:
+            return 0
+
+        last_ts = int(ts_arr[idx])
+        if last_ts >= through_ts:
+            return 0
+
+        # Cap synthesis burst to avoid building enormous in-memory runs if a symbol has
+        # been inactive for a very long time.
+        max_synth = max(1, min(self.max_memory_candles_per_symbol, 24 * 60))
+        first_synth_ts = max(last_ts + ONE_MIN_MS, through_ts - (max_synth - 1) * ONE_MIN_MS)
+        if first_synth_ts > through_ts:
+            return 0
+
+        prev_close = float(arr[idx]["c"])
+        if not math.isfinite(prev_close):
+            return 0
+
+        synth_ts = np.arange(first_synth_ts, through_ts + ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
+        if synth_ts.size == 0:
+            return 0
+
+        synth = np.empty((synth_ts.shape[0],), dtype=CANDLE_DTYPE)
+        synth["ts"] = synth_ts
+        synth["o"] = prev_close
+        synth["h"] = prev_close
+        synth["l"] = prev_close
+        synth["c"] = prev_close
+        synth["bv"] = 0.0
+
+        merged = self._merge_overwrite(arr, synth)
+        self._cache[symbol] = merged
+        try:
+            self._enforce_memory_retention(symbol)
+        except Exception as exc:
+            self._log(
+                "debug",
+                "runtime_synthetic_retention_enforcement_failed",
+                symbol=symbol,
+                error=str(exc),
+            )
+        self._track_synthetic_timestamps(symbol, synth_ts.tolist())
+
+        self._log(
+            "debug",
+            "runtime_synthetic_gap_materialized",
+            symbol=symbol,
+            synthesized=int(synth_ts.shape[0]),
+            first_ts=int(synth_ts[0]),
+            last_ts=int(synth_ts[-1]),
+            seed_last_real_ts=last_ts,
+        )
+        return int(synth_ts.shape[0])
+
+    def _invalidate_ema_cache(self, symbol: str) -> None:
+        """Invalidate all cached EMA values for a symbol, forcing recomputation."""
+        if symbol in self._ema_cache:
+            del self._ema_cache[symbol]
+
+    def needs_ema_recompute(self, symbol: str) -> bool:
+        """Check if EMAs for a symbol should be recomputed due to synthetic data replacement.
+
+        The bot can call this method to check if real data has replaced synthetic data
+        since the last EMA computation, indicating EMAs should be recomputed.
+
+        Returns True if:
+        - EMA cache was invalidated due to synthetic replacement
+        - Symbol has no cached EMAs (will be computed fresh anyway)
+
+        Returns False if:
+        - Symbol has valid cached EMAs computed from real data
+        """
+        # If there's no EMA cache for this symbol, it will be computed fresh
+        if symbol not in self._ema_cache or not self._ema_cache[symbol]:
+            return True
+        # If the cache exists, it's valid (invalidation clears it)
+        return False
+
+    def clear_synthetic_tracking(self, symbol: Optional[str] = None) -> None:
+        """Clear synthetic timestamp tracking for a symbol or all symbols.
+
+        Useful after warmup completes or when the bot knows all real data has been fetched.
+        """
+        if symbol is None:
+            self._synthetic_timestamps.clear()
+        elif symbol in self._synthetic_timestamps:
+            del self._synthetic_timestamps[symbol]
 
     def _merge_overwrite(self, existing: np.ndarray, new: np.ndarray) -> np.ndarray:
         """Merge two candle arrays by ts, preferring values from `new` on conflict."""
@@ -1058,56 +2311,339 @@ class CandlestickManager:
         b = _ensure_dtype(new)
         # Put existing first, then new; then keep last seen per ts to prefer new
         combo = np.concatenate([a, b])
-        combo = np.sort(combo, order="ts")
-        ts = combo["ts"].astype(np.int64)
-        # deduplicate keeping last occurrence
-        keep = np.ones(len(combo), dtype=bool)
-        # scan from end, mark first-seen; then reverse mask
-        seen = {}
-        for i in range(len(combo) - 1, -1, -1):
-            t = int(ts[i])
-            if t in seen:
-                keep[i] = False
-            else:
-                seen[t] = True
+        # Stable sort ensures that for equal timestamps, rows from `new` remain after `existing`.
+        combo = np.sort(combo, order="ts", kind="stable")
+        ts = combo["ts"].astype(np.int64, copy=False)
+        if combo.size <= 1:
+            return combo
+        # Deduplicate keeping the last occurrence per timestamp (vectorized).
+        keep = np.empty(combo.size, dtype=bool)
+        keep[:-1] = ts[:-1] != ts[1:]
+        keep[-1] = True
         merged = combo[keep]
         # Enforce in-memory retention: keep only the latest N candles per symbol (applied by caller after assign)
         return merged
 
     # ----- Known gap helpers -----
 
-    def _get_known_gaps(self, symbol: str) -> List[Tuple[int, int]]:
+    def _get_known_gaps_enhanced(self, symbol: str) -> List[GapEntry]:
+        """Return known gaps as enhanced GapEntry objects with full metadata."""
         idx = self._ensure_symbol_index(symbol)
         gaps = idx.get("meta", {}).get("known_gaps", [])
-        out: List[Tuple[int, int]] = []
+        out: List[GapEntry] = []
+        now_ms = int(time.time() * 1000)
         for it in gaps:
             try:
-                a, b = int(it[0]), int(it[1])
-                if a <= b:
-                    out.append((a, b))
+                # Support both old format [[start, end], ...] and new format [GapEntry, ...]
+                if isinstance(it, dict):
+                    # New enhanced format
+                    entry: GapEntry = {
+                        "start_ts": int(it.get("start_ts", 0)),
+                        "end_ts": int(it.get("end_ts", 0)),
+                        "retry_count": int(it.get("retry_count", 0)),
+                        "reason": str(it.get("reason", GAP_REASON_AUTO)),
+                        "added_at": int(it.get("added_at", now_ms)),
+                    }
+                    if entry["start_ts"] <= entry["end_ts"]:
+                        out.append(entry)
+                elif isinstance(it, (list, tuple)) and len(it) >= 2:
+                    # Legacy format: auto-upgrade to enhanced
+                    a, b = int(it[0]), int(it[1])
+                    if a <= b:
+                        out.append(
+                            {
+                                "start_ts": a,
+                                "end_ts": b,
+                                "retry_count": _GAP_MAX_RETRIES,  # Assume old gaps are persistent
+                                "reason": GAP_REASON_AUTO,
+                                "added_at": now_ms,
+                            }
+                        )
             except Exception:
                 continue
         return out
 
-    def _save_known_gaps(self, symbol: str, gaps: List[Tuple[int, int]]) -> None:
-        # merge overlaps
-        gaps = sorted(gaps)
-        merged: List[Tuple[int, int]] = []
-        for s, e in gaps:
-            if not merged or s > merged[-1][1] + ONE_MIN_MS:
-                merged.append((s, e))
+    def _get_known_gaps(self, symbol: str) -> List[Tuple[int, int]]:
+        """Return known gaps as simple (start_ts, end_ts) tuples for backward compatibility."""
+        enhanced = self._get_known_gaps_enhanced(symbol)
+        return [(g["start_ts"], g["end_ts"]) for g in enhanced]
+
+    def _save_known_gaps_enhanced(self, symbol: str, gaps: List[GapEntry]) -> None:
+        """Save gaps in enhanced format, merging overlapping ranges."""
+        # Sort by start_ts
+        gaps = sorted(gaps, key=lambda g: g["start_ts"])
+        merged: List[GapEntry] = []
+        for gap in gaps:
+            if not merged or gap["start_ts"] > merged[-1]["end_ts"] + ONE_MIN_MS:
+                merged.append(gap)
             else:
-                ps, pe = merged[-1]
-                merged[-1] = (ps, max(pe, e))
+                # Merge overlapping gaps, keeping max retry count and earliest added_at
+                prev = merged[-1]
+                merged[-1] = {
+                    "start_ts": prev["start_ts"],
+                    "end_ts": max(prev["end_ts"], gap["end_ts"]),
+                    "retry_count": max(prev.get("retry_count", 0), gap.get("retry_count", 0)),
+                    "reason": prev.get("reason", GAP_REASON_AUTO),  # Keep original reason
+                    "added_at": min(prev.get("added_at", 0), gap.get("added_at", 0)),
+                }
         idx = self._ensure_symbol_index(symbol)
-        idx["meta"]["known_gaps"] = [[int(s), int(e)] for s, e in merged]
+        idx["meta"]["known_gaps"] = [
+            {
+                "start_ts": int(g["start_ts"]),
+                "end_ts": int(g["end_ts"]),
+                "retry_count": int(g.get("retry_count", 0)),
+                "reason": str(g.get("reason", GAP_REASON_AUTO)),
+                "added_at": int(g.get("added_at", 0)),
+            }
+            for g in merged
+        ]
         self._index[symbol] = idx
         self._save_index(symbol)
 
-    def _add_known_gap(self, symbol: str, start_ts: int, end_ts: int) -> None:
-        gaps = self._get_known_gaps(symbol)
-        gaps.append((int(start_ts), int(end_ts)))
-        self._save_known_gaps(symbol, gaps)
+    def _save_known_gaps(self, symbol: str, gaps: List[Tuple[int, int]]) -> None:
+        """Save gaps from simple tuples (backward compatibility wrapper)."""
+        now_ms = int(time.time() * 1000)
+        enhanced = [
+            {
+                "start_ts": int(s),
+                "end_ts": int(e),
+                "retry_count": _GAP_MAX_RETRIES,  # Assume caller-provided gaps are persistent
+                "reason": GAP_REASON_AUTO,
+                "added_at": now_ms,
+            }
+            for s, e in gaps
+        ]
+        self._save_known_gaps_enhanced(symbol, enhanced)
+
+    def _add_known_gap(
+        self,
+        symbol: str,
+        start_ts: int,
+        end_ts: int,
+        *,
+        reason: str = GAP_REASON_AUTO,
+        increment_retry: bool = True,
+        retry_count: Optional[int] = None,
+    ) -> None:
+        """Add or update a known gap with enhanced metadata.
+
+        If a gap overlapping with [start_ts, end_ts] already exists:
+        - Extends the gap to cover the full range
+        - Increments retry_count if increment_retry is True (unless retry_count is specified)
+        - Updates reason if provided
+
+        If retry_count reaches _GAP_MAX_RETRIES, the gap is considered persistent
+        and will not be re-fetched unless force_refetch_gaps is used.
+
+        Args:
+            retry_count: If specified, set retry_count directly instead of incrementing.
+                         Useful for pre-inception gaps that should be immediately persistent.
+        """
+        now_ms = int(time.time() * 1000)
+        gaps = self._get_known_gaps_enhanced(symbol)
+
+        # Check if we have an overlapping gap to update
+        updated = False
+        previous_retry_count = 0
+        for gap in gaps:
+            if gap["start_ts"] <= end_ts + ONE_MIN_MS and gap["end_ts"] >= start_ts - ONE_MIN_MS:
+                # Overlapping - extend and optionally increment retry
+                gap["start_ts"] = min(gap["start_ts"], int(start_ts))
+                gap["end_ts"] = max(gap["end_ts"], int(end_ts))
+                previous_retry_count = gap.get("retry_count", 0)
+                if retry_count is not None:
+                    gap["retry_count"] = retry_count
+                elif increment_retry:
+                    # Cap retry_count at _GAP_MAX_RETRIES to prevent unbounded growth
+                    # and avoid redundant disk writes for persistent gaps
+                    new_retry_count = previous_retry_count + 1
+                    gap["retry_count"] = min(new_retry_count, _GAP_MAX_RETRIES)
+                if reason != GAP_REASON_AUTO:
+                    gap["reason"] = reason
+                updated = True
+                break
+
+        if not updated:
+            initial_retry = retry_count if retry_count is not None else (1 if increment_retry else 0)
+            new_gap: GapEntry = {
+                "start_ts": int(start_ts),
+                "end_ts": int(end_ts),
+                "retry_count": initial_retry,
+                "reason": reason,
+                "added_at": now_ms,
+            }
+            gaps.append(new_gap)
+            self._log(
+                "debug",
+                "gap_added",
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                reason=reason,
+                retry_count=new_gap["retry_count"],
+            )
+        else:
+            # Log warning only when gap transitions from retryable to persistent
+            # (retry_count goes from <max to >=max). Use throttling to prevent spam
+            # in edge cases where the same gap is processed multiple times.
+            updated_gap = next(
+                (
+                    g
+                    for g in gaps
+                    if g["start_ts"] <= end_ts + ONE_MIN_MS and g["end_ts"] >= start_ts - ONE_MIN_MS
+                ),
+                None,
+            )
+            if updated_gap:
+                current_retry_count = updated_gap.get("retry_count", 0)
+                gap_reason = updated_gap.get("reason", GAP_REASON_AUTO)
+                # Only warn on transition to persistent status (skip pre_inception - expected behavior)
+                if (
+                    current_retry_count >= _GAP_MAX_RETRIES
+                    and previous_retry_count < _GAP_MAX_RETRIES
+                    and gap_reason != "pre_inception"
+                ):
+                    gap_minutes = (updated_gap["end_ts"] - updated_gap["start_ts"]) // ONE_MIN_MS + 1
+                    # Track persistent gaps for summary logging
+                    if not hasattr(self, "_persistent_gap_summary"):
+                        self._persistent_gap_summary: Dict[str, int] = {}
+                    self._persistent_gap_summary[symbol] = (
+                        self._persistent_gap_summary.get(symbol, 0) + 1
+                    )
+
+        self._save_known_gaps_enhanced(symbol, gaps)
+
+    def _record_verified_gap(
+        self,
+        symbol: str,
+        start_ts: int,
+        end_ts: int,
+        *,
+        reason: str = GAP_REASON_NO_TRADES,
+    ) -> None:
+        """Record a gap as verified (no data on exchange), so we don't retry it."""
+        if start_ts > end_ts:
+            return
+        self._add_known_gap(
+            symbol,
+            int(start_ts),
+            int(end_ts),
+            reason=reason,
+            increment_retry=False,
+            retry_count=_GAP_MAX_RETRIES,
+        )
+
+    def _should_retry_gap(self, gap: GapEntry) -> bool:
+        """Check if a gap should be retried (retry_count < max)."""
+        return gap.get("retry_count", 0) < _GAP_MAX_RETRIES
+
+    def clear_known_gaps(
+        self,
+        symbol: str,
+        *,
+        date_range: Optional[Tuple[int, int]] = None,
+    ) -> int:
+        """Clear known gaps for a symbol, optionally filtered by date range.
+
+        Args:
+            symbol: The symbol to clear gaps for
+            date_range: Optional (start_ts, end_ts) to only clear gaps within this range
+
+        Returns:
+            Number of gaps cleared
+        """
+        gaps = self._get_known_gaps_enhanced(symbol)
+        if not gaps:
+            return 0
+
+        if date_range is None:
+            # Clear all gaps
+            cleared = len(gaps)
+            idx = self._ensure_symbol_index(symbol)
+            idx["meta"]["known_gaps"] = []
+            self._index[symbol] = idx
+            self._save_index(symbol)
+            self._log(
+                "info",
+                "gaps_cleared",
+                symbol=symbol,
+                cleared_count=cleared,
+            )
+            return cleared
+
+        # Clear only gaps overlapping with date_range
+        range_start, range_end = date_range
+        remaining = []
+        cleared = 0
+        for gap in gaps:
+            if gap["end_ts"] < range_start or gap["start_ts"] > range_end:
+                # Outside range - keep
+                remaining.append(gap)
+            else:
+                cleared += 1
+
+        if cleared > 0:
+            self._save_known_gaps_enhanced(symbol, remaining)
+            self._log(
+                "info",
+                "gaps_cleared",
+                symbol=symbol,
+                cleared_count=cleared,
+                date_range_start=range_start,
+                date_range_end=range_end,
+            )
+        return cleared
+
+    def get_gap_summary(self, symbol: str) -> Dict[str, Any]:
+        """Get summary of known gaps for a symbol.
+
+        Returns:
+            Dict with keys:
+            - total_gaps: Number of gap entries
+            - total_minutes: Total minutes of gaps
+            - persistent_gaps: Gaps with retry_count >= max
+            - retryable_gaps: Gaps with retry_count < max
+            - by_reason: Dict of reason -> count
+            - gaps: List of gap details
+        """
+        gaps = self._get_known_gaps_enhanced(symbol)
+        if not gaps:
+            return {
+                "total_gaps": 0,
+                "total_minutes": 0,
+                "persistent_gaps": 0,
+                "retryable_gaps": 0,
+                "by_reason": {},
+                "gaps": [],
+            }
+
+        total_minutes = sum((g["end_ts"] - g["start_ts"]) // ONE_MIN_MS + 1 for g in gaps)
+        persistent = sum(1 for g in gaps if g.get("retry_count", 0) >= _GAP_MAX_RETRIES)
+        retryable = len(gaps) - persistent
+
+        by_reason: Dict[str, int] = {}
+        for g in gaps:
+            reason = g.get("reason", GAP_REASON_AUTO)
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+
+        return {
+            "total_gaps": len(gaps),
+            "total_minutes": total_minutes,
+            "persistent_gaps": persistent,
+            "retryable_gaps": retryable,
+            "by_reason": by_reason,
+            "gaps": [
+                {
+                    "start_ts": g["start_ts"],
+                    "end_ts": g["end_ts"],
+                    "minutes": (g["end_ts"] - g["start_ts"]) // ONE_MIN_MS + 1,
+                    "retry_count": g.get("retry_count", 0),
+                    "reason": g.get("reason", GAP_REASON_AUTO),
+                    "persistent": g.get("retry_count", 0) >= _GAP_MAX_RETRIES,
+                }
+                for g in gaps
+            ],
+        }
 
     def _missing_spans(self, arr: np.ndarray, start_ts: int, end_ts: int) -> List[Tuple[int, int]]:
         """Return list of inclusive [gap_start, gap_end] minute-aligned spans missing in arr."""
@@ -1132,12 +2668,244 @@ class CandlestickManager:
             spans.append((int(ts[-1] + ONE_MIN_MS), end_ts))
         return spans
 
+    @staticmethod
+    def _missing_spans_step(
+        arr: np.ndarray, start_ts: int, end_ts: int, step_ms: int
+    ) -> List[Tuple[int, int]]:
+        """Return list of inclusive [gap_start, gap_end] spans missing in arr at step_ms."""
+        spans: List[Tuple[int, int]] = []
+        if start_ts > end_ts or step_ms <= 0:
+            return spans
+        if arr.size == 0:
+            return [(start_ts, end_ts)]
+        ts = np.asarray(arr["ts"], dtype=np.int64)
+        ts = ts[(ts >= start_ts) & (ts <= end_ts)]
+        if ts.size == 0:
+            return [(start_ts, end_ts)]
+        ts = np.sort(ts)
+        # head gap
+        if ts[0] > start_ts:
+            spans.append((int(start_ts), int(ts[0] - step_ms)))
+        # middle gaps
+        for i in range(len(ts) - 1):
+            if ts[i + 1] - ts[i] > step_ms:
+                spans.append((int(ts[i] + step_ms), int(ts[i + 1] - step_ms)))
+        # tail gap
+        if ts[-1] < end_ts:
+            spans.append((int(ts[-1] + step_ms), int(end_ts)))
+        return spans
+
+    def check_disk_coverage(
+        self,
+        symbol: str,
+        start_ts: int,
+        end_ts: int,
+        *,
+        timeframe: Optional[str] = None,
+        tf: Optional[str] = None,
+        log_level: str = "info",
+        max_span_log: int = 3,
+    ) -> Dict[str, Any]:
+        """Check whether disk cache fully covers [start_ts, end_ts] for a symbol.
+
+        Returns a dict with:
+            ok, missing_spans, missing_candles, loaded_rows, timeframe.
+        """
+        tf_norm = self._normalize_timeframe_arg(timeframe, tf)
+        step_ms = _tf_to_ms(tf_norm)
+        if step_ms <= 0:
+            step_ms = ONE_MIN_MS
+        s_ts = (int(start_ts) // step_ms) * step_ms
+        e_ts = (int(end_ts) // step_ms) * step_ms
+        if s_ts > e_ts:
+            return {
+                "ok": True,
+                "missing_spans": [],
+                "missing_candles": 0,
+                "loaded_rows": 0,
+                "timeframe": tf_norm,
+            }
+
+        arr = self._load_from_disk(symbol, s_ts, e_ts, timeframe=tf_norm)
+        if arr is None or arr.size == 0:
+            missing = [(s_ts, e_ts)]
+            loaded_rows = 0
+        else:
+            sub = self._slice_ts_range(arr, s_ts, e_ts)
+            missing = (
+                self._missing_spans(sub, s_ts, e_ts)
+                if step_ms == ONE_MIN_MS
+                else self._missing_spans_step(sub, s_ts, e_ts, step_ms)
+            )
+            loaded_rows = int(sub.shape[0]) if sub is not None else 0
+
+        missing_candles = 0
+        if missing:
+            missing_candles = int(sum((e - s) // step_ms + 1 for s, e in missing))
+            top_parts = []
+            for s, e in missing[: max(1, int(max_span_log))]:
+                top_parts.append(f"{self._fmt_ts(int(s))} to {self._fmt_ts(int(e))}")
+            top_str = ", ".join(top_parts)
+            if len(missing) > max_span_log:
+                top_str = f"{top_str} (+{len(missing) - max_span_log} more)"
+            self._log(
+                log_level,
+                "disk_coverage_missing",
+                symbol=symbol,
+                timeframe=tf_norm,
+                start_ts=s_ts,
+                end_ts=e_ts,
+                missing_spans=len(missing),
+                missing_candles=missing_candles,
+                top=top_str,
+            )
+        return {
+            "ok": len(missing) == 0,
+            "missing_spans": missing,
+            "missing_candles": missing_candles,
+            "loaded_rows": loaded_rows,
+            "timeframe": tf_norm,
+        }
+
+    def rebuild_index_for_range(
+        self,
+        symbol: str,
+        start_ts: int,
+        end_ts: int,
+        *,
+        timeframe: Optional[str] = None,
+        tf: Optional[str] = None,
+        log_level: str = "info",
+    ) -> Dict[str, Any]:
+        """Rebuild index.json metadata for shards intersecting [start_ts, end_ts]."""
+        tf_norm = self._normalize_timeframe_arg(timeframe, tf)
+        step_ms = _tf_to_ms(tf_norm)
+        if step_ms <= 0:
+            step_ms = ONE_MIN_MS
+        s_ts = (int(start_ts) // step_ms) * step_ms
+        e_ts = (int(end_ts) // step_ms) * step_ms
+        if s_ts > e_ts:
+            return {
+                "updated": 0,
+                "removed": 0,
+                "scanned": 0,
+                "timeframe": tf_norm,
+                "start_ts": s_ts,
+                "end_ts": e_ts,
+            }
+
+        # Ensure shard path cache is fresh for this symbol/tf.
+        self._invalidate_shard_paths_cache(symbol, tf=tf_norm)
+        shard_paths = self._iter_shard_paths(symbol, tf=tf_norm)
+
+        idx = self._ensure_symbol_index(symbol, tf=tf_norm)
+        shards = idx.setdefault("shards", {})
+
+        updated = 0
+        removed = 0
+        scanned = 0
+
+        for day_key, (day_start, day_end) in self._date_keys_between(s_ts, e_ts).items():
+            if day_end < s_ts or day_start > e_ts:
+                continue
+            path = shard_paths.get(day_key)
+            if path is None or not os.path.exists(path):
+                if day_key in shards:
+                    shards.pop(day_key, None)
+                    removed += 1
+                continue
+            try:
+                arr = _ensure_dtype(self._load_shard(path))
+            except Exception:
+                arr = np.empty((0,), dtype=CANDLE_DTYPE)
+            if arr.size == 0:
+                if day_key in shards:
+                    shards.pop(day_key, None)
+                    removed += 1
+                continue
+            arr = np.sort(arr, order="ts")
+            crc = int(zlib.crc32(arr.tobytes()) & 0xFFFFFFFF)
+            shards[day_key] = {
+                "path": path,
+                "min_ts": int(arr[0]["ts"]),
+                "max_ts": int(arr[-1]["ts"]),
+                "count": int(arr.shape[0]),
+                "crc32": crc,
+            }
+            updated += 1
+            scanned += 1
+
+        idx["shards"] = shards
+        pruned = 0
+        try:
+            pruned = int(self._prune_missing_shards_from_index(idx) or 0)
+        except Exception:
+            pruned = 0
+        if pruned:
+            removed += pruned
+
+        # Guard against corrupted refresh timestamps that prevent updates.
+        meta = idx.setdefault("meta", {})
+        now = _utc_now_ms()
+        try:
+            last_refresh = int(meta.get("last_refresh_ms", 0) or 0)
+        except Exception:
+            last_refresh = 0
+        meta_changed = False
+        if last_refresh > (now + ONE_MIN_MS):
+            meta["last_refresh_ms"] = 0
+            meta_changed = True
+            self._log(
+                "warning",
+                "index_last_refresh_in_future",
+                symbol=symbol,
+                timeframe=tf_norm,
+                last_refresh_ms=last_refresh,
+                now=now,
+            )
+
+        if updated or removed or meta_changed:
+            self._save_index(symbol, tf=tf_norm)
+
+        self._log(
+            log_level,
+            "index_rebuild_range",
+            symbol=symbol,
+            timeframe=tf_norm,
+            start_ts=s_ts,
+            end_ts=e_ts,
+            scanned=scanned,
+            updated=updated,
+            removed=removed,
+        )
+
+        return {
+            "updated": updated,
+            "removed": removed,
+            "scanned": scanned,
+            "timeframe": tf_norm,
+            "start_ts": s_ts,
+            "end_ts": e_ts,
+        }
+
     # ----- Refresh metadata helpers -----
 
     def _get_last_refresh_ms(self, symbol: str) -> int:
         idx = self._ensure_symbol_index(symbol)
         try:
             return int(idx.get("meta", {}).get("last_refresh_ms", 0))
+        except Exception:
+            return 0
+
+    def get_last_refresh_ms(self, symbol: str) -> int:
+        """Public helper to read last refresh timestamp (ms) from index metadata."""
+        return self._get_last_refresh_ms(symbol)
+
+    def get_last_final_ts(self, symbol: str) -> int:
+        """Return last finalized candle timestamp (ms) seen for this symbol, or 0 if unknown."""
+        idx = self._ensure_symbol_index(symbol)
+        try:
+            return int(idx.get("meta", {}).get("last_final_ts", 0))
         except Exception:
             return 0
 
@@ -1152,7 +2920,305 @@ class CandlestickManager:
         self._index[symbol] = idx
         self._save_index(symbol)
 
+    # ----- Coverage / history-bound tracking -----
+
+    def _infer_legacy_authoritative_start_ts(self, meta: Dict[str, Any]) -> Optional[int]:
+        """Infer authoritative lower bound from legacy inception/pre_inception metadata.
+
+        Old caches used `inception_ts` both as earliest observed candle and as an implicit
+        lower bound when paired with persistent `pre_inception` gaps immediately preceding it.
+        Preserve that learned boundary during migration instead of dropping it.
+        """
+        try:
+            observed_start = meta.get("observed_start_ts", meta.get("inception_ts"))
+            if observed_start is None:
+                return None
+            observed_start = int(observed_start)
+            cutoff_end = observed_start - ONE_MIN_MS
+            for gap in meta.get("known_gaps", []):
+                if not isinstance(gap, dict):
+                    continue
+                if str(gap.get("reason", "")) != "pre_inception":
+                    continue
+                try:
+                    gap_end = int(gap.get("end_ts"))
+                    gap_start = int(gap.get("start_ts"))
+                    retry_count = int(gap.get("retry_count", 0))
+                except Exception:
+                    continue
+                if retry_count < _GAP_MAX_RETRIES:
+                    continue
+                if gap_start < observed_start and gap_end >= cutoff_end:
+                    return observed_start
+        except Exception:
+            return None
+        return None
+
+    def _get_inception_ts(self, symbol: str) -> Optional[int]:
+        """Return earliest observed candle timestamp for this symbol, or None.
+
+        Historically this field was also used as an authoritative exchange-history lower bound.
+        It now tracks only local observed coverage, while authoritative clipping uses
+        ``authoritative_start_ts``.
+        """
+        idx = self._ensure_symbol_index(symbol)
+        try:
+            meta = idx.get("meta", {})
+            val = meta.get("observed_start_ts", meta.get("inception_ts"))
+            return int(val) if val is not None else None
+        except Exception:
+            return None
+
+    def _set_inception_ts(self, symbol: str, ts: int, *, save: bool = True) -> None:
+        """Set earliest observed candle timestamp for this symbol."""
+        idx = self._ensure_symbol_index(symbol)
+        meta = idx.setdefault("meta", {})
+        current = meta.get("observed_start_ts", meta.get("inception_ts"))
+        # Only update if unset or if new ts is earlier
+        if current is None or int(ts) < int(current):
+            observed_ts = int(ts)
+            meta["observed_start_ts"] = observed_ts
+            meta["inception_ts"] = observed_ts  # legacy alias
+            auth_current = meta.get("authoritative_start_ts")
+            auth_updated = False
+            if auth_current is not None and observed_ts < int(auth_current):
+                meta["authoritative_start_ts"] = observed_ts
+                meta["authoritative_start_source"] = "observed_data"
+                auth_updated = True
+            self._index[f"{symbol}::1m"] = idx
+            if save:
+                self._save_index(symbol)
+            if auth_updated:
+                # If we previously marked ranges as pre-inception but later observed earlier
+                # real data, that authoritative lower bound became stale.
+                try:
+                    self._prune_pre_inception_gaps(symbol, observed_ts, save=save)
+                except Exception as exc:
+                    self._log(
+                        "warning",
+                        "prune_pre_inception_gaps_failed",
+                        symbol=symbol,
+                        error=str(exc),
+                    )
+            self._log(
+                "debug",
+                "inception_ts_updated",
+                symbol=symbol,
+                old_ts=current,
+                new_ts=observed_ts,
+            )
+
+    def _first_ohlcv_cache_path(self) -> Path:
+        return Path(self.cache_dir) / "first_ohlcv_timestamps_unified_exchange_specific.json"
+
+    def _first_ohlcv_cache_exchange_name(self) -> str:
+        exchange_name = str(self.exchange_name or self._ex_id or "").lower()
+        return _FIRST_OHLCV_EXCHANGE_CACHE_ALIASES.get(exchange_name, exchange_name)
+
+    def _lookup_cached_authoritative_start_ts(self, symbol: str) -> Optional[int]:
+        cache_path = self._first_ohlcv_cache_path()
+        if not cache_path.exists():
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            coin = symbol.split("/")[0].strip()
+            exchange_name = self._first_ohlcv_cache_exchange_name()
+            value = data.get(coin, {}).get(exchange_name)
+            return int(value) if value is not None and float(value) > 0.0 else None
+        except Exception:
+            return None
+
+    def _get_authoritative_start_ts(self, symbol: str) -> Optional[int]:
+        """Return authoritative exchange-history lower bound, if known."""
+        idx = self._ensure_symbol_index(symbol)
+        meta = idx.setdefault("meta", {})
+        try:
+            value = meta.get("authoritative_start_ts")
+            if value is not None:
+                return int(value)
+        except Exception:
+            pass
+
+        cached = self._lookup_cached_authoritative_start_ts(symbol)
+        if cached is not None:
+            self._set_authoritative_start_ts(
+                symbol,
+                cached,
+                source="exchange_specific_cache",
+                save=True,
+            )
+            idx = self._ensure_symbol_index(symbol)
+            value = idx.get("meta", {}).get("authoritative_start_ts")
+            return int(value) if value is not None else None
+        return None
+
+    def _set_authoritative_start_ts(
+        self, symbol: str, ts: int, *, source: str, save: bool = True
+    ) -> None:
+        """Persist authoritative exchange-history lower bound for this symbol."""
+        idx = self._ensure_symbol_index(symbol)
+        meta = idx.setdefault("meta", {})
+        observed_start = self._get_inception_ts(symbol)
+        authoritative_ts = int(ts)
+        authoritative_source = str(source)
+        if observed_start is not None and observed_start < authoritative_ts:
+            authoritative_ts = int(observed_start)
+            authoritative_source = "observed_data"
+        current = meta.get("authoritative_start_ts")
+        if current is None or authoritative_ts < int(current):
+            meta["authoritative_start_ts"] = authoritative_ts
+            meta["authoritative_start_source"] = authoritative_source
+            self._index[f"{symbol}::1m"] = idx
+            if save:
+                self._save_index(symbol)
+            try:
+                self._prune_pre_inception_gaps(symbol, authoritative_ts, save=save)
+            except Exception as exc:
+                self._log(
+                    "warning",
+                    "prune_pre_inception_gaps_failed",
+                    symbol=symbol,
+                    error=str(exc),
+                )
+
+    def _prune_pre_inception_gaps(self, symbol: str, inception_ts: int, *, save: bool = True) -> None:
+        """Trim/remove known gaps with reason='pre_inception' now covered by real data."""
+        gaps = self._get_known_gaps_enhanced(symbol)
+        if not gaps:
+            return
+        cutoff_end = int(inception_ts) - ONE_MIN_MS
+        changed = False
+        new_gaps: List[GapEntry] = []
+
+        for g in gaps:
+            try:
+                if str(g.get("reason", "")) != "pre_inception":
+                    new_gaps.append(g)
+                    continue
+                s = int(g.get("start_ts", 0))
+                e = int(g.get("end_ts", 0))
+                if e <= cutoff_end:
+                    new_gaps.append(g)
+                    continue
+                if s <= cutoff_end:
+                    # Overlaps: trim to end before inception
+                    trimmed: GapEntry = {
+                        "start_ts": s,
+                        "end_ts": cutoff_end,
+                        "retry_count": int(g.get("retry_count", 0)),
+                        "reason": "pre_inception",
+                        "added_at": int(g.get("added_at", 0)),
+                    }
+                    if trimmed["start_ts"] <= trimmed["end_ts"]:
+                        new_gaps.append(trimmed)
+                    changed = True
+                    continue
+                # Entirely after inception: remove
+                changed = True
+            except Exception:
+                new_gaps.append(g)
+
+        if changed and save:
+            self._save_known_gaps_enhanced(symbol, new_gaps)
+
+    def _get_min_shard_ts(self, symbol: str) -> Optional[int]:
+        """Return earliest shard timestamp (ms) from index or disk, if available."""
+        try:
+            idx = self._ensure_symbol_index(symbol, tf="1m")
+            shards = idx.get("shards") or {}
+            if isinstance(shards, dict):
+                min_ts: Optional[int] = None
+                for shard_meta in shards.values():
+                    if not isinstance(shard_meta, dict):
+                        continue
+                    mi = shard_meta.get("min_ts")
+                    if mi is None:
+                        continue
+                    ts = int(mi)
+                    min_ts = ts if min_ts is None else min(min_ts, ts)
+                if min_ts is not None:
+                    return min_ts
+        except Exception:
+            pass
+
+        # Fallback: infer earliest shard from filenames on disk.
+        try:
+            shard_dir = self._symbol_dir(symbol, tf="1m")
+            if not os.path.isdir(shard_dir):
+                return None
+            day_keys = [f[:-4] for f in os.listdir(shard_dir) if f.endswith(".npy")]
+            if not day_keys:
+                return None
+            day_keys.sort()
+            start_ts, _ = self._date_range_of_key(day_keys[0])
+            return int(start_ts)
+        except Exception:
+            return None
+
+    def _get_inception_probe_meta(self, symbol: str) -> Tuple[int, int]:
+        """Return (last_probe_ms, last_probe_end_ts) for inception probing."""
+        idx = self._ensure_symbol_index(symbol)
+        meta = idx.get("meta", {})
+        try:
+            last_probe_ms = int(meta.get("inception_ts_probe_ms", 0) or 0)
+            last_probe_end_ts = int(meta.get("inception_ts_probe_end_ts", 0) or 0)
+            return last_probe_ms, last_probe_end_ts
+        except Exception:
+            return 0, 0
+
+    def _set_inception_probe_meta(
+        self, symbol: str, probe_ms: int, probe_end_ts: int, *, save: bool = True
+    ) -> None:
+        """Persist inception probe metadata to avoid repeated probes."""
+        idx = self._ensure_symbol_index(symbol)
+        meta = idx.setdefault("meta", {})
+        meta["inception_ts_probe_ms"] = int(probe_ms)
+        meta["inception_ts_probe_end_ts"] = int(probe_end_ts)
+        self._index[f"{symbol}::1m"] = idx
+        if save:
+            self._save_index(symbol)
+
+    def _maybe_update_inception_ts(self, symbol: str, arr: np.ndarray, *, save: bool = True) -> None:
+        """Update inception_ts if arr contains an earlier timestamp than known."""
+        if arr.size == 0:
+            return
+        first_ts = int(arr[0]["ts"]) if arr.ndim else int(arr["ts"])
+        current = self._get_inception_ts(symbol)
+        if current is None or first_ts < current:
+            self._set_inception_ts(symbol, first_ts, save=save)
+
     # ----- CCXT fetching -----
+
+    async def _apply_rate_limit_backoff(self) -> None:
+        """Wait if we're in a global rate limit backoff period.
+
+        When a rate limit is hit, all concurrent requests should pause to avoid
+        the thundering herd problem where they all retry simultaneously.
+        """
+        now = time.time()
+        if now < self._rate_limit_until:
+            wait_time = self._rate_limit_until - now
+            if wait_time > 0:
+                self._log("debug", "rate_limit_global_wait", wait_seconds=round(wait_time, 2))
+                await asyncio.sleep(wait_time)
+
+    async def _set_global_rate_limit(self, backoff_seconds: float = 5.0) -> None:
+        """Set a global rate limit backoff that affects all concurrent requests."""
+        async with self._rate_limit_lock:
+            new_until = time.time() + backoff_seconds
+            # Only extend if the new backoff is longer than existing
+            if new_until > self._rate_limit_until:
+                self._rate_limit_until = new_until
+                self._rate_limit_count += 1
+                self._log(
+                    "debug",
+                    "rate_limit_global_set",
+                    backoff_seconds=backoff_seconds,
+                    total_count=self._rate_limit_count,
+                )
 
     async def _ccxt_fetch_ohlcv_once(
         self,
@@ -1172,10 +3238,17 @@ class CandlestickManager:
         if not hasattr(ex, "fetch_ohlcv"):
             return []
 
-        backoff = 0.5
-        for attempt in range(5):
+        exid = (self._ex_id or "").lower() if isinstance(self._ex_id, str) else ""
+        is_bybit = "bybit" in exid
+        is_hyperliquid = "hyperliquid" in exid
+        max_attempts = 9 if is_bybit else 5
+        backoff = 1.0 if is_bybit else 0.5
+        backoff_cap = 20.0 if is_bybit else 8.0
+        for attempt in range(max_attempts):
+            # Wait for global rate limit backoff if one is active
+            await self._apply_rate_limit_backoff()
             try:
-                params = {}
+                params: Dict[str, Any] = {}
                 # Provide an end bound for exchanges that support it.
                 # Note: Avoid passing 'until' to Bitget due to API validation errors on non-1m tfs.
                 if end_exclusive_ms is not None:
@@ -1187,9 +3260,30 @@ class CandlestickManager:
                         and "okx" not in exid
                         and "bybit" not in exid
                         and "kucoin" not in exid
+                        and "gateio" not in exid
                     ):
                         params["until"] = int(end_exclusive_ms) - 1
+
+                # Bybit v5 requires a category for some market data routes. CCXT usually infers
+                # this from the market, but being explicit avoids intermittent misclassification.
+                if "bybit" in exid:
+                    params.setdefault("category", "linear")
+
                 tf_norm = self._normalize_timeframe_arg(timeframe, tf, default=self._ccxt_timeframe)
+                t0 = time.monotonic()
+                self._emit_remote_fetch(
+                    {
+                        "kind": "ccxt_fetch_ohlcv",
+                        "stage": "start",
+                        "exchange": str(self._ex_id),
+                        "symbol": symbol,
+                        "tf": tf_norm,
+                        "since_ts": int(since_ms),
+                        "limit": int(limit),
+                        "attempt": int(attempt + 1),
+                        "params": dict(params),
+                    }
+                )
                 self._log(
                     "debug",
                     "ccxt_fetch_ohlcv",
@@ -1202,6 +3296,11 @@ class CandlestickManager:
                 )
                 if getattr(self, "_net_sem", None) is not None:
                     async with self._net_sem:  # type: ignore[attr-defined]
+                        # Re-check rate limit after acquiring semaphore.
+                        # Tasks may have been queued before a 429 set the
+                        # global backoff; honour it now instead of firing
+                        # immediately after the semaphore unblocks.
+                        await self._apply_rate_limit_backoff()
                         res = await ex.fetch_ohlcv(
                             symbol,
                             timeframe=tf_norm,
@@ -1217,6 +3316,32 @@ class CandlestickManager:
                         limit=limit,
                         params=params,
                     )
+                first_ts = None
+                last_ts = None
+                if res:
+                    try:
+                        first_ts = int(res[0][0])
+                    except Exception:
+                        first_ts = None
+                    try:
+                        last_ts = int(res[-1][0])
+                    except Exception:
+                        last_ts = None
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                self._emit_remote_fetch(
+                    {
+                        "kind": "ccxt_fetch_ohlcv",
+                        "stage": "ok",
+                        "exchange": str(self._ex_id),
+                        "symbol": symbol,
+                        "tf": tf_norm,
+                        "since_ts": int(since_ms),
+                        "rows": int(len(res) if res else 0),
+                        "first_ts": first_ts,
+                        "last_ts": last_ts,
+                        "elapsed_ms": elapsed_ms,
+                    }
+                )
                 self._log(
                     "debug",
                     "ccxt_fetch_ohlcv_ok",
@@ -1224,30 +3349,97 @@ class CandlestickManager:
                     tf=tf_norm,
                     since_ts=int(since_ms),
                     rows=(len(res) if res else 0),
+                    first_ts=first_ts,
+                    last_ts=last_ts,
                 )
                 return res or []
             except Exception as e:  # pragma: no cover - network not used in tests
+                err_type = type(e).__name__
+                err_repr = repr(e)
+                elapsed_ms = int((time.monotonic() - t0) * 1000) if "t0" in locals() else None
+                self._emit_remote_fetch(
+                    {
+                        "kind": "ccxt_fetch_ohlcv",
+                        "stage": "error",
+                        "exchange": str(self._ex_id),
+                        "symbol": symbol,
+                        "tf": str(tf) if tf is not None else None,
+                        "since_ts": int(since_ms),
+                        "attempt": int(attempt + 1),
+                        "elapsed_ms": elapsed_ms,
+                        "params": dict(params) if "params" in locals() else None,
+                        "error_type": err_type,
+                        "error": str(e),
+                        "error_repr": err_repr,
+                    }
+                )
                 self._log(
                     "warning",
                     "ccxt_fetch_ohlcv_failed",
                     symbol=symbol,
+                    tf=str(tf) if tf is not None else None,
                     attempt=attempt + 1,
+                    params=params if "params" in locals() else None,
+                    error_type=err_type,
                     error=str(e),
+                    error_repr=err_repr,
                 )
-                await asyncio.sleep(backoff)
-                backoff *= 2
+                sleep_s = backoff
+                msg = str(e) or ""
+                msg_l = msg.lower()
+                # Heuristic: slow down harder on rate-limit style responses.
+                is_rate_limit = any(x in msg_l for x in ("rate limit", "too many", "429", "10006"))
+                if is_rate_limit:
+                    # Set global backoff to coordinate all concurrent requests
+                    # Hyperliquid needs longer backoff due to stricter limits
+                    global_backoff = 10.0 if is_hyperliquid else 5.0
+                    await self._set_global_rate_limit(global_backoff)
+                    sleep_s = max(sleep_s, global_backoff)
+                # Bybit: be more persistent on transient network-ish errors.
+                if is_bybit and (
+                    err_type
+                    in {"RequestTimeout", "NetworkError", "ExchangeNotAvailable", "DDoSProtection"}
+                    or any(
+                        x in msg_l
+                        for x in (
+                            "timed out",
+                            "timeout",
+                            "etimedout",
+                            "econnreset",
+                            "502",
+                            "503",
+                            "504",
+                        )
+                    )
+                ):
+                    sleep_s = max(sleep_s, 2.0)
+                await asyncio.sleep(sleep_s)
+                backoff = min(backoff * 2.0, backoff_cap)
         return []
 
     # ----- Array slicing helpers -----
 
-    def _slice_ts_range(self, arr: np.ndarray, start_ts: int, end_ts: int) -> np.ndarray:
+    def _slice_ts_range(
+        self, arr: np.ndarray, start_ts: int, end_ts: int, *, assume_sorted: bool = False
+    ) -> np.ndarray:
         """Return arr sliced to [start_ts, end_ts] inclusive by 'ts'.
 
-        Assumes arr is structured dtype CANDLE_DTYPE; sorts by ts before slicing.
+        Assumes arr is structured dtype CANDLE_DTYPE.
+
+        Parameters
+        ----------
+        assume_sorted : bool
+            If True, skip the sort (caller guarantees arr is already sorted by ts).
+            Use this when arr comes from get_candles/standardize_gaps which already sorts.
         """
         if arr.size == 0:
             return arr
-        arr = np.sort(_ensure_dtype(arr), order="ts")
+        arr = _ensure_dtype(arr)
+        if not assume_sorted:
+            # Only sort if needed - check if already sorted to skip O(n log n) sort
+            ts_arr = arr["ts"]
+            if ts_arr.size > 1 and not np.all(ts_arr[:-1] <= ts_arr[1:]):
+                arr = np.sort(arr, order="ts")
         ts_arr = _ts_index(arr)
         i0 = int(np.searchsorted(ts_arr, start_ts, side="left"))
         i1 = int(np.searchsorted(ts_arr, end_ts, side="right"))
@@ -1266,6 +3458,7 @@ class CandlestickManager:
                     ts = _floor_minute(ts)
                 o, h, l, c = map(float, (r[1], r[2], r[3], r[4]))
                 bv = float(r[5]) if len(r) > 5 else 0.0
+                bv = normalize_ccxt_volume_to_base(self._ex_id or "", c, bv)
                 out.append((ts, o, h, l, c, bv))
             except Exception:
                 continue
@@ -1299,22 +3492,65 @@ class CandlestickManager:
         """
         if self.exchange is None:
             return np.empty((0,), dtype=CANDLE_DTYPE)
+        since_start = int(since_ms)
         since = int(since_ms)
         end_excl = int(end_exclusive_ms)
         limit = self._ccxt_limit_default
         tf_norm = self._normalize_timeframe_arg(timeframe, tf, default=self._ccxt_timeframe)
         # Derive pagination step from timeframe
         period_ms = _tf_to_ms(tf_norm)
+        # Some exchanges treat `since` as exclusive. Back up by overlap to avoid missing the first candle.
+        if self._ccxt_since_exclusive and self._ccxt_page_overlap_candles > 0 and since > 0:
+            overlap_ms = period_ms * int(self._ccxt_page_overlap_candles)
+            since = max(0, since - overlap_ms)
         all_rows = []
+        pages = 0
+        prev_last_ts: Optional[int] = None
+        total_span = max(1, end_excl - since_start)
         while since < end_excl:
+            # Bitget auto-probe: try a larger limit once to see if the API supports it.
+            probe_limit = None
+            if (
+                not self._ccxt_limit_probe_done
+                and isinstance(self._ex_id, str)
+                and "bitget" in self._ex_id.lower()
+                and tf_norm == "1m"
+            ):
+                probe_limit = 1000
+            use_limit = probe_limit or limit
             page = await self._ccxt_fetch_ohlcv_once(
-                symbol, since, limit, end_exclusive_ms=end_excl, tf=tf_norm
+                symbol, since, use_limit, end_exclusive_ms=end_excl, tf=tf_norm
             )
             if not page:
                 break
             arr = self._normalize_ccxt_ohlcv(page)
             if arr.size == 0:
                 break
+            if probe_limit is not None and not self._ccxt_limit_probe_done:
+                # If Bitget returns >200 rows, we can safely use 1000 going forward.
+                if arr.shape[0] > 200:
+                    self._ccxt_limit_default = 1000
+                    limit = 1000
+                    self._log(
+                        "debug",
+                        "bitget_ohlcv_limit_probe",
+                        symbol=symbol,
+                        tf=tf_norm,
+                        supported_limit=1000,
+                        rows=int(arr.shape[0]),
+                    )
+                else:
+                    self._ccxt_limit_default = 200
+                    limit = 200
+                    self._log(
+                        "debug",
+                        "bitget_ohlcv_limit_probe",
+                        symbol=symbol,
+                        tf=tf_norm,
+                        supported_limit=200,
+                        rows=int(arr.shape[0]),
+                    )
+                self._ccxt_limit_probe_done = True
             # Exclude any candles >= end_exclusive
             arr = arr[arr["ts"] < end_excl]
             if arr.size == 0:
@@ -1328,18 +3564,51 @@ class CandlestickManager:
                     max_step = int(diffs.max())
                     min_step = int(diffs.min())
                     # Expect step to match the requested timeframe's period
+                    # Log at DEBUG - unexpected steps are common on illiquid exchanges and aren't actionable
                     if max_step != period_ms or min_step != period_ms:
                         warn_key = (self._ex_id, symbol, tf_norm)
                         if warn_key not in self._step_warning_keys:
                             self._step_warning_keys.add(warn_key)
-                            self.log.warning(
-                                f"unexpected step for tf exchange={self._ex_id} symbol={symbol} tf={tf_norm} expected={period_ms} min_step={min_step} max_step={max_step}"
+                            self.log.debug(
+                                f"[candle] unexpected step for tf exchange={self._ex_id} symbol={symbol} tf={tf_norm} expected={period_ms} min_step={min_step} max_step={max_step}"
                             )
                 else:
                     max_step = ONE_MIN_MS
             except Exception:
                 first_ts = last_ts = 0
+            # Record gaps inside payload and between pages as verified no-trade gaps (exchange-provided).
+            if self._record_payload_gaps_as_known and tf_norm == "1m":
+                try:
+                    ts_arr = arr["ts"].astype(np.int64)
+                    if ts_arr.size > 1:
+                        diffs = np.diff(ts_arr)
+                        gap_idxs = np.where(diffs > period_ms)[0]
+                        for i in gap_idxs:
+                            gap_start = int(ts_arr[i] + period_ms)
+                            gap_end = int(ts_arr[i + 1] - period_ms)
+                            self._record_verified_gap(symbol, gap_start, gap_end)
+                    if prev_last_ts is not None and first_ts > prev_last_ts + period_ms:
+                        gap_start = int(prev_last_ts + period_ms)
+                        gap_end = int(first_ts - period_ms)
+                        self._record_verified_gap(symbol, gap_start, gap_end)
+                except Exception:
+                    pass
+
             all_rows.append(arr)
+            pages += 1
+            if self._page_debug_all or symbol in self._page_debug_symbols:
+                self._log(
+                    "info",
+                    "ccxt_page_range",
+                    symbol=symbol,
+                    tf=tf_norm,
+                    page=pages,
+                    rows=int(arr.shape[0]),
+                    first_ts=first_ts,
+                    last_ts=last_ts,
+                    since_ts=int(since),
+                    end_exclusive_ts=int(end_excl),
+                )
             if on_batch is not None:
                 try:
                     on_batch(arr)
@@ -1354,7 +3623,29 @@ class CandlestickManager:
                     )
                     break
             last_ts = int(arr[-1]["ts"])  # inclusive last
+            # Throttled progress logs (INFO) for long-running paginated fetches
+            try:
+                progressed = max(
+                    0, min(100.0, 100.0 * float(last_ts - since_start) / float(total_span))
+                )
+            except Exception:
+                progressed = 0.0
+            self._progress_log(
+                (symbol, tf_norm, "ccxt"),
+                "ccxt_fetch_progress",
+                symbol=symbol,
+                tf=tf_norm,
+                pages=pages,
+                rows=sum(int(a.shape[0]) for a in all_rows) if all_rows else 0,
+                since_ts=since_start,
+                end_exclusive_ts=end_excl,
+                last_ts=last_ts,
+                progress_pct=f"{progressed:.1f}",
+            )
             new_since = last_ts + period_ms
+            if self._ccxt_page_overlap_candles > 0:
+                overlap_ms = period_ms * int(self._ccxt_page_overlap_candles)
+                new_since = max(last_ts - overlap_ms, since + period_ms)
             # Safety to avoid infinite loops if exchange returns overlapping data
             if new_since <= since:
                 self.log.debug(
@@ -1362,6 +3653,7 @@ class CandlestickManager:
                 )
                 break
             since = new_since
+            prev_last_ts = last_ts
         self.log.debug(
             f"paginated fetch done exchange={self._ex_id} symbol={symbol} tf={tf_norm} rows={sum(a.shape[0] for a in all_rows) if all_rows else 0}"
         )
@@ -1378,6 +3670,9 @@ class CandlestickManager:
         start_ts: Optional[int] = None,
         end_ts: Optional[int] = None,
         strict: bool = False,
+        fill_leading_gaps: bool = False,
+        assume_sorted: bool = False,
+        symbol: Optional[str] = None,
     ) -> np.ndarray:
         """Return a new array with zero-candles synthesized for missing minutes.
 
@@ -1392,51 +3687,109 @@ class CandlestickManager:
         strict : bool
             If True, raises when a gap exists and no previous candle is available
             to seed the synthesized zero-candle.
+        fill_leading_gaps : bool
+            If False (default), do NOT synthesize candles before the first real data point.
+            This prevents creating fake flat data when data doesn't exist at start_ts.
+            If True, forward-fill from first available candle to fill leading gaps.
+        assume_sorted : bool
+            If True, skip sorting (caller guarantees array is already sorted by ts).
         """
         a = _ensure_dtype(candles)
         if a.size == 0:
             # Nothing to standardize; caller decides how to handle empty ranges
             return a
 
-        a = np.sort(a, order="ts")
+        if not assume_sorted:
+            # Check if already sorted to skip O(n log n) sort
+            ts_check = a["ts"]
+            if ts_check.size > 1 and not np.all(ts_check[:-1] <= ts_check[1:]):
+                a = np.sort(a, order="ts")
         ts_arr = _ts_index(a)
-        lo = start_ts if start_ts is not None else int(ts_arr[0])
-        hi = end_ts if end_ts is not None else int(ts_arr[-1])
+
+        # Determine effective boundaries
+        first_real_ts = int(ts_arr[0])
+        last_real_ts = int(ts_arr[-1])
+
+        lo = start_ts if start_ts is not None else first_real_ts
+        hi = end_ts if end_ts is not None else last_real_ts
         lo = _floor_minute(lo)
         hi = _floor_minute(hi)
 
-        expected = np.arange(lo, hi + ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
+        # If not filling leading gaps, don't start before actual data
+        effective_lo = lo
+        if not fill_leading_gaps and first_real_ts > lo:
+            leading_gap_minutes = (first_real_ts - lo) // ONE_MIN_MS
+            if leading_gap_minutes > 0:
+                self._log(
+                    "debug",
+                    "standardize_gaps_skipping_leading",
+                    requested_start_ts=lo,
+                    actual_start_ts=first_real_ts,
+                    skipped_minutes=int(leading_gap_minutes),
+                )
+            effective_lo = _floor_minute(first_real_ts)
+
+        expected = np.arange(effective_lo, hi + ONE_MIN_MS, ONE_MIN_MS, dtype=np.int64)
         # Map from ts to row index in a
         pos = {int(t): i for i, t in enumerate(ts_arr)}
 
         if strict:
             # In strict mode: do not synthesize zero-candles.
             # If there are gaps, log a warning and return whatever real candles exist in range.
-            missing = [int(t) for t in expected if int(t) not in pos]
-            i0 = int(np.searchsorted(ts_arr, lo, side="left"))
+            i0 = int(np.searchsorted(ts_arr, effective_lo, side="left"))
             i1 = int(np.searchsorted(ts_arr, hi, side="right"))
-            if missing:
-                self._log(
-                    "warning",
-                    "standardize_gaps_strict_missing",
-                    missing=len(missing),
-                    start_ts=lo,
-                    end_ts=hi,
-                )
+            missing_count = 0
+            try:
+                expected_len = int((hi - effective_lo) // ONE_MIN_MS) + 1
+                slice_ts = ts_arr[i0:i1].astype(np.int64, copy=False)
+                if slice_ts.size:
+                    # Missing at head + tail + internal gaps (but NOT leading gaps if not filling)
+                    if fill_leading_gaps:
+                        missing_count += int((int(slice_ts[0]) - effective_lo) // ONE_MIN_MS)
+                    missing_count += int((hi - int(slice_ts[-1])) // ONE_MIN_MS)
+                    if slice_ts.size > 1:
+                        diffs = np.diff(slice_ts)
+                        gaps = diffs[diffs > ONE_MIN_MS]
+                        if gaps.size:
+                            missing_count += int(np.sum((gaps // ONE_MIN_MS) - 1))
+                    # If duplicates exist, treat them as missing coverage too
+                    missing_count += int(
+                        max(0, expected_len - int(np.unique(slice_ts).size) - missing_count)
+                    )
+                else:
+                    missing_count = expected_len
+            except Exception:
+                # fallback: keep behavior safe (no warning rather than exploding)
+                missing_count = 0
+            if missing_count:
+                # Accumulate for summary logging instead of per-event warnings
+                sym_key = symbol or "unknown"
+                self._record_strict_gap(sym_key, int(missing_count))
+                self._log_strict_gaps_summary()
             return a[i0:i1]
 
         out_rows = []
         prev_close: Optional[float] = None
-        # Seed prev_close from earliest included real candle if available
-        if lo in pos:
-            prev_close = float(a[pos[lo]]["c"])  # after we append it, close is known
-        else:
-            # If first expected timestamp is missing, try to seed from the first
-            # available candle earlier than lo.
-            idx = np.searchsorted(ts_arr, lo)
-            if idx > 0:
-                prev_close = float(a[idx - 1]["c"])  # previous real close
 
+        # Seed prev_close from:
+        # 1) the candle exactly at effective_lo, else
+        # 2) the last candle before effective_lo (ffill from earlier data), else
+        # 3) if fill_leading_gaps=True, use the first available candle (bfill for leading gaps)
+        if effective_lo in pos:
+            prev_close = float(a[pos[effective_lo]]["c"])
+        else:
+            idx = int(np.searchsorted(ts_arr, effective_lo))
+            if idx > 0:
+                # There's a candle before effective_lo - use it for ffill
+                prev_close = float(a[idx - 1]["c"])
+            elif fill_leading_gaps and a.size > 0:
+                # No candle before effective_lo, but fill_leading_gaps=True
+                # Use first candle's close to backward-fill leading gaps
+                prev_close = float(a[0]["c"])
+            # If no candle before, prev_close stays None until we hit real data
+
+        synthesized_count = 0
+        synthesized_timestamps: List[int] = []
         for t in expected:
             if t in pos:
                 row = a[pos[t]]
@@ -1444,14 +3797,1039 @@ class CandlestickManager:
                 prev_close = float(row["c"])  # update seed
             else:
                 if prev_close is None:
-                    # Skip until we know a previous close; this keeps behavior predictable.
+                    # No previous data to forward-fill from - skip this timestamp
                     continue
-                # Synthesize a zero-candle using previous close
+                # Synthesize a zero-candle using previous close (internal gaps only)
                 out_rows.append((int(t), prev_close, prev_close, prev_close, prev_close, 0.0))
+                synthesized_timestamps.append(int(t))
+                synthesized_count += 1
+
+        # Track synthetic timestamps for EMA recomputation detection
+        if symbol and synthesized_timestamps:
+            self._track_synthetic_timestamps(symbol, synthesized_timestamps)
+
+        # Log when zero-candles were synthesized (rate-limited or batched)
+        if synthesized_count > 0 and symbol:
+            # In batch mode, collect for later aggregated logging
+            if self._synth_candle_batch_mode:
+                try:
+                    first_ts = min(synthesized_timestamps)
+                    last_ts = max(synthesized_timestamps)
+                except Exception:
+                    first_ts = None
+                    last_ts = None
+                meta = self._synth_candle_batch.get(symbol)
+                if not isinstance(meta, dict):
+                    meta = {"count": 0, "min_ts": None, "max_ts": None}
+                meta["count"] = int(meta.get("count", 0)) + int(synthesized_count)
+                if first_ts is not None:
+                    try:
+                        meta["min_ts"] = (
+                            int(first_ts)
+                            if meta.get("min_ts") is None
+                            else min(int(meta["min_ts"]), int(first_ts))
+                        )
+                    except Exception:
+                        meta["min_ts"] = int(first_ts)
+                if last_ts is not None:
+                    try:
+                        meta["max_ts"] = (
+                            int(last_ts)
+                            if meta.get("max_ts") is None
+                            else max(int(meta["max_ts"]), int(last_ts))
+                        )
+                    except Exception:
+                        meta["max_ts"] = int(last_ts)
+                self._synth_candle_batch[symbol] = meta
+            else:
+                # Normal mode: deduplicate by gap start (only warn once per unique gap origin)
+                # Round first_ts to nearest hour to reduce duplicate warnings when the same
+                # underlying gap is detected at slightly different boundaries in different fetch windows
+                first_ts = min(synthesized_timestamps)
+                last_ts = max(synthesized_timestamps)
+                hour_ms = 3600_000
+                first_ts_hour = (first_ts // hour_ms) * hour_ms  # Floor to hour boundary
+                gap_key = (symbol, first_ts_hour)
+
+                # Skip if we've already warned about a gap starting in this hour window
+                if gap_key in self._synth_gap_warned:
+                    pass  # Already warned, skip
+                else:
+                    self._synth_gap_warned.add(gap_key)
+                    # Format timestamp range for human readability
+                    from datetime import datetime, timezone
+
+                    first_dt = datetime.fromtimestamp(first_ts / 1000, tz=timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M"
+                    )
+                    if synthesized_count == 1:
+                        ts_info = first_dt
+                    else:
+                        last_dt = datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M"
+                        )
+                        ts_info = f"{first_dt} to {last_dt}"
+                    # Use DEBUG for individual gap warnings - the batch summary at startup is enough at WARNING
+                    # Only use WARNING for truly exceptional situations (gaps > 1000 candles during live operation)
+                    log_fn = self.log.warning if synthesized_count > 1000 else self.log.debug
+                    log_fn(
+                        "[candle] %s: synthesized %d zero-candle%s at %s (no data for requested minutes) using prev_close=%.6f",
+                        symbol,
+                        synthesized_count,
+                        "s" if synthesized_count > 1 else "",
+                        ts_info,
+                        prev_close if prev_close is not None else 0.0,
+                    )
 
         if not out_rows:
             return np.empty((0,), dtype=CANDLE_DTYPE)
         return np.array(out_rows, dtype=CANDLE_DTYPE)
+
+    # ----- External archives (historical) -----
+
+    def _archive_supported(self) -> bool:
+        """Check if archive fetching is supported and enabled for this exchange."""
+        if not self.archive_enabled:
+            return False
+        try:
+            exid = (self._ex_id or "").lower() if isinstance(self._ex_id, str) else ""
+        except Exception:
+            exid = ""
+        # Note: Bybit excluded - CCXT is faster and uses far less bandwidth.
+        # Bybit's archive endpoint provides raw trades (not bucketed OHLCVs), so fetching
+        # and bucketing trades costs ~700x more data for BTC. Keep the archive fetch logic
+        # below for reference/optional use, but avoid it by default.
+        return exid in {"binanceusdm", "bitget", "kucoinfutures", "hyperliquid"}
+
+    @staticmethod
+    def _archive_symbol_code(symbol: str) -> str:
+        """Return archive symbol code (typically BASEQUOTE) for ccxt-style symbols."""
+        symbol = str(symbol or "")
+        if not symbol:
+            return ""
+        base = symbol
+        quote = ""
+        if "/" in symbol:
+            base, rest = symbol.split("/", 1)
+            quote = rest.split(":", 1)[0] if ":" in rest else rest
+        elif ":" in symbol:
+            base, quote = symbol.split(":", 1)
+        # best-effort fallback
+        base = (base or "").replace("/", "").replace(":", "")
+        quote = (quote or "").replace("/", "").replace(":", "")
+        return f"{base}{quote}" if quote else base
+
+    async def _archive_fetch_day(self, symbol: str, day_key: str) -> Optional[np.ndarray]:
+        """Fetch a full-day (1440x1m) candle array from external archives.
+
+        Returns CANDLE_DTYPE with inclusive timestamps spanning the UTC day, or None if not available.
+        """
+        try:
+            exid = (self._ex_id or "").lower() if isinstance(self._ex_id, str) else ""
+        except Exception:
+            exid = ""
+        if exid not in {"binanceusdm", "bybit", "bitget", "kucoinfutures", "hyperliquid"}:
+            return None
+
+        symbol_code = self._archive_symbol_code(symbol)
+        if not symbol_code:
+            return None
+
+        if exid == "kucoinfutures":
+            symbol_code = f"{symbol_code}M"
+
+        if exid == "binanceusdm":
+            url = (
+                "https://data.binance.vision/data/futures/um/"
+                f"daily/klines/{symbol_code}/1m/{symbol_code}-1m-{day_key}.zip"
+            )
+            return await self._archive_fetch_binance_zip(url, day_key)
+
+        if exid == "bybit":
+            # Note: Bybit archive provides raw trades, not bucketed OHLCVs.
+            # It's intentionally disabled by _archive_supported() by default due to bandwidth.
+            url = f"https://public.bybit.com/trading/{symbol_code}/{symbol_code}{day_key}.csv.gz"
+            return await self._archive_fetch_bybit_trades(url, day_key)
+
+        if exid == "bitget":
+            # Bitget archive layout varies by date; mirror existing logic.
+            day_comp = day_key
+            day_yymmdd = day_key.replace("-", "")
+            if day_comp <= "2024-04-18":
+                url = (
+                    "https://img.bitgetimg.com/online/kline/"
+                    f"{symbol_code}/{symbol_code}_UMCBL_1min_{day_yymmdd}.zip"
+                )
+            else:
+                url = f"https://img.bitgetimg.com/online/kline/{symbol_code}/UMCBL/{day_yymmdd}.zip"
+            return await self._archive_fetch_bitget_zip(url, day_key)
+
+        if exid == "kucoinfutures":
+            url = (
+                "https://historical-data.kucoin.com/data/futures/daily/klines/"
+                f"{symbol_code}/1m/{symbol_code}-1m-{day_key}.zip"
+            )
+            return await self._archive_fetch_kucoin_zip(url, day_key)
+
+        if exid == "hyperliquid":
+            return await self._archive_fetch_hyperliquid(symbol, day_key)
+
+        return None
+
+    async def _get_http_session(self) -> "aiohttp.ClientSession":
+        """Get or create a persistent HTTP session for archive fetches."""
+        import aiohttp
+
+        async with self._http_session_lock:
+            if self._http_session is None or self._http_session.closed:
+                # Archive hosts can be slow and archives can be large; use tolerant timeouts.
+                # Keep connect timeout bounded, but allow more time for reads.
+                timeout = aiohttp.ClientTimeout(total=120, connect=20, sock_read=60)
+                connector = aiohttp.TCPConnector(
+                    # Keep concurrency moderate to avoid timeouts under load.
+                    limit=20,
+                    limit_per_host=6,
+                    ttl_dns_cache=300,  # DNS cache TTL in seconds
+                    enable_cleanup_closed=True,
+                )
+                self._http_session = aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                )
+            return self._http_session
+
+    async def _close_http_session(self) -> None:
+        """Close the HTTP session if open."""
+        async with self._http_session_lock:
+            if self._http_session is not None and not self._http_session.closed:
+                await self._http_session.close()
+                self._http_session = None
+
+    async def _archive_fetch_bytes(self, url: str) -> Optional[bytes]:
+        t0 = time.monotonic()
+        self._emit_remote_fetch(
+            {
+                "kind": "archive_http_get",
+                "stage": "start",
+                "exchange": str(self._ex_id),
+                "url": str(url),
+            }
+        )
+        self._log("debug", "archive_http_get", url=url)
+
+        session = await self._get_http_session()
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 404:
+                    self._emit_remote_fetch(
+                        {
+                            "kind": "archive_http_get",
+                            "stage": "not_found",
+                            "exchange": str(self._ex_id),
+                            "url": str(url),
+                            "status": 404,
+                            "elapsed_ms": int((time.monotonic() - t0) * 1000),
+                        }
+                    )
+                    self._log(
+                        "debug",
+                        "archive_http_404",
+                        url=url,
+                        elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    )
+                    return None
+                resp.raise_for_status()
+                data = await resp.read()
+        except Exception as e:
+            err_type = type(e).__name__
+            err_repr = repr(e)
+            self._emit_remote_fetch(
+                {
+                    "kind": "archive_http_get",
+                    "stage": "error",
+                    "exchange": str(self._ex_id),
+                    "url": str(url),
+                    "error_type": err_type,
+                    "error": str(e),
+                    "error_repr": err_repr,
+                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
+                }
+            )
+            self._log(
+                "debug",
+                "archive_http_error",
+                url=url,
+                error_type=err_type,
+                error=str(e),
+                error_repr=err_repr,
+            )
+            raise
+
+        self._emit_remote_fetch(
+            {
+                "kind": "archive_http_get",
+                "stage": "ok",
+                "exchange": str(self._ex_id),
+                "url": str(url),
+                "bytes": int(len(data)),
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            }
+        )
+        self._log(
+            "debug",
+            "archive_http_ok",
+            url=url,
+            bytes=len(data),
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+        )
+        return data
+
+    async def _archive_fetch_binance_zip(self, url: str, day_key: str) -> Optional[np.ndarray]:
+        raw = await self._archive_fetch_bytes(url)
+        if raw is None:
+            return None
+        import zipfile
+        from io import BytesIO
+        import pandas as pd
+
+        col_names = ["timestamp", "open", "high", "low", "close", "volume"]
+        with zipfile.ZipFile(BytesIO(raw), "r") as z:
+            dfs = []
+            for name in z.namelist():
+                with z.open(name) as f:
+                    df = pd.read_csv(f, header=None)
+                df.columns = col_names + [
+                    f"extra_{i}" for i in range(len(df.columns) - len(col_names))
+                ]
+                dfs.append(df[col_names])
+        if not dfs:
+            return None
+        dfc = pd.concat(dfs).sort_values("timestamp").reset_index(drop=True)
+        dfc = dfc[dfc.timestamp != "open_time"]
+        for c in col_names:
+            dfc[c] = pd.to_numeric(dfc[c], errors="coerce")
+        dfc = dfc.dropna(subset=["timestamp"]).reset_index(drop=True)
+        start_ts, end_ts = self._date_range_of_key(day_key)
+        # Binance timestamps should already be ms.
+        dfc = dfc[(dfc["timestamp"] >= start_ts) & (dfc["timestamp"] <= end_ts)]
+        if dfc.empty:
+            return None
+        return self._ohlcv_df_to_day_arr(dfc, day_key)
+
+    async def _archive_fetch_bitget_zip(self, url: str, day_key: str) -> Optional[np.ndarray]:
+        raw = await self._archive_fetch_bytes(url)
+        if raw is None:
+            return None
+        import zipfile
+        from io import BytesIO
+        import pandas as pd
+
+        col_names = ["timestamp", "open", "high", "low", "close", "volume"]
+        with zipfile.ZipFile(BytesIO(raw), "r") as z:
+            dfs = []
+            for name in z.namelist():
+                with z.open(name) as f:
+                    # Bitget provides xlsx-like sheets; pandas can read excel from bytes.
+                    df = pd.read_excel(f)
+                df.columns = col_names + [
+                    f"extra_{i}" for i in range(len(df.columns) - len(col_names))
+                ]
+                dfs.append(df[col_names])
+        if not dfs:
+            return None
+        dfc = pd.concat(dfs).sort_values("timestamp").reset_index(drop=True)
+        for c in col_names:
+            dfc[c] = pd.to_numeric(dfc[c], errors="coerce")
+        dfc = dfc.dropna(subset=["timestamp"]).reset_index(drop=True)
+        start_ts, end_ts = self._date_range_of_key(day_key)
+        # Bitget timestamps sometimes come in seconds.
+        ts = dfc["timestamp"].astype("float64").values
+        if np.isfinite(ts).any() and float(np.nanmax(np.abs(ts))) < 1e11:
+            dfc["timestamp"] = dfc["timestamp"] * 1000.0
+        dfc = dfc[(dfc["timestamp"] >= start_ts) & (dfc["timestamp"] <= end_ts)]
+        if dfc.empty:
+            return None
+        return self._ohlcv_df_to_day_arr(dfc, day_key)
+
+    async def _archive_fetch_kucoin_zip(self, url: str, day_key: str) -> Optional[np.ndarray]:
+        raw = await self._archive_fetch_bytes(url)
+        if raw is None:
+            return None
+        import zipfile
+        from io import BytesIO
+        import pandas as pd
+
+        required = ["timestamp", "open", "high", "low", "close", "volume"]
+        with zipfile.ZipFile(BytesIO(raw), "r") as z:
+            dfs = []
+            for name in z.namelist():
+                with z.open(name) as f:
+                    df = pd.read_csv(f)
+                df.columns = [str(c).strip().lower() for c in df.columns]
+                if "time" in df.columns and "timestamp" not in df.columns:
+                    df = df.rename(columns={"time": "timestamp"})
+                missing = [c for c in required if c not in df.columns]
+                if missing:
+                    raise ValueError(f"kucoin archive missing columns {missing} in {url}")
+                dfs.append(df[required])
+        if not dfs:
+            return None
+        dfc = pd.concat(dfs, ignore_index=True)
+        for c in required:
+            dfc[c] = pd.to_numeric(dfc[c], errors="coerce")
+        dfc = dfc.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        # Kucoin timestamps are typically seconds.
+        ts = dfc["timestamp"].astype("float64").values
+        if np.isfinite(ts).any() and float(np.nanmax(np.abs(ts))) < 1e11:
+            dfc["timestamp"] = dfc["timestamp"] * 1000.0
+        start_ts, end_ts = self._date_range_of_key(day_key)
+        dfc = dfc[(dfc["timestamp"] >= start_ts) & (dfc["timestamp"] <= end_ts)]
+        if dfc.empty:
+            return None
+        return self._ohlcv_df_to_day_arr(dfc, day_key)
+
+    async def _archive_fetch_bybit_trades(self, url: str, day_key: str) -> Optional[np.ndarray]:
+        raw = await self._archive_fetch_bytes(url)
+        if raw is None:
+            return None
+        import gzip
+        from io import BytesIO
+        import pandas as pd
+
+        with gzip.open(BytesIO(raw)) as f:
+            trades = pd.read_csv(f)
+        if "timestamp" not in trades.columns or "price" not in trades.columns:
+            return None
+        # Bybit archive timestamps are in seconds (trade time).
+        ts_sec = pd.to_numeric(trades["timestamp"], errors="coerce").astype("float64")
+        price = pd.to_numeric(trades["price"], errors="coerce").astype("float64")
+        size = pd.to_numeric(trades.get("size", 0.0), errors="coerce").astype("float64")
+        trades = pd.DataFrame({"timestamp": ts_sec, "price": price, "size": size}).dropna(
+            subset=["timestamp", "price"]
+        )
+        if trades.empty:
+            return None
+        interval = 60_000
+        minute_ts = (trades["timestamp"] * 1000.0) // interval * interval
+        groups = trades.groupby(minute_ts)
+        ohlcvs = pd.DataFrame(
+            {
+                "open": groups["price"].first(),
+                "high": groups["price"].max(),
+                "low": groups["price"].min(),
+                "close": groups["price"].last(),
+                "volume": groups["size"].sum(),
+            }
+        )
+        ohlcvs["timestamp"] = ohlcvs.index.astype("int64")
+        ohlcvs = ohlcvs.reset_index(drop=True)
+        start_ts, end_ts = self._date_range_of_key(day_key)
+        ohlcvs = ohlcvs[(ohlcvs["timestamp"] >= start_ts) & (ohlcvs["timestamp"] <= end_ts)]
+        if ohlcvs.empty:
+            return None
+        return self._ohlcv_df_to_day_arr(ohlcvs, day_key)
+
+    async def _archive_fetch_hyperliquid(self, symbol: str, day_key: str) -> Optional[np.ndarray]:
+        """Fetch Hyperliquid archive data for backtesting.
+
+        Data sources tried in order:
+        1. Local pre-processed cache (caches/ohlcv/hyperliquid/{coin}/{day_key}.parquet)
+        2. For stock perps: TradFi API (if credentials available in api-keys.json)
+
+        For Hyperliquid's S3 raw trade data, users can pre-process it using:
+            python -m src.tools.hyperliquid_s3_fetcher --start YYYY-MM-DD --end YYYY-MM-DD
+            python -m src.tools.trades_to_ohlcv --input caches/hyperliquid_trades --output caches/ohlcv/hyperliquid
+
+        Args:
+            symbol: CCXT-style symbol (e.g., "BTC/USDC:USDC" or "xyz:TSLA/USDC:USDC")
+            day_key: Date string (YYYY-MM-DD)
+
+        Returns:
+            CANDLE_DTYPE array with 1440 candles, or None if not available
+        """
+        import pandas as pd
+        from pathlib import Path
+
+        # Derive coin name from symbol for cache path
+        base = symbol.split("/")[0] if "/" in symbol else symbol
+        # Handle xyz: prefix in path (replace : with _ for filesystem)
+        safe_coin = base.replace(":", "_")
+
+        # 1. Check local pre-processed cache first
+        cache_path = Path("caches/ohlcv/hyperliquid") / safe_coin / f"{day_key}.parquet"
+
+        if cache_path.exists():
+            try:
+                import pyarrow.parquet as pq
+
+                table = pq.read_table(cache_path)
+                df = table.to_pandas()
+
+                # Rename columns to match expected format
+                col_map = {
+                    "ts": "timestamp",
+                    "o": "open",
+                    "h": "high",
+                    "l": "low",
+                    "c": "close",
+                    "bv": "volume",
+                }
+                df = df.rename(columns=col_map)
+
+                self._log(
+                    "debug",
+                    "hyperliquid_archive_hit",
+                    symbol=symbol,
+                    day_key=day_key,
+                    path=str(cache_path),
+                )
+                return self._ohlcv_df_to_day_arr(df, day_key)
+            except Exception as e:
+                self._log(
+                    "debug", "hyperliquid_archive_error", symbol=symbol, day_key=day_key, error=str(e)
+                )
+
+        # 2. For stock perps, try TradFi data fetch
+        try:
+            from tradfi_data import is_stock_ticker, hip3_to_tradfi_symbol
+        except ImportError:
+            self._log("debug", "hyperliquid_archive_miss", symbol=symbol, day_key=day_key)
+            return None
+
+        if is_stock_ticker(base):
+            arr = await self._fetch_tradfi_day(base, day_key, cache_path)
+            if arr is not None and arr.size > 0:
+                return arr
+
+        self._log("debug", "hyperliquid_archive_miss", symbol=symbol, day_key=day_key)
+        return None
+
+    async def _fetch_tradfi_day(
+        self, coin: str, day_key: str, cache_path: "Path"
+    ) -> Optional[np.ndarray]:
+        """Fetch stock data from TradFi API and cache it.
+
+        Args:
+            coin: Stock ticker (e.g., "TSLA", "xyz:TSLA")
+            day_key: Date string (YYYY-MM-DD)
+            cache_path: Path to save cached data
+
+        Returns:
+            CANDLE_DTYPE array or None
+        """
+        from pathlib import Path
+
+        try:
+            from tradfi_data import (
+                get_provider,
+                hip3_to_tradfi_symbol,
+                TradFiDataFetcher,
+            )
+        except ImportError:
+            return None
+
+        # Load TradFi credentials from api-keys.json
+        # Default to yfinance (free, no API key required)
+        tradfi_config = self._load_tradfi_config()
+        if tradfi_config:
+            provider_name = tradfi_config.get("provider", "yfinance")
+            api_key = tradfi_config.get("api_key")
+            api_secret = tradfi_config.get("api_secret")  # For Alpaca
+        else:
+            # Use yfinance as free default
+            provider_name = "yfinance"
+            api_key = None
+            api_secret = None
+
+        try:
+            provider = get_provider(provider_name, api_key=api_key, api_secret=api_secret)
+            ticker = hip3_to_tradfi_symbol(coin)
+
+            self._log("info", "tradfi_fetch", ticker=ticker, day_key=day_key, provider=provider_name)
+
+            async with TradFiDataFetcher(provider) as fetcher:
+                # Construct HIP-3 symbol for the fetcher
+                hip3_symbol = f"xyz:{ticker}/USDC:USDC" if not coin.startswith("xyz:") else coin
+                arr = await fetcher.fetch_day(hip3_symbol, day_key)
+
+            if arr is not None and arr.size > 0:
+                # Cache the result for future use
+                self._save_tradfi_cache(arr, cache_path)
+                # Convert to day array format
+                import pandas as pd
+
+                df = pd.DataFrame(
+                    {
+                        "timestamp": arr["ts"],
+                        "open": arr["o"],
+                        "high": arr["h"],
+                        "low": arr["l"],
+                        "close": arr["c"],
+                        "volume": arr["bv"],
+                    }
+                )
+                return self._ohlcv_df_to_day_arr(df, day_key)
+
+        except Exception as e:
+            self._log("debug", "tradfi_fetch_error", coin=coin, day_key=day_key, error=str(e))
+
+        return None
+
+    def _load_tradfi_config(self) -> Optional[dict]:
+        """Load TradFi API configuration from api-keys.json."""
+        from pathlib import Path
+        import json
+
+        api_keys_path = Path("api-keys.json")
+        if not api_keys_path.exists():
+            return None
+
+        try:
+            with open(api_keys_path) as f:
+                api_keys = json.load(f)
+            return api_keys.get("tradfi")
+        except Exception:
+            return None
+
+    def _save_tradfi_cache(self, arr: np.ndarray, cache_path: "Path") -> None:
+        """Save TradFi data to local cache."""
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+            table = pa.table(
+                {
+                    "ts": pa.array(arr["ts"].astype("int64")),
+                    "o": pa.array(arr["o"].astype("float32")),
+                    "h": pa.array(arr["h"].astype("float32")),
+                    "l": pa.array(arr["l"].astype("float32")),
+                    "c": pa.array(arr["c"].astype("float32")),
+                    "bv": pa.array(arr["bv"].astype("float32")),
+                }
+            )
+            pq.write_table(table, cache_path, compression="zstd")
+            self._log("debug", "tradfi_cache_saved", path=str(cache_path))
+        except Exception as e:
+            self._log("debug", "tradfi_cache_save_error", error=str(e))
+
+    def _ohlcv_df_to_day_arr(self, df, day_key: str) -> np.ndarray:
+        """Convert a dataframe with timestamp/open/high/low/close/volume to 1m day array."""
+        start_ts, end_ts = self._date_range_of_key(day_key)
+        cols = ["timestamp", "open", "high", "low", "close", "volume"]
+        for c in cols:
+            df[c] = df[c].astype("float64")
+        df = (
+            df.dropna(subset=["timestamp", "close"])
+            .sort_values("timestamp")
+            .drop_duplicates(subset=["timestamp"], keep="last")
+        )
+        # Convert to CANDLE_DTYPE and then standardize to full-day grid.
+        arr = np.empty((df.shape[0],), dtype=CANDLE_DTYPE)
+        arr["ts"] = df["timestamp"].astype("int64").values
+        arr["o"] = df["open"].values
+        arr["h"] = df["high"].values
+        arr["l"] = df["low"].values
+        arr["c"] = df["close"].values
+        arr["bv"] = df["volume"].values
+        arr = arr[(arr["ts"] >= start_ts) & (arr["ts"] <= end_ts)]
+        if arr.size == 0:
+            return np.empty((0,), dtype=CANDLE_DTYPE)
+        # For archive day data, we expect full day coverage - use fill_leading_gaps=True
+        out = self.standardize_gaps(
+            arr, start_ts=start_ts, end_ts=end_ts, strict=False, fill_leading_gaps=True
+        )
+        # Validate full-day coverage (best-effort; callers can fall back to ccxt).
+        if out.size != 1440 or int(out[0]["ts"]) != start_ts or int(out[-1]["ts"]) != end_ts:
+            return np.empty((0,), dtype=CANDLE_DTYPE)
+        return out
+
+    async def _prefetch_archives_for_range(
+        self, symbol: str, start_ts: int, end_ts: int, *, parallel_days: int = 5
+    ) -> None:
+        """Try to materialize missing full-day shards using external archives.
+
+        Args:
+            symbol: The symbol to fetch archives for
+            start_ts: Start timestamp (ms)
+            end_ts: End timestamp (ms)
+            parallel_days: Number of days to fetch in parallel (default 5)
+        """
+        if not self._archive_supported():
+            return
+
+        # For stock-perps with TradFi configured, allow fetches before exchange inception
+        # so historical data can be backfilled from TradFi providers (alpaca/polygon/etc.).
+        allow_pre_inception_for_stock_perp = False
+        try:
+            from tradfi_data import is_stock_ticker
+
+            base = symbol.split("/")[0].strip()
+            tradfi_cfg = self._load_tradfi_config()
+            allow_pre_inception_for_stock_perp = bool(tradfi_cfg) and is_stock_ticker(base)
+        except Exception:
+            allow_pre_inception_for_stock_perp = False
+
+        # Clip/skip only when we know an authoritative lower bound for exchange-available
+        # history. Earliest cached shard is observed local coverage, not proof of
+        # exchange inception, so it must not suppress earlier backfills.
+        authoritative_start_ts = self._get_authoritative_start_ts(symbol)
+        if (
+            authoritative_start_ts is not None
+            and start_ts < authoritative_start_ts
+            and not allow_pre_inception_for_stock_perp
+        ):
+            if authoritative_start_ts > end_ts:
+                pre_inception_end = min(authoritative_start_ts - ONE_MIN_MS, end_ts)
+                if start_ts <= pre_inception_end:
+                    self._add_known_gap(
+                        symbol,
+                        start_ts,
+                        pre_inception_end,
+                        reason="pre_inception",
+                        retry_count=_GAP_MAX_RETRIES,
+                    )
+                    self._log(
+                        "warning",
+                        "skip_pre_inception_fetch",
+                        symbol=symbol,
+                        original_start=start_ts,
+                        original_end=end_ts,
+                        authoritative_start_ts=authoritative_start_ts,
+                        uncovered_start=start_ts,
+                        uncovered_end=pre_inception_end,
+                    )
+                return
+
+            pre_inception_end = min(authoritative_start_ts - ONE_MIN_MS, end_ts)
+            if start_ts <= pre_inception_end:
+                self._add_known_gap(
+                    symbol,
+                    start_ts,
+                    pre_inception_end,
+                    reason="pre_inception",
+                    retry_count=_GAP_MAX_RETRIES,
+                )
+                self._log(
+                    "warning",
+                    "skip_pre_inception_fetch",
+                    symbol=symbol,
+                    original_start=start_ts,
+                    original_end=end_ts,
+                    authoritative_start_ts=authoritative_start_ts,
+                    uncovered_start=start_ts,
+                    uncovered_end=pre_inception_end,
+                )
+            start_ts = authoritative_start_ts
+            if start_ts > end_ts:
+                return  # Nothing left to fetch
+
+        day_map = self._date_keys_between(start_ts, end_ts)
+        shard_paths = self._iter_shard_paths(symbol, tf="1m")
+        legacy_paths = self._get_legacy_shard_paths(symbol, "1m")
+
+        # Determine primary shard completeness via index.json (cheap; avoids loading npy files).
+        idx_shards: Dict[str, Dict[str, Any]] = {}
+        try:
+            idx = self._ensure_symbol_index(symbol, tf="1m")
+            idx_shards = idx.get("shards") or {}
+            if not isinstance(idx_shards, dict):
+                idx_shards = {}
+        except Exception:
+            idx_shards = {}
+
+        # Don't try to fetch archives for recent days - they don't exist yet
+        # Exchanges typically need 48-72 hours to publish archive data
+        archive_freshness_hours = 72
+        archive_cutoff_ms = _utc_now_ms() - (archive_freshness_hours * 3600 * 1000)
+
+        # First pass: count days to fetch
+        days_to_fetch = []
+        skipped_reasons = {
+            "partial_day_request": 0,
+            "too_recent": 0,
+            "legacy_present": 0,
+            "primary_complete": 0,
+            "verified_from_disk": 0,  # Files verified by loading (no index metadata)
+        }
+        for day_key, (day_start, day_end) in day_map.items():
+            if start_ts > day_start or end_ts < day_end:
+                skipped_reasons["partial_day_request"] += 1
+                continue  # not a full-day request for this day
+            if day_end > archive_cutoff_ms:
+                skipped_reasons["too_recent"] += 1
+                continue  # too recent - archive not available yet, use CCXT
+            if day_key in legacy_paths:
+                skipped_reasons["legacy_present"] += 1
+                continue  # legacy cache already covers this day
+
+            # Only fetch archives for days missing or incomplete in primary.
+            # NOTE: Previously we skipped any day with an existing primary shard path.
+            # That can block archive healing if a prior CCXT run wrote a partial/incomplete day.
+            if day_key in shard_paths:
+                meta = idx_shards.get(day_key) if isinstance(idx_shards, dict) else None
+                try:
+                    if isinstance(meta, dict):
+                        # full UTC day coverage (inclusive endpoints)
+                        if (
+                            int(meta.get("count") or -1) == 1440
+                            and int(meta.get("min_ts") or 0) == int(day_start)
+                            and int(meta.get("max_ts") or 0) == int(day_end)
+                        ):
+                            skipped_reasons["primary_complete"] += 1
+                            continue
+                    else:
+                        # No index metadata but file exists - verify by loading the shard
+                        # to avoid redundant re-downloads of already complete files.
+                        try:
+                            arr = self._load_shard(shard_paths[day_key])
+                            if (
+                                len(arr) == 1440
+                                and len(arr) > 0
+                                and int(arr["ts"][0]) == int(day_start)
+                                and int(arr["ts"][-1]) == int(day_end)
+                            ):
+                                # File is complete - update index with metadata and skip
+                                crc = int(zlib.crc32(arr.tobytes()) & 0xFFFFFFFF)
+                                idx_shards[day_key] = {
+                                    "path": shard_paths[day_key],
+                                    "min_ts": int(arr["ts"][0]),
+                                    "max_ts": int(arr["ts"][-1]),
+                                    "count": int(len(arr)),
+                                    "crc32": crc,
+                                }
+                                skipped_reasons["verified_from_disk"] += 1
+                                continue
+                        except Exception:
+                            # Load failed - proceed to re-download
+                            pass
+                except Exception:
+                    # If meta is missing/corrupt, treat as incomplete and allow archive fetch.
+                    pass
+
+            days_to_fetch.append((day_key, day_start, day_end))
+
+        # If we verified any files from disk, persist the index updates
+        if skipped_reasons["verified_from_disk"] > 0:
+            try:
+                idx["shards"] = idx_shards
+                self._index[f"{symbol}::1m"] = idx
+                self._save_index(symbol, tf="1m")
+                self._log(
+                    "debug",
+                    "index_updated_from_disk_verification",
+                    symbol=symbol,
+                    shards_verified=skipped_reasons["verified_from_disk"],
+                )
+            except Exception:
+                pass
+
+        if not days_to_fetch:
+            # Surface why archive prefetch didn't run (useful when large gaps exist but
+            # they are not eligible for full-day archive materialization).
+            try:
+                self._emit_remote_fetch(
+                    {
+                        "kind": "archive_prefetch",
+                        "stage": "skip",
+                        "exchange": str(self._ex_id),
+                        "symbol": symbol,
+                        "reasons": dict(skipped_reasons),
+                    }
+                )
+            except Exception:
+                pass
+            return
+
+        total_days = len(days_to_fetch)
+        completed = 0
+        skipped = 0
+        start_time = time.monotonic()
+
+        # Log start of archive prefetch
+        self._log(
+            "info",
+            "archive_prefetch_start",
+            symbol=symbol,
+            days_to_fetch=total_days,
+            parallel=parallel_days,
+            date_range=f"{days_to_fetch[0][0]}..{days_to_fetch[-1][0]}",
+        )
+        self._emit_remote_fetch(
+            {
+                "kind": "archive_prefetch",
+                "stage": "start",
+                "exchange": str(self._ex_id),
+                "symbol": symbol,
+                "days_to_fetch": int(total_days),
+                "parallel": int(parallel_days),
+                "date_range": f"{days_to_fetch[0][0]}..{days_to_fetch[-1][0]}",
+            }
+        )
+
+        last_progress_emit = 0.0
+
+        # Semaphore to limit concurrent fetches
+        sem = asyncio.Semaphore(max(1, parallel_days))
+
+        def _format_archive_exc(exc: BaseException) -> Tuple[str, str]:
+            """Return (error_type, error_repr) for logging."""
+            try:
+                return (type(exc).__name__, repr(exc))
+            except Exception:
+                return (type(exc).__name__, "<unrepresentable exception>")
+
+        async def fetch_single_day(
+            day_info: Tuple[str, int, int],
+        ) -> Tuple[str, Optional[np.ndarray], Optional[Tuple[str, str]]]:
+            """Fetch a single day's archive data. Returns (day_key, array or None, (err_type, err_repr) or None)."""
+            day_key, day_start, day_end = day_info
+            async with sem:
+                try:
+                    self._log("debug", "archive_day_attempt", symbol=symbol, day=day_key)
+                    arr = await self._archive_fetch_day(symbol, day_key)
+                    return (day_key, arr, None)
+                except Exception as e:
+                    return (day_key, None, _format_archive_exc(e))
+
+        try:
+            # Process in batches matching semaphore limit to avoid task queuing
+            batch_size = max(1, parallel_days)  # Match semaphore for optimal throughput
+
+            for batch_start in range(0, total_days, batch_size):
+                batch = days_to_fetch[batch_start : batch_start + batch_size]
+                batch_start_time = time.monotonic()
+
+                # Throttled progress log (every ~10 seconds)
+                self._progress_log(
+                    (symbol, "1m", "archive"),
+                    "archive_prefetch_progress",
+                    symbol=symbol,
+                    progress=f"{completed}/{total_days}",
+                    pct=int(100 * completed / total_days) if total_days > 0 else 0,
+                    batch=f"{batch[0][0]}..{batch[-1][0]}",
+                    elapsed_s=round(time.monotonic() - start_time, 1),
+                )
+                try:
+                    now = time.monotonic()
+                    if (now - last_progress_emit) >= float(
+                        self._progress_log_interval_seconds or 0.0
+                    ):
+                        last_progress_emit = now
+                        self._emit_remote_fetch(
+                            {
+                                "kind": "archive_prefetch",
+                                "stage": "progress",
+                                "exchange": str(self._ex_id),
+                                "symbol": symbol,
+                                "completed": int(completed),
+                                "total": int(total_days),
+                                "pct": int(100 * completed / total_days) if total_days > 0 else 0,
+                                "batch": f"{batch[0][0]}..{batch[-1][0]}",
+                                "elapsed_s": round(time.monotonic() - start_time, 1),
+                            }
+                        )
+                except Exception:
+                    pass
+
+                # Fetch batch in parallel
+                tasks = [fetch_single_day(d) for d in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Process results and persist (with deferred index writes)
+                batch_had_saves = False
+                for i, result in enumerate(results):
+                    day_key = batch[i][0]
+                    if isinstance(result, Exception):
+                        err_type, err_repr = _format_archive_exc(result)
+                        self._log(
+                            "warning",
+                            "archive_day_failed",
+                            symbol=symbol,
+                            day=day_key,
+                            error=err_repr,
+                            error_type=err_type,
+                        )
+                        skipped += 1
+                    elif result[2] is not None:  # (error_type, error_repr)
+                        err_type, err_repr = result[2]
+                        self._log(
+                            "warning",
+                            "archive_day_failed",
+                            symbol=symbol,
+                            day=day_key,
+                            error=err_repr,
+                            error_type=err_type,
+                        )
+                        skipped += 1
+                    elif result[1] is None or result[1].size == 0:
+                        self._log("debug", "archive_day_unavailable", symbol=symbol, day=day_key)
+                        skipped += 1
+                    else:
+                        arr = result[1]
+                        # Defer index write - we'll flush once at the end of the batch
+                        # Skip memory retention to preserve full historical data for backtesting
+                        self._persist_batch(
+                            symbol,
+                            arr,
+                            timeframe="1m",
+                            merge_cache=True,
+                            last_refresh_ms=_utc_now_ms(),
+                            defer_index=True,
+                            skip_memory_retention=True,
+                        )
+                        shard_paths[day_key] = self._shard_path(symbol, day_key, tf="1m")
+                        self._log(
+                            "debug",  # Changed from info to debug to reduce log noise
+                            "archive_day_saved",
+                            symbol=symbol,
+                            day=day_key,
+                            rows=int(arr.size),
+                        )
+                        completed += 1
+                        batch_had_saves = True
+
+                batch_elapsed = round(time.monotonic() - batch_start_time, 2)
+                if len(batch) > 1:
+                    self._log(
+                        "debug",
+                        "archive_batch_complete",
+                        symbol=symbol,
+                        batch_size=len(batch),
+                        elapsed_s=batch_elapsed,
+                    )
+        except Exception:
+            # Re-raise, but ensure we still log completion below
+            raise
+
+        # Flush deferred index writes once after all batches complete
+        if completed > 0:
+            self.flush_deferred_index(symbol, tf="1m")
+
+        # Log completion summary
+        total_elapsed = round(time.monotonic() - start_time, 1)
+        self._log(
+            "info",
+            "archive_prefetch_complete",
+            symbol=symbol,
+            fetched=completed,
+            skipped=skipped,
+            total=total_days,
+            elapsed_s=total_elapsed,
+        )
+        self._emit_remote_fetch(
+            {
+                "kind": "archive_prefetch",
+                "stage": "done",
+                "exchange": str(self._ex_id),
+                "symbol": symbol,
+                "fetched": int(completed),
+                "skipped": int(skipped),
+                "total": int(total_days),
+                "elapsed_s": float(total_elapsed),
+            }
+        )
 
     async def get_candles(
         self,
@@ -1463,6 +4841,10 @@ class CandlestickManager:
         strict: bool = False,
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
+        force_refetch_gaps: bool = False,
+        fill_leading_gaps: bool = False,
+        skip_historical_gap_fill: bool = False,
+        max_lookback_candles: Optional[int] = None,
     ) -> np.ndarray:
         """Return candles in inclusive range [start_ts, end_ts].
 
@@ -1472,9 +4854,39 @@ class CandlestickManager:
         - If `max_age_ms` == 0: force refresh (no-op when exchange is None)
         - Negative `max_age_ms` raises ValueError
         - Applies gap standardization (1m only)
+        - If `force_refetch_gaps` is True: clears known gaps in the requested range
+          before fetching, forcing a retry of all gaps regardless of retry count
+        - If `fill_leading_gaps` is True: synthesize zero-candles even before the
+          first real data point (useful for EMA calculation)
+        - If `skip_historical_gap_fill` is True: do not attempt to fetch/fill gaps
+          in historical data older than 1 day. Useful for live bot warmup where
+          recent data is sufficient and filling old gaps wastes time.
+        - If `max_lookback_candles` is set: clamp start_ts so the request spans
+          at most that many candles ending at end_ts (per timeframe).
         """
         if max_age_ms is not None and max_age_ms < 0:
             raise ValueError("max_age_ms cannot be negative")
+
+        # Force refetch: clear known gaps in the requested range
+        if force_refetch_gaps:
+            # Compute actual range first
+            now = _utc_now_ms()
+            eff_end = end_ts if end_ts is not None else _floor_minute(now)
+            eff_start = (
+                start_ts
+                if start_ts is not None
+                else (int(eff_end) - self.default_window_candles * ONE_MIN_MS)
+            )
+            cleared = self.clear_known_gaps(symbol, date_range=(eff_start, eff_end))
+            if cleared > 0:
+                self._log(
+                    "info",
+                    "force_refetch_gaps",
+                    symbol=symbol,
+                    start_ts=eff_start,
+                    end_ts=eff_end,
+                    gaps_cleared=cleared,
+                )
 
         # When a higher timeframe is requested, fetch it directly from the exchange
         # and bypass the 1m cache/standardization logic.
@@ -1494,6 +4906,15 @@ class CandlestickManager:
                     # default window expressed in number of requested-tf buckets
                     start_ts = int(end_ts) - self.default_window_candles * period_ms
                 start_ts = (int(start_ts) // period_ms) * period_ms
+
+                if max_lookback_candles is not None:
+                    try:
+                        lookback = max(1, int(max_lookback_candles))
+                        lookback_start = int(end_ts) - period_ms * (lookback - 1)
+                        if int(start_ts) < int(lookback_start):
+                            start_ts = int(lookback_start)
+                    except Exception:
+                        pass
 
                 if start_ts > end_ts:
                     return np.empty((0,), dtype=CANDLE_DTYPE)
@@ -1659,11 +5080,21 @@ class CandlestickManager:
         else:
             start_ts = _floor_minute(int(start_ts))
 
+        if max_lookback_candles is not None:
+            try:
+                lookback = max(1, int(max_lookback_candles))
+                lookback_start = int(end_ts) - ONE_MIN_MS * (lookback - 1)
+                if int(start_ts) < int(lookback_start):
+                    start_ts = int(lookback_start)
+            except Exception:
+                pass
+
         if start_ts > end_ts:
             return np.empty((0,), dtype=CANDLE_DTYPE)
 
         # Optionally refresh if range touches the latest finalized minute
         allow_fetch_present = True
+        skip_present_fetch_due_to_ttl = False
         latest_finalized = _floor_minute(now) - ONE_MIN_MS
         if end_ts >= latest_finalized and self.exchange is not None:
             if max_age_ms == 0:
@@ -1676,19 +5107,37 @@ class CandlestickManager:
                 await self.refresh(symbol, through_ts=end_ts)
             elif max_age_ms is not None and max_age_ms > 0:
                 last_ref = self._get_last_refresh_ms(symbol)
+                last_final = 0
+                try:
+                    idx = self._ensure_symbol_index(symbol, tf="1m")
+                    last_final = int(idx.get("meta", {}).get("last_final_ts", 0) or 0)
+                except Exception:
+                    last_final = 0
                 self._log(
                     "debug",
                     "get_candles_check_refresh",
                     symbol=symbol,
                     end_ts=end_ts,
                     last_refresh_ms=last_ref,
+                    last_final_ts=last_final,
                     max_age_ms=max_age_ms,
                     now=now,
                 )
-                if last_ref == 0 or (now - last_ref) > int(max_age_ms):
+                need_refresh = last_ref == 0 or (now - last_ref) > int(max_age_ms)
+                if not need_refresh:
+                    # Only force refresh if cached data lags by MORE than 1 candle
+                    # period.  Being exactly 1 minute behind is normal when a new
+                    # minute boundary crosses (e.g. right after warmup).  The TTL
+                    # alone governs refresh timing in that case — avoiding a
+                    # thundering-herd where all symbols refresh simultaneously on
+                    # minute transitions.
+                    if last_final and (int(end_ts) - int(last_final)) > ONE_MIN_MS:
+                        need_refresh = True
+                if need_refresh:
                     await self.refresh(symbol, through_ts=end_ts)
                 else:
                     allow_fetch_present = False
+                    skip_present_fetch_due_to_ttl = True
 
         # Try to load from disk shards for this range before slicing memory
         try:
@@ -1716,15 +5165,100 @@ class CandlestickManager:
             return True
 
         fully_covered = _is_fully_covered(sub, start_ts, end_ts)
+        if skip_present_fetch_due_to_ttl and not fully_covered:
+            # TTL says data is fresh, but coverage is incomplete for requested range.
+            # Allow present fetch/gap fill to try and repair missing spans.
+            allow_fetch_present = True
+            try:
+                missing_now = self._missing_spans(sub, start_ts, end_ts)
+                self._log(
+                    "debug",
+                    "ttl_bypass_missing_coverage",
+                    symbol=symbol,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    max_age_ms=max_age_ms,
+                    last_refresh_ms=self._get_last_refresh_ms(symbol),
+                    missing_spans=len(missing_now),
+                )
+            except Exception:
+                pass
 
         # For historical ranges, if we don't have shards for all days yet, fetch
         # exactly the range and persist shards for future calls.
         end_finalized = latest_finalized
+
+        # Large span prefetch: If the request spans more than 2 days and is not fully
+        # covered, trigger archive prefetch for the historical portion even if end_ts
+        # touches the present. This fixes warmup requests that span 31 days but were
+        # previously skipping archive fetch because end_ts == latest_finalized.
+        span_minutes = (end_ts - start_ts) // ONE_MIN_MS
+        large_span_threshold = 2 * 24 * 60  # 2 days in minutes
+        archive_supported = self._archive_supported()
+        if not fully_covered and span_minutes > large_span_threshold:
+            self._log(
+                "debug",
+                "large_span_check",
+                symbol=symbol,
+                exchange_present=self.exchange is not None,
+                span_minutes=int(span_minutes),
+                fully_covered=fully_covered,
+                archive_supported=archive_supported,
+                sub_size=sub.size if hasattr(sub, "size") else 0,
+            )
+        if (
+            self.exchange is not None
+            and span_minutes > large_span_threshold
+            and not fully_covered
+            and archive_supported
+        ):
+            # Prefetch archives for the historical portion (up to 2 days ago, since
+            # archives typically lag by 1-2 days). Also respect the user's requested
+            # end_ts to avoid fetching beyond the requested date range.
+            archive_end_ts = min(end_finalized - 2 * 24 * 60 * ONE_MIN_MS, end_ts)
+            if start_ts < archive_end_ts:
+                self._log(
+                    "info",
+                    "large_span_archive_prefetch",
+                    symbol=symbol,
+                    span_minutes=int(span_minutes),
+                    start_ts=start_ts,
+                    archive_end_ts=archive_end_ts,
+                )
+                await self._prefetch_archives_for_range(symbol, start_ts, archive_end_ts)
+                # Reload from disk after archive fetch
+                try:
+                    self._load_from_disk(symbol, start_ts, end_ts, timeframe="1m")
+                except Exception:
+                    pass
+                arr = _ensure_dtype(self._cache.get(symbol, np.empty((0,), dtype=CANDLE_DTYPE)))
+                sub = self._slice_ts_range(arr, start_ts, end_ts) if arr.size else arr
+                fully_covered = _is_fully_covered(sub, start_ts, end_ts)
+
         # Treat ranges ending exactly at the latest finalized minute as present-touching
+        # UNLESS the span is large (>2 days) and not fully covered - then treat as historical
+        # to trigger gap filling via CCXT. This fixes warmup requests that span 31 days but
+        # were skipping gap detection because end_ts == latest_finalized.
         historical = end_ts < end_finalized
-        if self.exchange is not None and historical:
+        if (
+            not historical
+            and span_minutes > large_span_threshold
+            and not fully_covered
+            and self.exchange is not None
+        ):
+            self._log(
+                "debug",
+                "large_span_needs_gap_fill",
+                symbol=symbol,
+                span_minutes=int(span_minutes),
+                fully_covered=fully_covered,
+            )
+            historical = True
+        if self.exchange is not None and historical and not skip_historical_gap_fill:
             # If the requested historical window is not fully covered in memory,
             # attempt to fetch unknown missing spans, regardless of shard presence.
+            # Skip this if skip_historical_gap_fill is set (e.g., live warmup where
+            # we only need recent data and old gaps don't matter).
             if not fully_covered:
                 # Hyperliquid special case: cap lookback to last 5000 minutes
                 try:
@@ -1739,18 +5273,52 @@ class CandlestickManager:
                         if adj_start_ts <= gap_end:
                             self._add_known_gap(symbol, int(adj_start_ts), int(gap_end))
                         adj_start_ts = max(adj_start_ts, earliest)
+                if "gateio" in exid:
+                    earliest = int(
+                        end_finalized - ONE_MIN_MS * (_GATEIO_RECENT_1M_LIMIT_CANDLES - 1)
+                    )
+                    if adj_start_ts < earliest:
+                        gap_end = min(end_ts, earliest - ONE_MIN_MS)
+                        if adj_start_ts <= gap_end:
+                            self._record_verified_gap(
+                                symbol,
+                                int(adj_start_ts),
+                                int(gap_end),
+                                reason=GAP_REASON_NO_ARCHIVE,
+                            )
+                        if symbol not in self._gateio_recent_window_clip_warned:
+                            self._log(
+                                "warning",
+                                "gateio_ohlcv_recent_window_clipped",
+                                symbol=symbol,
+                                requested_start_ts=int(start_ts),
+                                requested_end_ts=int(end_ts),
+                                earliest_fetchable_ts=int(earliest),
+                                reason="gateio_public_1m_ohlcv_recent_window",
+                            )
+                            self._gateio_recent_window_clip_warned.add(symbol)
+                        adj_start_ts = max(adj_start_ts, earliest)
 
-                # Skip fetch if all missing spans are already known gaps
+                # Skip fetch if all missing spans are already known persistent gaps
                 missing_before = self._missing_spans(sub, start_ts, end_ts)
-                known = self._get_known_gaps(symbol)
 
-                def span_in_known(s: int, e: int) -> bool:
-                    for ks, ke in known:
-                        if s >= ks and e <= ke:
-                            return True
+                def span_in_persistent_gap(s: int, e: int) -> bool:
+                    """Check if span is fully contained in a persistent (max retries) gap.
+
+                    NOTE: We reload gaps fresh each call to avoid stale closures when
+                    _add_known_gap() is called within the same function context.
+                    """
+                    known_enhanced = self._get_known_gaps_enhanced(symbol)
+                    for gap in known_enhanced:
+                        if s >= gap["start_ts"] and e <= gap["end_ts"]:
+                            # Only consider it "known" if it's persistent (max retries reached)
+                            if not self._should_retry_gap(gap):
+                                return True
                     return False
 
-                unknown_missing = [(s, e) for (s, e) in missing_before if not span_in_known(s, e)]
+                unknown_missing = [
+                    (s, e) for (s, e) in missing_before if not span_in_persistent_gap(s, e)
+                ]
 
                 if unknown_missing:
                     end_excl = min(end_ts + ONE_MIN_MS, end_finalized + ONE_MIN_MS)
@@ -1766,43 +5334,170 @@ class CandlestickManager:
                             sub = self._slice_ts_range(arr, start_ts, end_ts) if arr.size else arr
                             missing_after = self._missing_spans(sub, start_ts, end_ts)
                             unknown_after = [
-                                (s, e) for (s, e) in missing_after if not span_in_known(s, e)
+                                (s, e) for (s, e) in missing_after if not span_in_persistent_gap(s, e)
                             ]
                             if unknown_after:
+                                # Only attempt archive prefetch for genuinely missing full days.
+                                await self._prefetch_archives_for_range(symbol, adj_start_ts, end_ts)
+                                try:
+                                    self._load_from_disk(symbol, start_ts, end_ts, timeframe="1m")
+                                except Exception:
+                                    pass
+                                arr = _ensure_dtype(
+                                    self._cache.get(symbol, np.empty((0,), dtype=CANDLE_DTYPE))
+                                )
+                                sub = self._slice_ts_range(arr, start_ts, end_ts) if arr.size else arr
+                                missing_after = self._missing_spans(sub, start_ts, end_ts)
+                                unknown_after = [
+                                    (s, e)
+                                    for (s, e) in missing_after
+                                    if not span_in_persistent_gap(s, e)
+                                ]
+                            if unknown_after:
                                 persisted_batches = False
+                                deferred_index_any = False
+                                flush_failed_once = False
 
                                 def _persist_hist_batch(batch: np.ndarray) -> None:
-                                    nonlocal persisted_batches
+                                    nonlocal persisted_batches, deferred_index_any
                                     persisted_batches = True
+                                    deferred_index_any = True
+                                    # Skip memory retention to preserve full historical data
                                     self._persist_batch(
                                         symbol,
                                         batch,
                                         timeframe="1m",
                                         merge_cache=True,
                                         last_refresh_ms=now,
+                                        defer_index=True,
+                                        skip_memory_retention=True,
                                     )
 
+                                self._log(
+                                    "debug",
+                                    "historical_missing_spans",
+                                    symbol=symbol,
+                                    spans=len(unknown_after),
+                                    first_start_ts=int(unknown_after[0][0]),
+                                    last_end_ts=int(unknown_after[-1][1]),
+                                )
+
+                                # Coalesce many small missing spans into per-day fetch windows.
+                                # This avoids thousands of tiny CCXT requests when gaps are fragmented.
+                                spans_to_fetch: List[Tuple[int, int]] = list(unknown_after)
                                 try:
-                                    fetched = await self._fetch_ohlcv_paginated(
-                                        symbol,
-                                        adj_start_ts,
-                                        end_excl,
-                                        on_batch=_persist_hist_batch,
-                                    )
-                                except TypeError:
-                                    fetched = await self._fetch_ohlcv_paginated(
-                                        symbol,
-                                        adj_start_ts,
-                                        end_excl,
-                                    )
-                                if fetched.size and not persisted_batches:
-                                    self._persist_batch(
-                                        symbol,
-                                        fetched,
-                                        timeframe="1m",
-                                        merge_cache=True,
-                                        last_refresh_ms=now,
-                                    )
+                                    day_windows: Dict[str, Tuple[int, int]] = {}
+                                    for s0, e0 in spans_to_fetch:
+                                        s = int(s0)
+                                        e = int(e0)
+                                        if e < s:
+                                            continue
+                                        while s <= e:
+                                            dk = self._date_key(s)
+                                            ds, de = self._date_range_of_key(dk)
+                                            w_start = max(int(ds), int(adj_start_ts))
+                                            w_end = min(int(de), int(end_ts))
+                                            if w_end >= w_start:
+                                                prev = day_windows.get(dk)
+                                                if prev is None:
+                                                    day_windows[dk] = (w_start, w_end)
+                                                else:
+                                                    day_windows[dk] = (
+                                                        min(int(prev[0]), w_start),
+                                                        max(int(prev[1]), w_end),
+                                                    )
+                                            s = int(de) + ONE_MIN_MS
+                                    spans_to_fetch = [
+                                        day_windows[k] for k in sorted(day_windows.keys())
+                                    ]
+                                    if len(spans_to_fetch) != len(unknown_after):
+                                        self._log(
+                                            "debug",
+                                            "historical_missing_spans_coalesced",
+                                            symbol=symbol,
+                                            spans_before=len(unknown_after),
+                                            spans_after=len(spans_to_fetch),
+                                        )
+                                except Exception:
+                                    spans_to_fetch = list(unknown_after)
+
+                                # Fetch only the missing spans (not the whole historical range).
+                                for s, e in spans_to_fetch:
+                                    s2 = max(int(s), int(adj_start_ts))
+                                    e2 = int(e)
+                                    if e2 < s2:
+                                        continue
+                                    span_end_excl = min(e2 + ONE_MIN_MS, end_excl)
+                                    if s2 >= span_end_excl:
+                                        continue
+                                    try:
+                                        fetched = await self._fetch_ohlcv_paginated(
+                                            symbol,
+                                            s2,
+                                            span_end_excl,
+                                            on_batch=_persist_hist_batch,
+                                        )
+                                    except TypeError:
+                                        fetched = await self._fetch_ohlcv_paginated(
+                                            symbol,
+                                            s2,
+                                            span_end_excl,
+                                        )
+                                    if deferred_index_any:
+                                        try:
+                                            self.flush_deferred_index(symbol, tf="1m")
+                                        except (
+                                            Exception
+                                        ) as exc:  # best-effort; keep fetching even if index update fails
+                                            if not flush_failed_once:
+                                                try:
+                                                    err_type = type(exc).__name__
+                                                    err_repr = repr(exc)
+                                                except Exception:
+                                                    err_type = "Exception"
+                                                    err_repr = "<unrepresentable exception>"
+                                                self._log(
+                                                    "warning",
+                                                    "flush_deferred_index_failed",
+                                                    symbol=symbol,
+                                                    timeframe="1m",
+                                                    error_type=err_type,
+                                                    error=err_repr,
+                                                )
+                                                flush_failed_once = True
+                                        deferred_index_any = False
+                                    if fetched.size and not persisted_batches:
+                                        # Skip memory retention to preserve full historical data
+                                        self._persist_batch(
+                                            symbol,
+                                            fetched,
+                                            timeframe="1m",
+                                            merge_cache=True,
+                                            last_refresh_ms=now,
+                                            defer_index=True,
+                                            skip_memory_retention=True,
+                                        )
+                                        try:
+                                            self.flush_deferred_index(symbol, tf="1m")
+                                        except (
+                                            Exception
+                                        ) as exc:  # best-effort; keep fetching even if index update fails
+                                            if not flush_failed_once:
+                                                try:
+                                                    err_type = type(exc).__name__
+                                                    err_repr = repr(exc)
+                                                except Exception:
+                                                    err_type = "Exception"
+                                                    err_repr = "<unrepresentable exception>"
+                                                self._log(
+                                                    "warning",
+                                                    "flush_deferred_index_failed",
+                                                    symbol=symbol,
+                                                    timeframe="1m",
+                                                    error_type=err_type,
+                                                    error=err_repr,
+                                                )
+                                                flush_failed_once = True
                             arr = (
                                 np.sort(self._cache[symbol], order="ts")
                                 if symbol in self._cache
@@ -1810,9 +5505,32 @@ class CandlestickManager:
                             )
                             sub = self._slice_ts_range(arr, start_ts, end_ts) if arr.size else arr
                             still_missing = self._missing_spans(sub, start_ts, end_ts)
+                            # Re-fetch authoritative lower bound after archive prefetch.
+                            authoritative_start_ts = self._get_authoritative_start_ts(symbol)
                             for s, e in still_missing:
-                                if not span_in_known(s, e):
-                                    self._add_known_gap(symbol, s, e)
+                                if not span_in_persistent_gap(s, e):
+                                    # Only mark pre_inception when we know a real authoritative
+                                    # lower bound for exchange-available history.
+                                    if (
+                                        authoritative_start_ts is not None
+                                        and e < authoritative_start_ts
+                                    ):
+                                        self._add_known_gap(
+                                            symbol,
+                                            s,
+                                            e,
+                                            reason="pre_inception",
+                                            retry_count=_GAP_MAX_RETRIES,  # Persistent immediately
+                                        )
+                                    else:
+                                        # Normal gap - will retry and eventually warn
+                                        self._add_known_gap(
+                                            symbol,
+                                            s,
+                                            e,
+                                            reason=GAP_REASON_FETCH_FAILED,
+                                            increment_retry=True,
+                                        )
         elif self.exchange is not None and allow_fetch_present:
             # Range touches present (end at or beyond current minute); fetch up to current minute inclusive
             end_current = _floor_minute(now)
@@ -1983,23 +5701,25 @@ class CandlestickManager:
             inclusive_end = end_ts if historical else min(end_ts, end_current)
             missing = self._missing_spans(sub, start_ts, inclusive_end)
             if missing:
-                known = self._get_known_gaps(symbol)
-
-                # Helper to test if a span is fully inside any known gap
-                def span_in_known(s: int, e: int) -> bool:
-                    for ks, ke in known:
-                        if s >= ks and e <= ke:
-                            return True
+                # Helper to test if a span is fully inside any persistent known gap
+                def span_in_persistent_gap_present(s: int, e: int) -> bool:
+                    """Check if span is in persistent gap. Reloads gaps to avoid stale data."""
+                    known_enhanced_present = self._get_known_gaps_enhanced(symbol)
+                    for gap in known_enhanced_present:
+                        if s >= gap["start_ts"] and e <= gap["end_ts"]:
+                            if not self._should_retry_gap(gap):
+                                return True
                     return False
 
                 # Attempt limited targeted fetches for unknown spans
                 attempts = 0
+                max_attempts = 10 if self._ccxt_since_exclusive else 3
                 attempted: List[Tuple[int, int]] = []
                 noresult: List[Tuple[int, int]] = []
                 for s, e in missing:
-                    if attempts >= 3:
+                    if attempts >= max_attempts:
                         break
-                    if span_in_known(s, e):
+                    if span_in_persistent_gap_present(s, e):
                         continue
                     end_excl_gap = e + ONE_MIN_MS
                     async with self._acquire_fetch_lock(symbol, "1m"):
@@ -2052,7 +5772,7 @@ class CandlestickManager:
                                     last_refresh_ms=now,
                                 )
                             arr = np.sort(self._cache[symbol], order="ts")
-                            sub = self._slice_ts_range(arr, start_ts, end_ts)
+                            sub = self._slice_ts_range(arr, start_ts, end_ts, assume_sorted=True)
                         else:
                             noresult.append((s, e))
                 # After attempts, recompute missing and tag remaining as known gaps
@@ -2064,8 +5784,46 @@ class CandlestickManager:
                         if not (e < ms or s > me):
                             self._add_known_gap(symbol, max(s, ms), min(e, me))
 
+        # Present-touching runtime path: if there were no trades in completed minutes,
+        # materialize zero-volume candles in RAM (not persisted).
+        if self.exchange is not None and not strict and end_ts >= latest_finalized:
+            synth_through = min(int(end_ts), int(latest_finalized))
+            if synth_through >= int(start_ts):
+                synthesized = self._materialize_runtime_synthetic_gap(symbol, synth_through)
+                if synthesized > 0:
+                    arr = _ensure_dtype(self._cache.get(symbol, np.empty((0,), dtype=CANDLE_DTYPE)))
+                    sub = self._slice_ts_range(arr, start_ts, end_ts) if arr.size else arr
+
         # Standardize gaps: synthesize zero-candles where missing.
-        result = self.standardize_gaps(sub, start_ts=start_ts, end_ts=end_ts, strict=strict)
+        # To help seed forward-fill, include one candle before start_ts if available.
+        # This ensures standardize_gaps has a prev_close even if sub starts after start_ts.
+        data_for_gaps = sub
+        if sub.size == 0 or (sub.size > 0 and int(sub[0]["ts"]) > start_ts):
+            full_arr = self._cache.get(symbol)
+            if full_arr is not None and full_arr.size > 0:
+                full_arr = _ensure_dtype(full_arr)
+                ts_idx = full_arr["ts"].astype(np.int64)
+                idx = int(np.searchsorted(ts_idx, start_ts, side="left"))
+                if idx > 0:
+                    seed_candle = full_arr[idx - 1 : idx]
+                    if sub.size > 0:
+                        data_for_gaps = np.concatenate([seed_candle, sub])
+                    else:
+                        data_for_gaps = seed_candle
+
+        result = self.standardize_gaps(
+            data_for_gaps,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            strict=strict,
+            fill_leading_gaps=fill_leading_gaps,
+            assume_sorted=True,
+            symbol=symbol,
+        )
+
+        # Log accumulated gap summaries (throttled)
+        self._log_persistent_gap_summary()
+        self._log_strict_gaps_summary()
 
         return result
 
@@ -2301,6 +6059,14 @@ class CandlestickManager:
         self._current_close_cache[symbol] = (float(price), int(now))
         return float(price)
 
+    def set_current_close(self, symbol: str, price: float, timestamp_ms: int) -> None:
+        """Inject a price into the current-close cache (e.g. from a bulk API call)."""
+        self._current_close_cache[symbol] = (float(price), int(timestamp_ms))
+
+    def is_rate_limited(self) -> bool:
+        """Return True if a global rate-limit backoff is active."""
+        return self._rate_limit_until > time.time()
+
     # ----- EMA helpers -----
 
     def _ema(self, values: np.ndarray, span: float) -> float:
@@ -2382,8 +6148,8 @@ class CandlestickManager:
     async def get_ema_bounds(
         self,
         symbol: str,
-        span_0: int,
-        span_1: int,
+        span_0: float,
+        span_1: float,
         max_age_ms: Optional[int] = None,
         *,
         timeframe: Optional[str] = None,
@@ -2391,12 +6157,13 @@ class CandlestickManager:
     ) -> Tuple[float, float]:
         """Return (lower, upper) bounds from EMAs at spans {span_0, span_1, span_2}.
 
-        span_2 = round(sqrt(span_0 * span_1)). Forwards timeframe and TTL to
-        get_latest_ema_close. Computes the three EMAs concurrently.
+        span_2 = sqrt(span_0 * span_1). Spans are treated as floats (no rounding),
+        matching the canonical EMA-alpha formulation `2/(span+1)`.
+        Forwards timeframe and TTL to get_latest_ema_close and computes the three EMAs concurrently.
         """
         from math import isfinite
 
-        s2 = int(round((float(span_0) * float(span_1)) ** 0.5))
+        s2 = (float(span_0) * float(span_1)) ** 0.5
         e0, e1, e2 = await asyncio.gather(
             self.get_latest_ema_close(
                 symbol, span_0, max_age_ms=max_age_ms, timeframe=timeframe, tf=tf
@@ -2415,11 +6182,37 @@ class CandlestickManager:
     async def get_last_prices(self, symbols: List[str], max_age_ms: int = 10_000) -> Dict[str, float]:
         """Return latest close for current minute per symbol.
 
-        Uses get_current_close per symbol with TTL. Returns 0.0 on failure.
+        Uses a cheap cache pass first, then one bulk ticker snapshot when safe,
+        and only falls back to per-symbol get_current_close for any leftovers.
+        Returns 0.0 on failure.
         """
         out: Dict[str, float] = {}
         if not symbols:
             return out
+
+        ordered_symbols = list(dict.fromkeys(symbols))
+        now = _utc_now_ms()
+        end_current = _floor_minute(now)
+
+        for symbol in ordered_symbols:
+            cached = self._get_last_price_cached_fast(
+                symbol,
+                now_ms=now,
+                end_current_ms=end_current,
+                max_age_ms=max_age_ms,
+            )
+            if cached is not None:
+                out[symbol] = cached
+
+        remaining = [s for s in ordered_symbols if s not in out]
+        if remaining:
+            bulk_prices = await self._get_last_prices_via_bulk_tickers(
+                remaining,
+                now_ms=now,
+            )
+            for symbol, price in bulk_prices.items():
+                if isinstance(price, (int, float)) and np.isfinite(float(price)) and float(price) > 0.0:
+                    out[symbol] = float(price)
 
         async def one(sym: str) -> float:
             try:
@@ -2428,14 +6221,128 @@ class CandlestickManager:
             except Exception:
                 return 0.0
 
-        tasks = {s: asyncio.create_task(one(s)) for s in symbols}
+        remaining = [s for s in ordered_symbols if s not in out]
+        tasks = {s: asyncio.create_task(one(s)) for s in remaining}
         for s, t in tasks.items():
             out[s] = await t
         return out
 
+    def _get_last_price_cached_fast(
+        self,
+        symbol: str,
+        *,
+        now_ms: int,
+        end_current_ms: int,
+        max_age_ms: Optional[int],
+    ) -> Optional[float]:
+        """Cheap non-fetching latest-price probe for bulk get_last_prices()."""
+        try:
+            if max_age_ms is not None and max_age_ms > 0:
+                prev = self._current_close_cache.get(symbol)
+                if prev is not None:
+                    price, updated = prev
+                    if (int(now_ms) - int(updated)) <= int(max_age_ms):
+                        self._log("debug", "get_last_prices_cache_hit", symbol=symbol)
+                        return float(price)
+        except Exception:
+            pass
+
+        try:
+            arr = self._cache.get(symbol)
+            if arr is None or not arr.size:
+                return None
+            arr_sorted = np.sort(_ensure_dtype(arr), order="ts")
+            last_ts = int(arr_sorted[-1]["ts"])
+            if last_ts == int(end_current_ms):
+                fresh_enough = True
+                if max_age_ms is not None and max_age_ms > 0:
+                    last_refresh = self._get_last_refresh_ms(symbol)
+                    fresh_enough = (int(now_ms) - int(last_refresh)) <= int(max_age_ms)
+                if fresh_enough:
+                    price = float(arr_sorted[-1]["c"])
+                    self._current_close_cache[symbol] = (price, int(now_ms))
+                    self._log("debug", "get_last_prices_mem_candle", symbol=symbol)
+                    return price
+        except Exception:
+            return None
+        return None
+
+    def _bulk_last_price_tickers_allowed(self) -> bool:
+        """Return True when bulk ticker snapshot is a safe latest-price fallback."""
+        ex = str(getattr(self, "exchange_name", "") or getattr(self, "_ex_id", "") or "").lower()
+        return ex not in {"hyperliquid"}
+
+    async def _get_last_prices_via_bulk_tickers(
+        self,
+        symbols: List[str],
+        *,
+        now_ms: int,
+    ) -> Dict[str, float]:
+        """Fetch latest prices for many symbols via one bulk ticker snapshot when safe."""
+        out: Dict[str, float] = {}
+        if (
+            len(symbols) <= 1
+            or self.exchange is None
+            or not hasattr(self.exchange, "fetch_tickers")
+            or not self._bulk_last_price_tickers_allowed()
+        ):
+            return out
+        self._log("debug", "get_last_prices_bulk_tickers_try", symbols=len(symbols))
+        fetched = None
+        try:
+            if getattr(self, "_net_sem", None) is not None:
+                async with self._net_sem:  # type: ignore[attr-defined]
+                    try:
+                        fetched = await self.exchange.fetch_tickers(symbols)
+                    except TypeError:
+                        fetched = await self.exchange.fetch_tickers()
+            else:
+                try:
+                    fetched = await self.exchange.fetch_tickers(symbols)
+                except TypeError:
+                    fetched = await self.exchange.fetch_tickers()
+        except Exception as exc:
+            self._log(
+                "debug",
+                "get_last_prices_bulk_tickers_failed",
+                symbols=len(symbols),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return out
+        if not isinstance(fetched, dict):
+            return out
+        hits = 0
+        for symbol in symbols:
+            tick = fetched.get(symbol)
+            if not isinstance(tick, dict):
+                continue
+            raw = tick.get("last")
+            if raw is None:
+                raw = tick.get("close")
+            if raw is None:
+                raw = tick.get("bid") or tick.get("ask")
+            try:
+                price = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(price) or price <= 0.0:
+                continue
+            out[symbol] = price
+            self._current_close_cache[symbol] = (price, int(now_ms))
+            hits += 1
+        self._log(
+            "debug",
+            "get_last_prices_bulk_tickers_ok",
+            symbols=len(symbols),
+            hits=hits,
+            misses=max(0, len(symbols) - hits),
+        )
+        return out
+
     async def get_ema_bounds_many(
         self,
-        items: List[Tuple[str, int, int]],
+        items: List[Tuple[str, float, float]],
         *,
         max_age_ms: Optional[int] = 60_000,
         timeframe: Optional[str] = None,
@@ -2449,7 +6356,7 @@ class CandlestickManager:
         if not items:
             return out
 
-        async def one(sym: str, s0: int, s1: int) -> Tuple[float, float]:
+        async def one(sym: str, s0: float, s1: float) -> Tuple[float, float]:
             try:
                 lo, hi = await self.get_ema_bounds(
                     sym, s0, s1, max_age_ms=max_age_ms, timeframe=timeframe, tf=tf
@@ -2591,6 +6498,118 @@ class CandlestickManager:
         cache[key] = (res, int(end_ts), int(now))
         return res
 
+    async def get_latest_ema_metrics(
+        self,
+        symbol: str,
+        spans_by_metric: Dict[str, float],
+        max_age_ms: Optional[int] = None,
+        *,
+        window_candles: Optional[int] = None,
+        timeframe: Optional[str] = None,
+        tf: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """Compute multiple latest-EMA metrics with a single candles fetch.
+
+        This is an optimization wrapper around get_candles() + EMA calculations. It preserves the
+        per-metric behavior of get_latest_ema_* helpers by:
+        - Using a single `get_candles()` call for the largest requested span.
+        - For 1m candles: applying gap standardization per metric window (same as get_candles()).
+        - Caching results in `self._ema_cache` per (metric, span, timeframe).
+        """
+        out: Dict[str, float] = {}
+        if not spans_by_metric:
+            return out
+
+        out_tf = timeframe if timeframe is not None else tf
+        period_ms = _tf_to_ms(out_tf)
+        # Use the largest span to fetch a superset window.
+        max_span = max(float(s) for s in spans_by_metric.values())
+        max_candles = max(1, int(math.ceil(max_span)))
+        start_ts, end_ts = await self._latest_finalized_range(max_span, period_ms=period_ms)
+        if window_candles is not None:
+            try:
+                lookback = max(1, int(window_candles))
+                start_ts = int(end_ts - period_ms * (lookback - 1))
+            except Exception:
+                pass
+        now = _utc_now_ms()
+        tf_key = str(period_ms)
+
+        cache = self._ema_cache.setdefault(symbol, {})
+        missing: List[str] = []
+        for metric_key, span in spans_by_metric.items():
+            key = (str(metric_key), float(span), tf_key)
+            if max_age_ms is not None and max_age_ms > 0 and key in cache:
+                val, cached_end_ts, computed_at = cache[key]
+                if int(cached_end_ts) == int(end_ts) and (now - int(computed_at)) <= int(max_age_ms):
+                    out[str(metric_key)] = float(val)
+                    continue
+            missing.append(str(metric_key))
+
+        if not missing:
+            return out
+
+        # Fetch raw candles for the superset range once.
+        # For 1m, we re-apply standardize_gaps per metric window to match per-call behavior.
+        raw = await self.get_candles(
+            symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            max_age_ms=max_age_ms,
+            strict=True if period_ms == ONE_MIN_MS else False,
+            timeframe=out_tf,
+            max_lookback_candles=window_candles,
+        )
+        if raw.size == 0:
+            for metric_key in missing:
+                out[metric_key] = float("nan")
+            return out
+
+        def series_for(metric_key: str, arr: np.ndarray) -> np.ndarray:
+            if metric_key == "volume":
+                return np.asarray(arr["bv"], dtype=np.float64)
+            if metric_key == "qv":
+                return (
+                    np.asarray(arr["bv"], dtype=np.float64)
+                    * (
+                        np.asarray(arr["h"], dtype=np.float64)
+                        + np.asarray(arr["l"], dtype=np.float64)
+                        + np.asarray(arr["c"], dtype=np.float64)
+                    )
+                    / 3.0
+                )
+            if metric_key == "log_range":
+                return np.log(
+                    np.maximum(np.asarray(arr["h"], dtype=np.float64), 1e-12)
+                    / np.maximum(np.asarray(arr["l"], dtype=np.float64), 1e-12)
+                )
+            if metric_key == "close":
+                return np.asarray(arr["c"], dtype=np.float64)
+            raise KeyError(f"Unknown EMA metric_key {metric_key!r}")
+
+        for metric_key in missing:
+            span = float(spans_by_metric[metric_key])
+            span_candles = max(1, int(math.ceil(span)))
+            # Get window ending at end_ts. Prefer slicing by tail length; if data is short, use what we have.
+            tail = raw[-span_candles:] if raw.size > span_candles else raw
+            if period_ms == ONE_MIN_MS:
+                # Re-apply gap standardization on the requested metric window.
+                # This matches get_candles(strict=False) behavior for the same [start,end] window.
+                # tail is a slice of sorted get_candles output, so assume_sorted=True
+                metric_start_ts = int(end_ts - period_ms * (span_candles - 1))
+                tail = self.standardize_gaps(
+                    tail, start_ts=metric_start_ts, end_ts=end_ts, strict=False, assume_sorted=True
+                )
+            if tail.size == 0:
+                out[metric_key] = float("nan")
+                continue
+            series = series_for(metric_key, tail)
+            res = float(self._ema(series, span))
+            out[metric_key] = res
+            cache[(metric_key, span, tf_key)] = (res, int(end_ts), int(now))
+
+        return out
+
     async def get_latest_ema_log_range(
         self,
         symbol: str,
@@ -2716,14 +6735,20 @@ class CandlestickManager:
         if through_ts is not None:
             end_exclusive = min(end_exclusive, _floor_minute(int(through_ts)) + ONE_MIN_MS)
 
+        # Refresh only needs to reconcile recent on-disk candles to avoid unnecessary
+        # full-history loads/sorts. Historical ranges are handled on-demand via get_candles().
+        lookback_candles = max(int(self.default_window_candles), int(self.overlap_candles)) + 10
+        disk_since = max(0, int(end_exclusive) - int(lookback_candles) * ONE_MIN_MS)
+
         try:
-            self._load_from_disk(symbol, 0, end_exclusive, timeframe="1m")
+            self._load_from_disk(symbol, disk_since, end_exclusive, timeframe="1m")
         except Exception:
             pass
 
         existing = self._ensure_symbol_cache(symbol)
-        existing_sorted = np.sort(existing, order="ts") if existing.size else existing
-        existing_last_ts = int(existing_sorted[-1]["ts"]) if existing_sorted.size else None
+        existing_last_ts = (
+            int(np.asarray(existing["ts"], dtype=np.int64).max()) if existing.size else None
+        )
         if existing.size == 0:
             proposed_since = end_exclusive - self.default_window_candles * ONE_MIN_MS
         else:
@@ -2752,13 +6777,14 @@ class CandlestickManager:
         async with self._acquire_fetch_lock(symbol, "1m"):
             # Re-evaluate with lock in case another process already fetched.
             try:
-                self._load_from_disk(symbol, 0, end_exclusive, timeframe="1m")
+                self._load_from_disk(symbol, disk_since, end_exclusive, timeframe="1m")
             except Exception:
                 pass
 
             existing = self._ensure_symbol_cache(symbol)
-            existing_sorted = np.sort(existing, order="ts") if existing.size else existing
-            existing_last_ts = int(existing_sorted[-1]["ts"]) if existing_sorted.size else None
+            existing_last_ts = (
+                int(np.asarray(existing["ts"], dtype=np.int64).max()) if existing.size else None
+            )
             if existing.size == 0:
                 since = end_exclusive - self.default_window_candles * ONE_MIN_MS
             else:
@@ -2816,6 +6842,8 @@ class CandlestickManager:
             except TypeError:
                 new_arr = await self._fetch_ohlcv_paginated(symbol, since, end_exclusive)
             if new_arr.size == 0:
+                # Keep finalized runtime candles contiguous even if there were no fills.
+                self._materialize_runtime_synthetic_gap(symbol, end_exclusive - ONE_MIN_MS)
                 return None
             if not persisted_batches:
                 self._persist_batch(
@@ -2837,6 +6865,7 @@ class CandlestickManager:
         *,
         timeframe: Optional[str] = None,
         tf: Optional[str] = None,
+        defer_index: bool = False,
     ) -> None:
         """Save shard as .npy and update index.json atomically.
 
@@ -2848,6 +6877,8 @@ class CandlestickManager:
             YYYY-MM-DD string used as shard filename.
         array : np.ndarray
             Structured array of dtype CANDLE_DTYPE to write.
+        defer_index : bool
+            If True, skip writing index.json (caller must call flush_deferred_index later).
         """
         arr = _ensure_dtype(array)
         if arr.size == 0:
@@ -2858,6 +6889,31 @@ class CandlestickManager:
         crc = int(zlib.crc32(data_bytes) & 0xFFFFFFFF)
 
         tf_norm = self._normalize_timeframe_arg(timeframe, tf)
+
+        # If legacy already has a continuous 1m day shard, skip writing this primary shard.
+        # Primary should only fill legacy gaps.
+        if tf_norm == "1m":
+            try:
+                if self._legacy_day_is_complete(symbol, tf_norm, date_key):
+                    return
+            except (
+                Exception
+            ) as exc:  # best-effort; legacy cache may be unreadable, fall back to primary write
+                try:
+                    err_type = type(exc).__name__
+                    err_repr = repr(exc)
+                except Exception:
+                    err_type = "Exception"
+                    err_repr = "<unrepresentable exception>"
+                self._log(
+                    "warning",
+                    "legacy_day_quality_check_failed",
+                    symbol=symbol,
+                    timeframe=tf_norm,
+                    day=date_key,
+                    error_type=err_type,
+                    error=err_repr,
+                )
         shard_path = self._shard_path(symbol, date_key, tf=tf_norm)
         os.makedirs(os.path.dirname(shard_path), exist_ok=True)
         # Write .npy content atomically
@@ -2869,7 +6925,12 @@ class CandlestickManager:
             os.fsync(f.fileno())
         os.replace(tmp_path, shard_path)
 
-        # Update index
+        # Update shard paths cache directly instead of invalidating (avoids re-scan)
+        cache_key = (symbol, tf_norm)
+        if cache_key in self._shard_paths_cache:
+            self._shard_paths_cache[cache_key][date_key] = shard_path
+
+        # Update in-memory index
         idx = self._ensure_symbol_index(symbol, tf=tf_norm)
         shards = idx.setdefault("shards", {})
         shards[date_key] = {
@@ -2881,8 +6942,26 @@ class CandlestickManager:
         }
         key = f"{symbol}::{tf_norm}"
         self._index[key] = idx
+
+        # Write index to disk unless deferred
+        if not defer_index:
+            self._save_index(symbol, tf=tf_norm)
+            # Enforce disk retention per timeframe after writing this shard
+            try:
+                self._enforce_disk_retention(symbol, tf=tf_norm)
+            except Exception:
+                pass
+
+    def flush_deferred_index(
+        self,
+        symbol: str,
+        *,
+        timeframe: Optional[str] = None,
+        tf: Optional[str] = None,
+    ) -> None:
+        """Flush any deferred index updates for a symbol to disk."""
+        tf_norm = self._normalize_timeframe_arg(timeframe, tf)
         self._save_index(symbol, tf=tf_norm)
-        # Enforce disk retention per timeframe after writing this shard
         try:
             self._enforce_disk_retention(symbol, tf=tf_norm)
         except Exception:
@@ -2890,15 +6969,36 @@ class CandlestickManager:
 
     # ----- Context manager and shutdown -----
 
+    async def aclose(self) -> None:
+        """Async close: flush and close resources including HTTP session."""
+        await self._close_http_session()
+
     def close(self) -> None:
-        """Flush and close resources. Currently a no-op for tests."""
-        return None
+        """Sync close: attempt to close HTTP session if event loop is running."""
+        # Try to close HTTP session synchronously if possible
+        if self._http_session is not None and not self._http_session.closed:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Schedule cleanup but don't wait
+                    asyncio.create_task(self._close_http_session())
+                else:
+                    loop.run_until_complete(self._close_http_session())
+            except Exception:
+                pass  # Best effort cleanup
 
     def __enter__(self):  # pragma: no cover - not exercised by tests
         return self
 
     def __exit__(self, exc_type, exc, tb):  # pragma: no cover - not exercised by tests
         self.close()
+        return False
+
+    async def __aenter__(self):  # pragma: no cover
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):  # pragma: no cover
+        await self.aclose()
         return False
 
 
