@@ -3,9 +3,11 @@ from copy import deepcopy
 from typing import Any, Dict, Iterable, Optional
 
 from utils import format_end_date, normalize_coins_source, symbol_to_coin
+from optimization.random_seed import normalize_optional_seed
 
 from .limits import _resolve_optimize_limits_for_load
 from .log_output import log_config_message
+from .optimize_bounds import sort_optimize_bounds_in_place
 from .scoring import extract_objective_specs
 from .schema import get_template_config
 from .tree_ops import add_missing_keys_recursively, remove_unused_keys_recursively
@@ -15,8 +17,11 @@ Path = tuple[str, ...]
 
 PARTIALLY_OPEN_CONFIG_PATHS: set[Path] = {
     ("backtest", "aggregate"),
+    ("live", "startup_phase_budgets"),
 }
 BACKTEST_INHERITED_LIVE_KEYS: tuple[str, ...] = (
+    "fee_pct_fallback",
+    "fee_pct_sanity_abs_max",
     "market_orders_allowed",
     "market_order_near_touch_threshold",
     "pnls_max_lookback_days",
@@ -26,6 +31,7 @@ TEMPLATE_SYNC_PRESERVE_PATHS: tuple[Path, ...] = (
     ("coin_overrides",),
     ("backtest", "suite", "aggregate"),
     ("backtest", "suite", "scenarios"),
+    ("backtest", "market_settings"),
     ("backtest", "market_settings_sources"),
     *tuple(PARTIALLY_OPEN_CONFIG_PATHS),
 )
@@ -64,7 +70,10 @@ def seed_missing_compatibility_sections(template: dict, result: dict, *, tracker
             seeded = deepcopy(template["bot"][pside])
             # A fully omitted side should stay disabled after hydration instead of inheriting
             # whichever exposure default happens to be in the schema.
-            seeded["total_wallet_exposure_limit"] = 0.0
+            if isinstance(seeded.get("risk"), dict):
+                seeded["risk"]["total_wallet_exposure_limit"] = 0.0
+            else:
+                seeded["total_wallet_exposure_limit"] = 0.0
             result["bot"][pside] = seeded
             if tracker is not None:
                 tracker.add(["bot", pside], seeded)
@@ -124,11 +133,6 @@ def sync_with_template(
         template["optimize"]["bounds"],
         result["optimize"]["bounds"],
         verbose=verbose,
-        preserve=[
-            (key,)
-            for key in result["optimize"]["bounds"]
-            if isinstance(key, str) and key.startswith("live_")
-        ],
         tracker=tracker,
     )
     remove_unused_keys_recursively(
@@ -222,6 +226,11 @@ def apply_non_live_adjustments(
     if population_size is not None and population_size <= 0:
         raise ValueError("optimize.population_size must be > 0 when set")
     result["optimize"]["population_size"] = population_size
+    objective_scenario = result["optimize"].get("objective_scenario")
+    if objective_scenario is not None:
+        objective_scenario = str(objective_scenario).strip() or None
+    result["optimize"]["objective_scenario"] = objective_scenario
+    result["optimize"]["seed"] = normalize_optional_seed(result["optimize"].get("seed"))
 
     current_limits = deepcopy(result["optimize"].get("limits", []))
     limits_snapshot = deepcopy(current_limits)
@@ -254,9 +263,7 @@ def apply_non_live_adjustments(
         )
         if tracker is not None:
             tracker.update(["optimize", "limits"], limits_snapshot, resolved_limits)
-    for key, value in sorted(result["optimize"]["bounds"].items()):
-        if isinstance(value, list):
-            if len(value) == 1:
-                result["optimize"]["bounds"][key] = [value[0], value[0]]
-            elif len(value) == 2:
-                result["optimize"]["bounds"][key] = sorted(value)
+    sort_optimize_bounds_in_place(
+        result["optimize"]["bounds"],
+        strategy_kind=result.get("live", {}).get("strategy_kind"),
+    )

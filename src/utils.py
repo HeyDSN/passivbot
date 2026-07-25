@@ -8,6 +8,7 @@ import asyncio
 import hjson
 import inspect
 import time
+import warnings
 from collections import defaultdict
 from typing import Dict, Any, List, Union, Optional
 import re
@@ -18,6 +19,10 @@ import portalocker  # type: ignore
 from custom_endpoint_overrides import (
     apply_rest_overrides_to_ccxt,
     resolve_custom_endpoint_override,
+)
+
+warnings.filterwarnings(
+    "ignore", message="timeout has no effect in blocking mode", module="portalocker"
 )
 
 logging.basicConfig(
@@ -87,7 +92,7 @@ def _cleanup_stale_symbol_map_locks() -> None:
                 age = now - stat.st_mtime
                 if age > threshold:
                     lock_path.unlink()
-                    logging.info("removed stale symbol map lock %s (age %.1fs)", lock_path, age)
+                    logging.debug("removed stale symbol map lock %s (age %.1fs)", lock_path, age)
             except FileNotFoundError:
                 continue
             except Exception as exc:
@@ -294,7 +299,7 @@ def dump_json_streamlined(
     *,
     indent: int = 4,
     max_inline: int = 60,
-    separators: tuple[str, str] = (",", ":"),
+    separators: tuple[str, str] = (", ", ": "),
     sort_keys: bool = False,
 ) -> None:
     """
@@ -327,7 +332,7 @@ def json_dumps_streamlined(
     *,
     indent: int = 4,
     max_inline: int = 60,
-    separators: tuple[str, str] = (",", ":"),
+    separators: tuple[str, str] = (", ", ": "),
     sort_keys: bool = False,
 ) -> str:
     """Return the streamlined JSON string (like ``dump_json_streamlined`` but in-memory)."""
@@ -493,9 +498,9 @@ async def load_markets(
     Note: Uses the exchange name as-is (e.g., "binance" not "binanceusdm") for
     consistency with other cache paths (pnls, ohlcv, fill_events).
     """
-    # Prefer cc.id when a ccxt instance is supplied, otherwise use the provided exchange string.
-    # Denormalize to use canonical form for cache paths (e.g., "binance" not "binanceusdm")
-    ex = to_standard_exchange_name(getattr(cc, "id", None) or exchange or "")
+    # The explicit exchange name is the canonical cache identity. A supplied
+    # client's library id may differ (for example Gate.io is ``gate`` in CCXT).
+    ex = to_standard_exchange_name(exchange or getattr(cc, "id", None) or "")
     markets_path = os.path.join("caches", ex, "markets.json")
 
     # Try cache first
@@ -574,6 +579,12 @@ def to_ccxt_exchange_id(exchange: str) -> str:
     return ex
 
 
+def to_ccxt_client_id(exchange: str) -> str:
+    """Return the CCXT class id used only when constructing a client session."""
+    exchange_id = to_ccxt_exchange_id(exchange)
+    return "gate" if exchange_id == "gateio" else exchange_id
+
+
 def to_standard_exchange_name(exchange: str) -> str:
     """
     Convert a ccxt exchange id to the canonical short form used in configs, caches, and logs.
@@ -639,6 +650,8 @@ def load_ccxt_instance(exchange_id: str, enable_rate_limit: bool = True, timeout
         raise RuntimeError(f"ccxt exchange '{ex}' not available")
     try:
         cc.options["defaultType"] = "swap"
+        if ex == "okx":
+            cc.options["fetchMarkets"] = {"types": ["swap"]}
         if ex == "hyperliquid":
             # Include HIP-3 stock perps from TradeXYZ
             cc.options["fetchMarkets"] = {
@@ -649,11 +662,8 @@ def load_ccxt_instance(exchange_id: str, enable_rate_limit: bool = True, timeout
             }
     except Exception:
         pass
-    try:
-        override = resolve_custom_endpoint_override(ex)
-        apply_rest_overrides_to_ccxt(cc, override)
-    except Exception as exc:
-        logging.warning("Failed to apply custom endpoint override for %s: %s", ex, exc)
+    override = resolve_custom_endpoint_override(ex)
+    apply_rest_overrides_to_ccxt(cc, override)
     return cc
 
 

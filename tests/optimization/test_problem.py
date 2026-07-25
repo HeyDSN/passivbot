@@ -40,6 +40,18 @@ class SingleObjectiveEvaluator:
         )
 
 
+class PayloadEvaluator:
+    limit_checks = []
+
+    def evaluate(self, vector, overrides_list):
+        return {
+            "fitness": (-2.0,),
+            "constraint_violation": 0.0,
+            "metrics": {"objectives": {"w_0": -2.0}},
+            "evaluation_vector": [0.42, float(vector[1])],
+        }
+
+
 class FakeAsyncResult:
     def __init__(self, value):
         self._value = value
@@ -54,6 +66,19 @@ class FakeAsyncResult:
 class FakeAsyncPool:
     def apply_async(self, fn, args=()):
         return FakeAsyncResult(fn(*args))
+
+
+class NeverReadyAsyncResult:
+    def ready(self):
+        return False
+
+
+class DeadWorkerPool:
+    def __init__(self):
+        self._pool = [type("DeadWorker", (), {"pid": 123, "exitcode": -9})()]
+
+    def apply_async(self, fn, args=()):
+        return NeverReadyAsyncResult()
 
 
 class PickleCheckingPool(FakeAsyncPool):
@@ -97,6 +122,21 @@ def test_problem_without_constraints_omits_g():
     assert out["F"].tolist() == [-1.5]
 
 
+def test_problem_accepts_shared_evaluation_payload_vector():
+    adapter = PymooEvaluatorAdapter(PayloadEvaluator())
+    problem = PassivbotProblem(
+        bounds=[Bound(0.0, 1.0), Bound(0.0, 2.0)],
+        scoring_keys=["adg"],
+        evaluator_adapter=adapter,
+    )
+
+    out = {}
+    problem._evaluate(np.asarray([0.7, 1.1]), out)
+
+    assert out["F"].tolist() == [-2.0]
+    assert out["evaluation_vector"].tolist() == [0.42, 1.1]
+
+
 def test_async_recording_runner_records_and_strips_metrics():
     evaluator = FakeEvaluator(has_constraints=True)
     recorder = MagicMock()
@@ -124,6 +164,63 @@ def test_async_recording_runner_records_and_strips_metrics():
     assert recorder.record.call_count == 2
 
 
+def test_async_recording_runner_does_not_reseed_parent_numpy_rng():
+    evaluator = FakeEvaluator(has_constraints=True)
+    recorder = MagicMock()
+    runner = PymooAsyncRecordingRunner(
+        evaluator=evaluator,
+        has_constraints=True,
+        n_obj=2,
+        pool=FakeAsyncPool(),
+        recorder=recorder,
+        template={"optimize": {"backend": "pymoo"}},
+        build_config_fn=lambda vector, overrides_fn, overrides_list, template: {
+            "bot": {"long": {"a": float(vector[0])}},
+            "backtest": {"coins": {"binance": ["BTC/USDT:USDT"]}},
+            **template,
+        },
+        overrides_fn=object(),
+        overrides_list=["x"],
+    )
+    np.random.seed(42)
+    before = np.random.get_state()
+
+    runner(object(), [np.asarray([0.25])])
+
+    after = np.random.get_state()
+    assert before[0] == after[0]
+    assert np.array_equal(before[1], after[1])
+    assert before[2:] == after[2:]
+
+
+def test_async_recording_runner_profiles_record_result_when_enabled(monkeypatch, caplog):
+    evaluator = FakeEvaluator(has_constraints=True)
+    recorder = MagicMock()
+    runner = PymooAsyncRecordingRunner(
+        evaluator=evaluator,
+        has_constraints=True,
+        n_obj=2,
+        pool=FakeAsyncPool(),
+        recorder=recorder,
+        template={"optimize": {"backend": "pymoo"}},
+        build_config_fn=lambda vector, overrides_fn, overrides_list, template: {
+            "bot": {"long": {"a": float(vector[0])}},
+            "backtest": {"coins": {"binance": ["BTC/USDT:USDT"]}},
+            **template,
+        },
+        overrides_fn=object(),
+        overrides_list=["x"],
+    )
+
+    monkeypatch.setenv("PASSIVBOT_OPTIMIZE_PROFILE", "1")
+    with caplog.at_level("INFO"):
+        results = runner(object(), [np.asarray([0.25])])
+
+    assert len(results) == 1
+    assert recorder.record.call_count == 1
+    assert any("[opt-profile] record_result_ms=" in record.message for record in caplog.records)
+
+
 def test_async_recording_runner_uses_picklable_worker_target():
     evaluator = FakeEvaluator(has_constraints=True)
     recorder = MagicMock()
@@ -148,3 +245,51 @@ def test_async_recording_runner_uses_picklable_worker_target():
     assert len(results) == 1
     assert results[0]["F"].tolist() == [-1.5, 0.2]
     assert results[0]["G"].tolist() == [0.3]
+
+
+def test_async_recording_runner_surfaces_base_exception_from_worker():
+    class WorkerPanic(BaseException):
+        pass
+
+    class FailingEvaluator:
+        limit_checks = []
+
+        def evaluate(self, vector, overrides_list):
+            raise WorkerPanic("unexpected rust panic")
+
+    runner = PymooAsyncRecordingRunner(
+        evaluator=FailingEvaluator(),
+        has_constraints=False,
+        n_obj=1,
+        pool=FakeAsyncPool(),
+        recorder=MagicMock(),
+        template={"optimize": {"backend": "pymoo"}},
+        build_config_fn=MagicMock(),
+        overrides_fn=object(),
+    )
+
+    with np.testing.assert_raises_regex(
+        RuntimeError,
+        "batch index 0: WorkerPanic: unexpected rust panic",
+    ):
+        runner(object(), [np.asarray([0.25])])
+
+
+def test_async_recording_runner_fails_when_pool_worker_exits():
+    runner = PymooAsyncRecordingRunner(
+        evaluator=SingleObjectiveEvaluator(),
+        has_constraints=False,
+        n_obj=1,
+        pool=DeadWorkerPool(),
+        recorder=MagicMock(),
+        template={"optimize": {"backend": "pymoo"}},
+        build_config_fn=MagicMock(),
+        overrides_fn=object(),
+        poll_interval_seconds=0.0,
+    )
+
+    with np.testing.assert_raises_regex(
+        RuntimeError,
+        "pymoo worker exited.*pid=123 exitcode=-9",
+    ):
+        runner(object(), [np.asarray([0.25])])

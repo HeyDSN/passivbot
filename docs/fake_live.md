@@ -16,6 +16,16 @@ The harness runs the normal live bot against a fake exchange adapter.
 - Rust still owns order behavior.
 - The exchange state, prices, candles, fills, and time all come from a local scenario file.
 
+The harness is deterministic and offline. `FakeCCXTClient` serves market metadata, candles,
+tickers, account state, fills, creates, and cancels from the scenario in memory; it does not call a
+real exchange or require exchange credentials. A fake user entry may be stored in the same local
+configuration file as real users, but it needs no API key or secret.
+
+Do not use “fake-live” as a label for authenticated testnet, demo, sandbox, or paper-trading
+sessions. Those modes may load credentials, contact an exchange, configure account state, and
+create or cancel orders. Public unauthenticated candle/market probes also use the network even
+though they do not access an account.
+
 The entry point is:
 
 ```shell
@@ -56,9 +66,20 @@ Each run writes a timestamped directory containing:
 - `fills.json`
 - `positions.json`
 - `hsl_trace.json`
+- `live_events.json`: redacted structured `LiveEvent.to_dict()` envelopes, including graceful
+  shutdown
 - `snapshots/step_*.json` if `--snapshot-each-step` is enabled
 
 This makes it easy to inspect the exact replay state at each step.
+
+`live_events.json` is a bounded in-memory diagnostic capture of at most the latest 2,000 envelopes,
+attached to the existing live-event pipeline before bot startup.
+`run_metadata.json.live_event_capture` records the total, retained, truncated, and maximum retained
+counts so dropping older envelopes is explicit. If disabled console and monitor output leave no
+default pipeline, fake-live installs a capture-only pipeline with the same bot context; it does not
+re-enable either output. The capture closes with the bot before serialization and contains no raw
+exchange payloads. Event IDs and timestamps are runtime-specific, so this file is not part of
+deterministic cross-run artifact comparison.
 
 Regression philosophy:
 
@@ -127,9 +148,9 @@ Minimal shape example:
 
 See:
 
-- [`hsl_long_red_restart.hjson`](../scenarios/fake_live/hsl_long_red_restart.hjson)
-- [`hsl_long_terminal_no_restart.hjson`](../scenarios/fake_live/hsl_long_terminal_no_restart.hjson)
-- [`minimal.hjson`](../scenarios/fake_live/minimal.hjson)
+- `scenarios/fake_live/hsl_long_red_restart.hjson`
+- `scenarios/fake_live/hsl_long_terminal_no_restart.hjson`
+- `scenarios/fake_live/minimal.hjson`
 
 ## HSL Replay Notes
 
@@ -180,7 +201,7 @@ The fake exchange can be selected through `api-keys.json` style user info:
 }
 ```
 
-[`api-keys.json.example`](../api-keys.json.example) does not ship with a fake entry by default.
+`api-keys.json.example` does not ship with a fake entry by default.
 Add one to your local `api-keys.json` when you want a reusable fake user.
 
 ## Troubleshooting
@@ -204,3 +225,7 @@ Common issues:
 Use the fake harness when you need live-loop realism with deterministic local inputs.
 
 Use the Rust backtester when you need broad historical evaluation, optimizer runs, or performance analysis over long date ranges.
+
+Use public-network probes only when current exchange metadata or endpoint behavior is necessary.
+Use authenticated testnet, demo, paper, or live sessions only with explicit human approval and a
+clearly named account and exchange target.

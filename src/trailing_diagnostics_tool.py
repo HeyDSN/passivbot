@@ -9,17 +9,59 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from config import load_prepared_config
-from trailing_diagnostics import (
-    CLOSE_CONFIG_KEYS,
-    ENTRY_CONFIG_KEYS,
-    NUMERIC_INPUT_KEYS,
-    TRAILING_EXTREMA_KEYS,
-    build_trailing_diagnostic,
-    build_trailing_inputs_from_snapshot,
-    snapshot_payload,
-)
+ENTRY_CONFIG_KEYS = [
+    "entry_grid_double_down_factor",
+    "entry_grid_spacing_volatility_weight",
+    "entry_grid_spacing_we_weight",
+    "entry_grid_spacing_pct",
+    "entry_initial_ema_dist",
+    "entry_initial_qty_pct",
+    "entry_trailing_double_down_factor",
+    "entry_trailing_retracement_pct",
+    "entry_trailing_retracement_we_weight",
+    "entry_trailing_retracement_volatility_weight",
+    "entry_trailing_threshold_pct",
+    "entry_trailing_threshold_we_weight",
+    "entry_trailing_threshold_volatility_weight",
+    "wallet_exposure_limit",
+    "total_wallet_exposure_limit",
+    "risk_we_excess_allowance_pct",
+]
 
+CLOSE_CONFIG_KEYS = [
+    "close_grid_qty_pct",
+    "close_trailing_qty_pct",
+    "close_trailing_retracement_pct",
+    "close_trailing_threshold_pct",
+    "wallet_exposure_limit",
+    "total_wallet_exposure_limit",
+    "risk_we_excess_allowance_pct",
+    "risk_wel_enforcer_threshold",
+]
+
+TRAILING_EXTREMA_KEYS = [
+    "min_since_open",
+    "max_since_min",
+    "max_since_open",
+    "min_since_max",
+]
+
+NUMERIC_INPUT_KEYS = [
+    "balance_raw",
+    "current_price",
+    "position_size",
+    "position_price",
+    "qty_step",
+    "price_step",
+    "min_qty",
+    "min_cost",
+    "c_mult",
+    "ema_lower",
+    "ema_upper",
+    "h1_log_range_ema",
+    *TRAILING_EXTREMA_KEYS,
+    *sorted(set(ENTRY_CONFIG_KEYS + CLOSE_CONFIG_KEYS)),
+]
 
 EDITABLE_INPUT_KEYS = [
     "balance_raw",
@@ -47,17 +89,16 @@ WIZARD_CORE_KEYS = [
     "ema_lower",
     "ema_upper",
     "h1_log_range_ema",
+    "m1_log_range_ema",
     *TRAILING_EXTREMA_KEYS,
     "wallet_exposure_limit",
+    "total_wallet_exposure_limit",
     "risk_we_excess_allowance_pct",
-    "entry_trailing_grid_ratio",
     "entry_trailing_threshold_pct",
-    "entry_trailing_threshold_we_weight",
-    "entry_trailing_threshold_volatility_weight",
     "entry_trailing_retracement_pct",
-    "entry_trailing_retracement_we_weight",
-    "entry_trailing_retracement_volatility_weight",
-    "close_trailing_grid_ratio",
+    "entry_weight_volatility_1h",
+    "entry_weight_volatility_1m",
+    "entry_we_weight",
     "close_trailing_qty_pct",
     "close_trailing_threshold_pct",
     "close_trailing_retracement_pct",
@@ -70,17 +111,42 @@ WIZARD_ADVANCED_KEYS = [
     "min_cost",
     "c_mult",
     "entry_grid_double_down_factor",
-    "entry_grid_spacing_volatility_weight",
-    "entry_grid_spacing_we_weight",
     "entry_grid_spacing_pct",
+    "entry_weight_volatility_1h",
+    "entry_weight_volatility_1m",
+    "entry_we_weight",
     "entry_initial_ema_dist",
     "entry_initial_qty_pct",
     "entry_trailing_double_down_factor",
-    "close_grid_markup_end",
-    "close_grid_markup_start",
     "close_grid_qty_pct",
     "risk_wel_enforcer_threshold",
 ]
+
+
+def load_prepared_config(*args, **kwargs):
+    from config import load_prepared_config as _load_prepared_config
+
+    return _load_prepared_config(*args, **kwargs)
+
+
+def build_trailing_diagnostic(*args, **kwargs):
+    from trailing_diagnostics import build_trailing_diagnostic as _build_trailing_diagnostic
+
+    return _build_trailing_diagnostic(*args, **kwargs)
+
+
+def build_trailing_inputs_from_snapshot(*args, **kwargs):
+    from trailing_diagnostics import (
+        build_trailing_inputs_from_snapshot as _build_trailing_inputs_from_snapshot,
+    )
+
+    return _build_trailing_inputs_from_snapshot(*args, **kwargs)
+
+
+def snapshot_payload(*args, **kwargs):
+    from trailing_diagnostics import snapshot_payload as _snapshot_payload
+
+    return _snapshot_payload(*args, **kwargs)
 
 
 def _truncate(value: str, width: int) -> str:
@@ -170,6 +236,16 @@ def _resolve_symbol_alias(query: str, snapshot: dict[str, Any]) -> tuple[Optiona
     if len(matches) > 1:
         return None, f"ambiguous symbol '{query}': {', '.join(matches[:4])}"
     return matches[0], None
+
+
+def _unsupported_trailing_diagnostics(snapshot: dict[str, Any]) -> Optional[dict[str, Any]]:
+    trailing = snapshot_payload(snapshot).get("trailing", {})
+    if not isinstance(trailing, dict):
+        return None
+    metadata = trailing.get("_meta", {})
+    if isinstance(metadata, dict) and metadata.get("diagnostics_supported") is False:
+        return metadata
+    return None
 
 
 def _load_snapshot_from_path(path: Path) -> dict[str, Any]:
@@ -343,7 +419,11 @@ class TrailingDiagnosticsState:
         return changed
 
     def can_reload_from_snapshot(self) -> bool:
-        return self.config is not None and self.snapshot is not None
+        return (
+            self.config is not None
+            and self.snapshot is not None
+            and _unsupported_trailing_diagnostics(self.snapshot) is None
+        )
 
     def reload_symbol_pside(self, symbol: str, pside: str) -> None:
         if not self.can_reload_from_snapshot():
@@ -384,16 +464,29 @@ def create_state_from_sources(
     )
     snapshot = _load_snapshot_from_path(resolved_snapshot) if resolved_snapshot and resolved_snapshot.exists() else None
     if snapshot is not None:
+        snap = snapshot_payload(snapshot)
+        trailing = snap.get("trailing", {})
+        trailing_meta = _unsupported_trailing_diagnostics(snapshot)
+        if not wizard and trailing_meta is not None:
+            strategy_kind = str(trailing_meta.get("strategy_kind") or "unknown")
+            reason = str(trailing_meta.get("reason") or "not_supported")
+            raise ValueError(
+                "snapshot trailing diagnostics are not supported for strategy "
+                f"'{strategy_kind}' ({reason}); use --wizard for explicit manual inputs"
+            )
         if symbol:
             resolved_symbol, error = _resolve_symbol_alias(symbol, snapshot)
             if error:
                 raise ValueError(error)
             symbol = resolved_symbol
         else:
-            snap = snapshot_payload(snapshot)
-            trailing = snap.get("trailing", {})
-            if isinstance(trailing, dict) and trailing:
-                symbol = sorted(trailing)[0]
+            trailing_symbols = (
+                sorted(key for key in trailing if not str(key).startswith("_"))
+                if isinstance(trailing, dict)
+                else []
+            )
+            if trailing_symbols:
+                symbol = trailing_symbols[0]
             else:
                 market = snap.get("market", {})
                 if isinstance(market, dict) and market:
@@ -528,18 +621,16 @@ def _render_side_box(title: str, payload: Optional[dict[str, Any]], width: int) 
 
 def _render_inputs_box(state: TrailingDiagnosticsState, width: int) -> list[str]:
     important = [
-        "entry_trailing_grid_ratio",
         "entry_trailing_threshold_pct",
-        "entry_trailing_threshold_we_weight",
-        "entry_trailing_threshold_volatility_weight",
         "entry_trailing_retracement_pct",
-        "entry_trailing_retracement_we_weight",
-        "entry_trailing_retracement_volatility_weight",
-        "close_trailing_grid_ratio",
+        "entry_weight_volatility_1h",
+        "entry_weight_volatility_1m",
+        "entry_we_weight",
         "close_trailing_qty_pct",
         "close_trailing_threshold_pct",
         "close_trailing_retracement_pct",
         "wallet_exposure_limit",
+        "total_wallet_exposure_limit",
         "risk_we_excess_allowance_pct",
         "risk_wel_enforcer_threshold",
     ]
@@ -657,8 +748,8 @@ def execute_command(state: TrailingDiagnosticsState, command: str) -> bool:
         if not args:
             state.status_lines = ["symbol requires a coin or full symbol"]
             return False
-        if state.snapshot is None or state.config is None:
-            state.status_lines = ["symbol switching requires snapshot + config source"]
+        if not state.can_reload_from_snapshot():
+            state.status_lines = ["symbol switching requires a supported snapshot + config source"]
             return False
         resolved, error = _resolve_symbol_alias(" ".join(args), state.snapshot)
         if error:
@@ -672,7 +763,7 @@ def execute_command(state: TrailingDiagnosticsState, command: str) -> bool:
             state.status_lines = ["side requires 'long' or 'short'"]
             return False
         new_pside = args[0].lower()
-        if state.snapshot is None or state.config is None:
+        if not state.can_reload_from_snapshot():
             state.inputs["pside"] = new_pside
             state.pside = new_pside
             state.status_lines = [f"Updated side to {new_pside} in manual mode."]

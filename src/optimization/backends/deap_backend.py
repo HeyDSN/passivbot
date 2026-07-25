@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import functools
 import logging
 import multiprocessing
+import os
+import pickle
+import random
 from copy import deepcopy
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -20,13 +24,17 @@ from optimization.backend_shared import (
     log_seed_memory,
     stream_async_results,
 )
+from optimization.evaluation_payload import apply_evaluation_payload
 from optimization.deap_adapters import (
     cxSimulatedBinaryBoundedWrapper,
     mutPolynomialBoundedWrapper,
 )
+from optimization.random_seed import seed_worker_rngs
 from config.scoring import engine_space_fitness_weights
 
 DEFAULT_DEAP_POPULATION_SIZE = 500
+_DEAP_WORKER_EVALUATOR = None
+_DEAP_WORKER_OVERRIDES_LIST: list[Any] = []
 
 
 def _resolve_deap_population_size(config: dict[str, Any]) -> int:
@@ -38,6 +46,48 @@ def _resolve_deap_population_size(config: dict[str, Any]) -> int:
         )
         return DEFAULT_DEAP_POPULATION_SIZE
     return max(1, int(raw))
+
+
+def _clone_evaluated_individual(individual):
+    clone = individual.__class__(individual)
+    source_fitness = getattr(individual, "fitness", None)
+    clone_fitness = getattr(clone, "fitness", None)
+    if source_fitness is not None and clone_fitness is not None:
+        if getattr(source_fitness, "valid", False):
+            clone_fitness.values = tuple(source_fitness.values)
+        if hasattr(source_fitness, "constraint_violation"):
+            clone_fitness.constraint_violation = source_fitness.constraint_violation
+    if hasattr(individual, "constraint_violation"):
+        clone.constraint_violation = individual.constraint_violation
+    if hasattr(individual, "evaluation_metrics"):
+        clone.evaluation_metrics = deepcopy(individual.evaluation_metrics)
+    return clone
+
+
+def _set_deap_worker_globals(evaluator, overrides_list: Sequence[Any] | None) -> None:
+    global _DEAP_WORKER_EVALUATOR
+    global _DEAP_WORKER_OVERRIDES_LIST
+
+    _DEAP_WORKER_EVALUATOR = evaluator
+    _DEAP_WORKER_OVERRIDES_LIST = list(overrides_list or [])
+
+
+def _initialize_deap_worker(
+    rng_seed,
+    ignore_sigint_in_worker=None,
+    evaluator=None,
+    overrides_list: Sequence[Any] | None = None,
+):
+    seed_worker_rngs(rng_seed, context="DEAP optimizer")
+    if ignore_sigint_in_worker is not None:
+        ignore_sigint_in_worker()
+    _set_deap_worker_globals(evaluator, overrides_list)
+
+
+def _evaluate_deap_worker(individual):
+    if _DEAP_WORKER_EVALUATOR is None:
+        raise RuntimeError("DEAP worker evaluator not initialized")
+    return _DEAP_WORKER_EVALUATOR.evaluate(individual, _DEAP_WORKER_OVERRIDES_LIST)
 
 
 def run_backend(
@@ -60,6 +110,8 @@ def run_backend(
     run_evolution: Callable[..., tuple[Any, Any]],
     build_config_fn,
     overrides_fn,
+    checkpoint_path: str | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     del build_config_fn
     del overrides_fn
@@ -116,12 +168,19 @@ def run_backend(
             bounds=bounds,
         )
         toolbox.register("select", tools.selNSGA2)
-        toolbox.register("evaluate", evaluator_for_pool.evaluate, overrides_list=overrides_list)
+        toolbox.register("evaluate", _evaluate_deap_worker)
 
         logging.info("Initializing multiprocessing pool. N cpus: %s", config["optimize"]["n_cpus"])
+        worker_initializer = functools.partial(
+            _initialize_deap_worker,
+            config["optimize"].get("seed"),
+            ignore_sigint_in_worker,
+            evaluator_for_pool,
+            overrides_list,
+        )
         pool = multiprocessing.Pool(
             processes=config["optimize"]["n_cpus"],
-            initializer=ignore_sigint_in_worker,
+            initializer=worker_initializer,
         )
         toolbox.register("map", pool.map)
         logging.info("Finished initializing multiprocessing pool.")
@@ -140,10 +199,7 @@ def run_backend(
             completed = {"count": 0}
 
             def _on_result(ind, payload):
-                fit_values, penalty, metrics = payload
-                ind.fitness.values = fit_values
-                ind.fitness.constraint_violation = penalty
-                ind.constraint_violation = penalty
+                metrics = apply_evaluation_payload(ind, payload)
                 if metrics is not None:
                     ind.evaluation_metrics = metrics
                     record_individual_result(
@@ -176,73 +232,94 @@ def run_backend(
             return completed["count"]
 
         population_size = _resolve_deap_population_size(config)
-        starting_individuals = load_starting_individuals(
-            starting_configs_path=starting_configs_path,
-            population_size=population_size,
-            get_starting_configs=get_starting_configs,
-            configs_to_individuals=configs_to_individuals,
-            iter_starting_configs=iter_starting_configs,
-            configs_to_individuals_streaming=configs_to_individuals_streaming,
-            optimization_shape=optimization_shape,
-            bounds=bounds,
-            sig_digits=sig_digits,
-        )
+        start_gen = 1
 
-        def _make_random_individual():
-            values = [bound.random_on_grid() for bound in bounds]
-            return creator.Individual(values)
+        # Checkpoint Loading
+        chk = None
+        if resume:
+            if checkpoint_path is None:
+                raise ValueError("DEAP resume requested without a checkpoint path")
+            if not os.path.isfile(checkpoint_path):
+                raise FileNotFoundError(f"DEAP checkpoint not found: {checkpoint_path}")
+            logging.info(f"Loading DEAP checkpoint from {checkpoint_path}...")
+            with open(checkpoint_path, "rb") as f:
+                chk = pickle.load(f)
 
-        population = [_make_random_individual() for _ in range(population_size)]
-        if starting_individuals:
-            log_seed_memory(
-                "deap_starting_individuals_ready",
-                count=len(starting_individuals),
-                approx_bytes=approx_object_size(starting_individuals),
+            random.setstate(chk["random_state"])
+            np.random.set_state(chk["np_random_state"])
+
+            population = chk["population"]
+            logbook = chk["logbook"]
+            hof = chk["halloffame"]
+            start_gen = chk["gen"] + 1
+            logging.info(f"Resuming DEAP evolution from generation {start_gen}...")
+
+        if chk is None:
+            starting_individuals = load_starting_individuals(
+                starting_configs_path=starting_configs_path,
+                population_size=population_size,
+                get_starting_configs=get_starting_configs,
+                configs_to_individuals=configs_to_individuals,
+                iter_starting_configs=iter_starting_configs,
+                configs_to_individuals_streaming=configs_to_individuals_streaming,
+                optimization_shape=optimization_shape,
+                bounds=bounds,
+                sig_digits=sig_digits,
             )
-            evaluated_seeds = [creator.Individual(ind) for ind in starting_individuals]
-            log_seed_memory(
-                "deap_evaluated_seeds_allocated",
-                count=len(evaluated_seeds),
-                approx_bytes=approx_object_size(evaluated_seeds),
-            )
-            eval_count = _evaluate_initial(evaluated_seeds)
-            logging.info("Evaluated %d starting configs", eval_count)
-            log_seed_memory(
-                "deap_starting_eval_complete",
-                count=len(evaluated_seeds),
-                approx_bytes=approx_object_size(evaluated_seeds),
-            )
-            if len(evaluated_seeds) > population_size:
-                evaluated_seeds = tools.selNSGA2(evaluated_seeds, population_size)
-                logging.info(
-                    "Trimmed starting configs to population size via NSGA-II crowding (kept %d)",
-                    len(evaluated_seeds),
-                )
+
+            def _make_random_individual():
+                values = [bound.random_on_grid() for bound in bounds]
+                return creator.Individual(values)
+
+            population = [_make_random_individual() for _ in range(population_size)]
+            if starting_individuals:
                 log_seed_memory(
-                    "deap_starting_trim_complete",
+                    "deap_starting_individuals_ready",
+                    count=len(starting_individuals),
+                    approx_bytes=approx_object_size(starting_individuals),
+                )
+                evaluated_seeds = [creator.Individual(ind) for ind in starting_individuals]
+                log_seed_memory(
+                    "deap_evaluated_seeds_allocated",
                     count=len(evaluated_seeds),
                     approx_bytes=approx_object_size(evaluated_seeds),
                 )
-            for i, ind in enumerate(evaluated_seeds):
-                population[i] = creator.Individual(ind)
+                eval_count = _evaluate_initial(evaluated_seeds)
+                logging.info("Evaluated %d starting configs", eval_count)
+                log_seed_memory(
+                    "deap_starting_eval_complete",
+                    count=len(evaluated_seeds),
+                    approx_bytes=approx_object_size(evaluated_seeds),
+                )
+                if len(evaluated_seeds) > population_size:
+                    evaluated_seeds = tools.selNSGA2(evaluated_seeds, population_size)
+                    logging.info(
+                        "Trimmed starting configs to population size via NSGA-II crowding (kept %d)",
+                        len(evaluated_seeds),
+                    )
+                    log_seed_memory(
+                        "deap_starting_trim_complete",
+                        count=len(evaluated_seeds),
+                        approx_bytes=approx_object_size(evaluated_seeds),
+                    )
+                for i, ind in enumerate(evaluated_seeds):
+                    population[i] = _clone_evaluated_individual(ind)
 
-            remaining = population_size - len(evaluated_seeds)
-            seed_pool = evaluated_seeds if evaluated_seeds else []
-            if seed_pool and remaining > 0:
-                for i in range(len(evaluated_seeds), len(evaluated_seeds) + remaining // 2):
-                    population[i] = deepcopy(seed_pool[np.random.choice(range(len(seed_pool)))])
-        for i in range(len(population)):
-            population[i][:] = enforce_bounds(population[i], bounds, sig_digits)
+                remaining = population_size - len(evaluated_seeds)
+                seed_pool = evaluated_seeds if evaluated_seeds else []
+                if seed_pool and remaining > 0:
+                    for i in range(len(evaluated_seeds), len(evaluated_seeds) + remaining // 2):
+                        population[i] = deepcopy(seed_pool[np.random.choice(range(len(seed_pool)))])
+            for i in range(len(population)):
+                population[i][:] = enforce_bounds(population[i], bounds, sig_digits)
 
-        logging.info("Initial population size: %d", len(population))
+            logbook = tools.Logbook()
+            logbook.header = "gen", "evals", "min", "max"
+            hof = tools.ParetoFront()
 
         stats = tools.Statistics(lambda ind: ind.fitness.values)
         stats.register("min", np.min, axis=0)
         stats.register("max", np.max, axis=0)
-
-        logbook = tools.Logbook()
-        logbook.header = "gen", "evals", "min", "max"
-        hof = tools.ParetoFront()
 
         logging.info("Starting optimize...")
         lambda_size = max(1, int(round(population_size * offspring_multiplier)))
@@ -263,6 +340,14 @@ def run_backend(
             pool=pool,
             duplicate_counter=duplicate_counter,
             pool_state=pool_state,
+            start_gen=start_gen,
+            logbook=logbook,
+            checkpoint_path=checkpoint_path,
+            max_pending_evals=max(
+                1,
+                int(config["optimize"]["n_cpus"])
+                * int(config["optimize"].get("max_pending_starting_evals_per_cpu", 1)),
+            ),
         )
         logging.info("Optimization complete.")
         return {

@@ -1,8 +1,12 @@
 from exchanges.ccxt_bot import CCXTBot
 from passivbot import logging
 
-from utils import ts_to_date, utc_ms
+from utils import to_ccxt_client_id, ts_to_date, utc_ms
 from config.access import require_live_value
+from custom_endpoint_overrides import (
+    get_custom_endpoint_source,
+    resolve_custom_endpoint_override_with_aliases,
+)
 
 
 class GateIOBot(CCXTBot):
@@ -20,7 +24,25 @@ class GateIOBot(CCXTBot):
 
     def create_ccxt_sessions(self):
         """GateIO: Add broker header to CCXT config."""
-        super().create_ccxt_sessions()
+        endpoint_override = resolve_custom_endpoint_override_with_aliases("gateio", ("gate",))
+        if endpoint_override != self.endpoint_override:
+            self.endpoint_override = endpoint_override
+            self.ws_enabled = endpoint_override is None or not endpoint_override.disable_ws
+            if endpoint_override is not None:
+                logging.info(
+                    "Custom endpoint override active for gateio/gate "
+                    "(disable_ws=%s, source=%s)",
+                    endpoint_override.disable_ws,
+                    get_custom_endpoint_source() or "auto-discovered",
+                )
+        # CCXT 4.5.66 exposes Gate.io clients under ``gate``. Keep Passivbot's
+        # exchange identity canonical everywhere outside client construction.
+        canonical_ccxt_id = self.exchange_ccxt_id
+        try:
+            self.exchange_ccxt_id = to_ccxt_client_id(canonical_ccxt_id)
+            super().create_ccxt_sessions()
+        finally:
+            self.exchange_ccxt_id = canonical_ccxt_id
         # Add broker header to both clients
         headers = {"X-Gate-Channel-Id": self.broker_code} if self.broker_code else {}
         for client in [self.cca, self.ccp]:
@@ -35,33 +57,37 @@ class GateIOBot(CCXTBot):
 
     def determine_pos_side(self, order):
         """GateIO-specific logic for one-way mode position side derivation."""
-        if order["side"] == "buy":
-            return "short" if order["reduceOnly"] else "long"
-        if order["side"] == "sell":
-            return "long" if order["reduceOnly"] else "short"
-        raise Exception(f"unsupported order side {order['side']}")
+        return self._normalize_one_way_position_side(order)
 
     # ═══════════════════ GATEIO-SPECIFIC METHODS ═══════════════════
 
     async def fetch_balance(self) -> float:
-        """GateIO: Fetch balance with special UID logic for websockets.
+        """GateIO: Fetch balance using the same parser as staged snapshots."""
+        balance_fetched = await self._do_fetch_balance()
+        return self._get_balance(balance_fetched)
 
-        GateIO requires UID for websocket subscriptions, which is obtained
-        from the balance response. Also handles classic vs multi_currency
-        margin modes.
+    def _get_balance(self, balance_fetched: dict) -> float:
+        """Extract Gate.io futures balance for classic and multi-currency margin modes.
+
+        Staged refresh calls CCXTBot.capture_balance_snapshot(), which bypasses
+        fetch_balance() and calls this hook directly. Keep Gate.io's margin-mode
+        specific parsing here so legacy and staged paths use the same balance.
         """
-        balance_fetched = await self.cca.fetch_balance()
+        info = balance_fetched.get("info")
+        if not isinstance(info, list) or not info:
+            raise KeyError(f"{self.exchange}: fetch_balance response missing info[0]")
+        primary = info[0]
         if not hasattr(self, "uid") or not self.uid:
-            self.uid = balance_fetched["info"][0]["user"]
+            self.uid = primary["user"]
             self.cca.uid = self.uid
             if self.ccp is not None:
                 self.ccp.uid = self.uid
-        margin_mode_name = balance_fetched["info"][0]["margin_mode_name"]
+        margin_mode_name = primary["margin_mode_name"]
         self.log_once(f"account margin mode: {margin_mode_name}")
         if margin_mode_name == "classic":
             balance = float(balance_fetched[self.quote]["total"])
         elif margin_mode_name == "multi_currency":
-            balance = float(balance_fetched["info"][0]["cross_available"])
+            balance = float(primary["cross_available"])
         else:
             raise Exception(f"unknown margin_mode_name {balance_fetched}")
         return balance

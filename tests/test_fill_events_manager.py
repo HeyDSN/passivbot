@@ -1,9 +1,13 @@
 import asyncio
+import errno
+import json
+import logging
 import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -12,6 +16,7 @@ if str(ROOT) not in sys.path:
 import pytest
 from ccxt.base.errors import RateLimitExceeded
 
+import src.fill_events_manager as fem
 from src.fill_events_manager import (
     BaseFetcher,
     BinanceFetcher,
@@ -23,8 +28,13 @@ from src.fill_events_manager import (
     OkxFetcher,
     FillEvent,
     FillEventCache,
+    FillEventCacheContractError,
+    FillEventCacheDiskFullError,
     FillEventsManager,
+    PnlObservation,
     GAP_REASON_FETCH_FAILED,
+    KUCOIN_POSITION_HISTORY_LOOKAHEAD_MS,
+    apply_hyperliquid_raw_psize_overrides,
     compute_psize_pprice,
     custom_id_to_snake,
     ensure_qty_signage,
@@ -47,8 +57,14 @@ class _Clock:
 
 
 class _FakeBitgetAPI:
-    def __init__(self, batches: List[List[Dict[str, str]]]) -> None:
+    def __init__(
+        self,
+        batches: List[List[Dict[str, str]]],
+        *,
+        options: Optional[Dict[str, object]] = None,
+    ) -> None:
         self._batches = batches
+        self.options = dict(options or {})
         self.history_calls: List[Dict[str, object]] = []
         self.detail_calls: List[Dict[str, object]] = []
         self.details_by_order: Dict[str, Dict[str, object]] = {}
@@ -71,18 +87,51 @@ class _FakeBitgetAPI:
         order_id = params["orderId"]
         return self.details_by_order.get(order_id, {"data": {"clientOid": None}})
 
+    async def private_uta_get_v3_trade_fills(self, params: Dict[str, object]):
+        self.history_calls.append(dict(params))
+        if not self._batches:
+            return {"data": {"list": []}}
+        return {"data": {"list": self._batches.pop(0)}}
+
 
 class _StaticFetcher(BaseFetcher):
-    def __init__(self, events: List[Dict[str, object]]):
+    def __init__(
+        self,
+        events: List[Dict[str, object]],
+        observations: Optional[List[PnlObservation]] = None,
+    ):
         self.events = list(events)
+        self._observations = list(observations or [])
+        self.pnl_observations: List[PnlObservation] = []
         self.calls: List[Tuple[Optional[int], Optional[int]]] = []
 
     async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
         self.calls.append((since_ms, until_ms))
+        self.pnl_observations = list(self._observations)
         payload = [dict(ev) for ev in self.events]
         if on_batch:
             on_batch(payload)
         return payload
+
+
+class _SequencedFetcher(BaseFetcher):
+    def __init__(
+        self,
+        batches: List[List[Dict[str, object]]],
+        observations: Optional[List[List[PnlObservation]]] = None,
+    ):
+        self.batches = list(batches)
+        self.observations = list(observations or [])
+        self.pnl_observations: List[PnlObservation] = []
+        self.calls: List[Tuple[Optional[int], Optional[int]]] = []
+
+    async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+        self.calls.append((since_ms, until_ms))
+        batch = [dict(ev) for ev in (self.batches.pop(0) if self.batches else [])]
+        self.pnl_observations = self.observations.pop(0) if self.observations else []
+        if on_batch and batch:
+            on_batch(batch)
+        return batch
 
 
 class _FakeBybitAPI:
@@ -158,8 +207,21 @@ class _FakeHyperliquidAPI:
         self._batches = list(batches)
         self.calls: List[Dict[str, Any]] = []
 
-    async def fetch_my_trades(self, params: Dict[str, Any]):
-        self.calls.append(dict(params))
+    async def fetch_my_trades(
+        self,
+        symbol: Optional[str] = None,
+        since: Optional[int] = None,
+        limit: Optional[int] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ):
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "since": since,
+                "limit": limit,
+                "params": dict(params or {}),
+            }
+        )
         if not self._batches:
             return []
         return self._batches.pop(0)
@@ -267,6 +329,65 @@ async def test_binance_fetcher_merges_trade_details(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_binance_fetcher_merges_commission_income_into_realized_pnl(monkeypatch):
+    ts = 1_700_000_000_000
+    fetcher = BinanceFetcher(
+        api=object(),
+        symbol_resolver=lambda sym: "ADA/USDT:USDT" if sym == "ADAUSDT" else sym or "",
+        positions_provider=lambda: [],
+        open_orders_provider=lambda: [],
+    )
+    realized = fetcher._normalize_income(
+        {
+            "tradeId": "trade-commission",
+            "time": ts,
+            "symbol": "ADAUSDT",
+            "income": "1.5",
+            "asset": "USDT",
+            "positionSide": "LONG",
+        },
+        income_type="REALIZED_PNL",
+    )
+    commission = fetcher._normalize_income(
+        {
+            "tradeId": "trade-commission",
+            "time": ts,
+            "symbol": "ADAUSDT",
+            "income": "-0.003",
+            "asset": "USDT",
+            "positionSide": "LONG",
+        },
+        income_type="COMMISSION",
+    )
+
+    async def fake_fetch_income(self, *_args, **_kwargs):
+        return [realized, commission]
+
+    async def fake_fetch_trades(self, symbol, *_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_income",
+        types.MethodType(fake_fetch_income, fetcher),
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_symbol_trades",
+        types.MethodType(fake_fetch_trades, fetcher),
+    )
+
+    events = await fetcher.fetch(ts, ts + 1_000, detail_cache={})
+
+    assert len(events) == 1
+    assert events[0]["pnl"] == pytest.approx(1.5)
+    assert events[0]["fees"] == [{"currency": "USDT", "fee_paid": -0.003}]
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(events[0])
+    assert fee_paid == pytest.approx(-0.003)
+    assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+
+
+@pytest.mark.asyncio
 async def test_binance_fetch_symbol_trades_uses_now_bound_and_one_percent_margin():
     now_ms = 1_700_000_000_000
     seven_days_ms = 7 * 24 * 60 * 60 * 1000
@@ -294,6 +415,37 @@ async def test_binance_fetch_symbol_trades_uses_now_bound_and_one_percent_margin
     assert second_call["startTime"] == first_call["endTime"] + 1
     assert second_call["endTime"] == now_ms
     assert all(call["params"]["endTime"] <= now_ms for call in api.calls)
+
+
+@pytest.mark.asyncio
+async def test_binance_trade_fetch_redacts_secret_error_but_preserves_cause(caplog):
+    secret = "authorization=binance-fill-fetch-secret"
+
+    class _FailingAPI:
+        async def fetch_my_trades(self, *_args, **_kwargs):
+            raise RuntimeError(secret)
+
+    fetcher = BinanceFetcher(
+        api=_FailingAPI(),
+        symbol_resolver=lambda symbol: symbol or "",
+        now_func=lambda: 1_700_000_000_000,
+    )
+
+    with caplog.at_level(logging.ERROR, logger=fem.logger.name):
+        with pytest.raises(RuntimeError) as captured:
+            await fetcher._fetch_symbol_trades(
+                "BTC/USDT:USDT",
+                since_ms=1_699_999_000_000,
+                until_ms=1_700_000_000_000,
+            )
+
+    assert secret not in str(captured.value)
+    assert "BTC/USDT:USDT" in str(captured.value)
+    assert "error_type=RuntimeError" in str(captured.value)
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert str(captured.value.__cause__) == secret
+    assert "error_type=RuntimeError" in caplog.text
+    assert secret not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -489,6 +641,104 @@ async def test_binance_fetcher_income_only_events(monkeypatch):
     assert event["id"] == "income-only-1"
     assert event["pnl"] == pytest.approx(5.0)
     assert event["position_side"] == "long"
+
+
+@pytest.mark.asyncio
+async def test_binance_fetcher_trade_history_errors_are_not_income_only_events(monkeypatch):
+    """Trade-history outages must not be normalized as zero-qty income-only fills."""
+    ts = 1_700_000_000_000
+    income_events = [
+        {
+            "id": "income-only-outage",
+            "timestamp": ts,
+            "datetime": "2023-11-01T00:00:00Z",
+            "symbol": "SOL/USDT:USDT",
+            "side": "",
+            "qty": 0.0,
+            "price": 0.0,
+            "pnl": 12.5,
+            "fees": None,
+            "pb_order_type": "",
+            "position_side": "long",
+            "client_order_id": "",
+        }
+    ]
+
+    class FailingTradeAPI:
+        async def fetch_my_trades(self, *_args, **_kwargs):
+            raise RuntimeError("simulated trade-history outage")
+
+    fetcher = BinanceFetcher(
+        api=FailingTradeAPI(),
+        symbol_resolver=lambda sym: sym or "",
+        positions_provider=lambda: [],
+        open_orders_provider=lambda: [],
+    )
+
+    async def fake_fetch_income(self, *_args, **_kwargs):
+        return [dict(ev) for ev in income_events]
+
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_income",
+        types.MethodType(fake_fetch_income, fetcher),
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        await fetcher.fetch(
+            since_ms=ts - 1,
+            until_ms=ts + 1,
+            detail_cache={},
+        )
+
+    assert "simulated trade-history outage" not in str(captured.value)
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert str(captured.value.__cause__) == "simulated trade-history outage"
+
+
+@pytest.mark.asyncio
+async def test_binance_fetcher_hostile_error_text_preserves_original_failure():
+    secret = "api_key=binance-hostile-string"
+
+    class HostileError(RuntimeError):
+        def __str__(self):
+            raise KeyboardInterrupt(secret)
+
+    original = HostileError()
+
+    class FailingTradeAPI:
+        async def fetch_my_trades(self, *_args, **_kwargs):
+            raise original
+
+    fetcher = BinanceFetcher(
+        api=FailingTradeAPI(),
+        symbol_resolver=lambda sym: sym or "",
+        positions_provider=lambda: [],
+        open_orders_provider=lambda: [],
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        await fetcher._fetch_symbol_trades("BTC/USDT:USDT", None, None)
+
+    assert captured.value.__cause__ is original
+    assert secret not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_binance_fetcher_classifies_late_unsupported_symbol_marker():
+    class UnsupportedTradeAPI:
+        async def fetch_my_trades(self, *_args, **_kwargs):
+            raise RuntimeError(("x" * 5000) + " does not have market symbol")
+
+    fetcher = BinanceFetcher(
+        api=UnsupportedTradeAPI(),
+        symbol_resolver=lambda sym: sym or "",
+        positions_provider=lambda: [],
+        open_orders_provider=lambda: [],
+    )
+
+    assert await fetcher._fetch_symbol_trades("BTC/USDT:USDT", None, None) == []
+    assert fetcher._unsupported_symbols == {"BTC/USDT:USDT"}
 
 
 @pytest.mark.asyncio
@@ -760,6 +1010,87 @@ async def test_binance_fetcher_symbol_pool_from_providers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_binance_fetcher_does_not_use_config_fallback_symbols_by_default(monkeypatch):
+    fetched_symbols: List[str] = []
+
+    fetcher = BinanceFetcher(
+        api=object(),
+        symbol_resolver=lambda sym: sym or "",
+        positions_provider=lambda: [],
+        open_orders_provider=lambda: [],
+        fallback_symbols=["ADA/USDT:USDT", "BTC/USDT:USDT"],
+    )
+
+    async def fake_fetch_income(self, *_args, **_kwargs):
+        return []
+
+    async def fake_fetch_trades(self, symbol, *_args, **_kwargs):
+        fetched_symbols.append(symbol)
+        return []
+
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_income",
+        types.MethodType(fake_fetch_income, fetcher),
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_symbol_trades",
+        types.MethodType(fake_fetch_trades, fetcher),
+    )
+
+    events = await fetcher.fetch(
+        since_ms=1_700_000_000_000,
+        until_ms=1_700_000_060_000,
+        detail_cache={},
+    )
+
+    assert events == []
+    assert fetched_symbols == []
+
+
+@pytest.mark.asyncio
+async def test_binance_fetcher_uses_config_fallback_symbols_when_enabled(monkeypatch):
+    fetched_symbols: List[str] = []
+
+    fetcher = BinanceFetcher(
+        api=object(),
+        symbol_resolver=lambda sym: sym or "",
+        positions_provider=lambda: [],
+        open_orders_provider=lambda: [],
+        fallback_symbols=["ADA/USDT:USDT", "BTC/USDT:USDT"],
+        allow_fallback_symbols=True,
+    )
+
+    async def fake_fetch_income(self, *_args, **_kwargs):
+        return []
+
+    async def fake_fetch_trades(self, symbol, *_args, **_kwargs):
+        fetched_symbols.append(symbol)
+        return []
+
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_income",
+        types.MethodType(fake_fetch_income, fetcher),
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_symbol_trades",
+        types.MethodType(fake_fetch_trades, fetcher),
+    )
+
+    events = await fetcher.fetch(
+        since_ms=1_700_000_000_000,
+        until_ms=1_700_000_060_000,
+        detail_cache={},
+    )
+
+    assert events == []
+    assert fetched_symbols == ["ADA/USDT:USDT", "BTC/USDT:USDT"]
+
+
+@pytest.mark.asyncio
 async def test_binance_fetcher_detail_cache_usage(monkeypatch):
     """Test detail cache is used and populated."""
     trades = [
@@ -846,6 +1177,520 @@ def test_fill_event_from_dict_normalises_datetime():
     assert event.datetime == expected
     assert event.side == "buy"
     assert event.position_side == "long"
+    assert event.pnl_status == "complete"
+
+
+def test_fill_event_from_dict_preserves_pending_pnl_status():
+    data = {
+        "id": "t1",
+        "timestamp": 1_000,
+        "symbol": "BTC/USDT",
+        "side": "sell",
+        "qty": -1.0,
+        "price": 10.0,
+        "pnl": 0.0,
+        "pnl_status": "pending",
+        "pb_order_type": "close_grid_long",
+        "position_side": "long",
+        "client_order_id": "cid",
+    }
+    event = FillEvent.from_dict(data)
+    assert event.pnl_status == "pending"
+    assert event.pnl_pending is True
+
+
+def test_fee_policy_uses_reported_quote_fee():
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 1.0,
+            "price": 1000.0,
+            "fees": {"currency": "USDT", "cost": 0.2},
+        }
+    )
+
+    assert fee_paid == pytest.approx(-0.2)
+    assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+    assert meta["fee_quality"] == fem.FEE_QUALITY_EXACT
+
+
+def test_fee_policy_uses_scalar_quote_fee():
+    for raw_fee, expected in [(0.25, -0.25), ("0.25", -0.25), (-0.05, 0.05)]:
+        payload = {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 1.0,
+            "price": 1000.0,
+            "fee": raw_fee,
+        }
+
+        assert fem.signed_fee_paid_from_payload(payload) == pytest.approx(expected)
+        fee_paid, meta = fem._normalize_fee_paid_from_payload(payload)
+        assert fee_paid == pytest.approx(expected)
+        assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+        assert meta["fee_quality"] == fem.FEE_QUALITY_EXACT
+
+
+def test_fee_policy_uses_bitget_fee_detail_fields():
+    for raw_fee, expected in [
+        ({"feeCoin": "USDT", "fee": "0.01"}, -0.01),
+        ({"feeCoin": "USDT", "fee": "-0.02"}, -0.02),
+        ({"feeCoin": "USDT", "totalFee": "-0.03"}, -0.03),
+    ]:
+        fee_paid, meta = fem._normalize_fee_paid_from_payload(
+            {
+                "symbol": "BTC/USDT:USDT",
+                "qty": 1.0,
+                "price": 1000.0,
+                "fees": [raw_fee],
+            }
+        )
+
+        assert fee_paid == pytest.approx(expected)
+        assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+        assert meta["fee_quality"] == fem.FEE_QUALITY_EXACT
+
+
+def test_fee_policy_converts_reported_non_quote_fee_to_quote():
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 1.0,
+            "price": 1000.0,
+            "fees": {"currency": "BNB", "cost": 0.0001},
+        },
+        conversion_rates={"BNB": 300.0},
+    )
+
+    assert fee_paid == pytest.approx(-0.03)
+    assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_CONVERTED
+    assert meta["fee_quality"] == fem.FEE_QUALITY_CONVERTED
+    assert meta["fee_conversion_source"] == "ticker"
+
+
+def test_fee_policy_preserves_existing_conversion_metadata():
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 1.0,
+            "price": 1000.0,
+            "fee_paid": -0.03,
+            "fee_source": fem.FEE_SOURCE_REPORTED_CONVERTED,
+            "fee_quality": fem.FEE_QUALITY_CONVERTED,
+            "fee_currency": "BNB",
+            "fee_conversion_source": "ticker",
+            "pnl_contract": fem.PNL_CONTRACT_CURRENT,
+        }
+    )
+
+    assert fee_paid == pytest.approx(-0.03)
+    assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_CONVERTED
+    assert meta["fee_quality"] == fem.FEE_QUALITY_CONVERTED
+    assert meta["fee_conversion_source"] == "ticker"
+
+
+def test_fee_policy_falls_back_when_mixed_fee_has_unresolved_non_quote():
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 1.0,
+            "price": 1000.0,
+            "fees": [
+                {"currency": "USDT", "cost": 0.10},
+                {"currency": "BNB", "cost": 0.0001},
+            ],
+        },
+        fee_pct_fallback=0.0002,
+    )
+
+    assert fee_paid == pytest.approx(-0.2)
+    assert meta["fee_source"] == fem.FEE_SOURCE_FALLBACK_PCT
+    assert meta["fee_quality"] == fem.FEE_QUALITY_FALLBACK
+    assert meta["fee_unresolved_non_quote"] is True
+
+
+def test_fee_policy_falls_back_to_configured_pct_with_contract_multiplier():
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 2.0,
+            "price": 100.0,
+            "c_mult": 10.0,
+            "fees": {"currency": "BNB", "cost": 0.0001},
+        },
+        fee_pct_fallback=0.0002,
+    )
+
+    assert fee_paid == pytest.approx(-0.4)
+    assert meta["fee_source"] == fem.FEE_SOURCE_FALLBACK_PCT
+    assert meta["fee_notional"] == pytest.approx(2000.0)
+
+
+def test_fee_policy_zero_fallback_means_net_equals_gross_when_fee_unresolved():
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 1.0,
+            "price": 1000.0,
+            "fees": {"currency": "BNB", "cost": 0.0001},
+        },
+        fee_pct_fallback=0.0,
+    )
+
+    assert fee_paid == pytest.approx(0.0)
+    assert meta["fee_source"] == fem.FEE_SOURCE_FALLBACK_PCT
+
+
+def test_fee_policy_sanity_replaces_absurd_reported_fee_with_fallback():
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 1.0,
+            "price": 1000.0,
+            "fees": {"currency": "USDT", "cost": 10.0},
+        },
+        fee_pct_fallback=0.0002,
+        fee_pct_sanity_abs_max=0.001,
+    )
+
+    assert fee_paid == pytest.approx(-0.2)
+    assert meta["fee_quality"] == fem.FEE_QUALITY_SANITY_REPLACED
+    assert meta["fee_ratio"] == pytest.approx(-0.0002)
+    assert meta["fee_original_paid"] == pytest.approx(-10.0)
+    assert meta["fee_original_ratio"] == pytest.approx(-0.01)
+    assert meta["fee_original_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+    assert meta["fee_original_quality"] == fem.FEE_QUALITY_EXACT
+
+
+def test_fee_policy_sums_coalesced_raw_bybit_notional_before_sanity_check():
+    payload = {
+        "symbol": "ZEC/USDT:USDT",
+        "qty": 4.07,
+        "price": 552.0312776412776,
+        "fees": {"currency": "USDT", "cost": 0.44935346, "rate": 0.0002},
+        "raw": [
+            {
+                "source": "fetch_my_trades",
+                "data": {
+                    "info": {
+                        "execValue": "44.1448",
+                        "execQty": "0.08",
+                        "execFee": "0.00882896",
+                    }
+                },
+            },
+            {
+                "source": "fetch_my_trades",
+                "data": {
+                    "info": {
+                        "execValue": "872.7604",
+                        "execQty": "1.58",
+                        "execFee": "0.17455208",
+                    }
+                },
+            },
+            {
+                "source": "fetch_my_trades",
+                "data": {
+                    "info": {
+                        "execValue": "1329.8621",
+                        "execQty": "2.41",
+                        "execFee": "0.26597242",
+                    }
+                },
+            },
+        ],
+    }
+
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        payload,
+        fee_pct_fallback=0.0002,
+        fee_pct_sanity_abs_max=0.001,
+    )
+
+    assert fee_paid == pytest.approx(-0.44935346)
+    assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+    assert meta["fee_quality"] == fem.FEE_QUALITY_EXACT
+    assert meta["fee_notional"] == pytest.approx(2246.7673)
+    assert meta["fee_ratio"] == pytest.approx(-0.0002)
+
+
+def test_fee_policy_rechecks_degraded_cached_bybit_fee_from_raw_entries():
+    cached = {
+        "id": "exec-a+exec-b+exec-c",
+        "timestamp": 1_778_769_802_245,
+        "datetime": "2026-05-14T14:43:22.245Z",
+        "symbol": "ZEC/USDT:USDT",
+        "side": "sell",
+        "qty": -4.07,
+        "price": 552.0312776412776,
+        "pnl": 20.0,
+        "fee_paid": -0.00882896,
+        "pnl_contract": fem.PNL_CONTRACT_CURRENT,
+        "fee_source": fem.FEE_SOURCE_FALLBACK_PCT,
+        "fee_quality": fem.FEE_QUALITY_SANITY_REPLACED,
+        "fee_currency": "USDT",
+        "fee_notional": 44.1448,
+        "fee_ratio": -0.0002,
+        "pnl_status": "complete",
+        "fees": {"currency": "USDT", "cost": 0.44935346, "rate": 0.0002},
+        "pb_order_type": "close_grid_long",
+        "position_side": "long",
+        "client_order_id": "0xabc",
+        # This is the stale multiplier shape seen in copied Bybit caches; it
+        # was inferred from the first raw child against the aggregate qty.
+        "c_mult": 0.01964814068639863,
+        "raw": [
+            {
+                "source": "fetch_my_trades",
+                "data": {
+                    "info": {
+                        "execValue": "44.1448",
+                        "execQty": "0.08",
+                        "execFee": "0.00882896",
+                    }
+                },
+            },
+            {
+                "source": "fetch_my_trades",
+                "data": {
+                    "info": {
+                        "execValue": "872.7604",
+                        "execQty": "1.58",
+                        "execFee": "0.17455208",
+                    }
+                },
+            },
+            {
+                "source": "fetch_my_trades",
+                "data": {
+                    "info": {
+                        "execValue": "1329.8621",
+                        "execQty": "2.41",
+                        "execFee": "0.26597242",
+                    }
+                },
+            },
+        ],
+    }
+
+    event = FillEvent.from_dict(cached)
+
+    assert event.fee_paid == pytest.approx(-0.44935346)
+    assert event.fee_source == fem.FEE_SOURCE_REPORTED_QUOTE
+    assert event.fee_quality == fem.FEE_QUALITY_EXACT
+    assert event.fee_notional == pytest.approx(2246.7673)
+    assert event.fee_ratio == pytest.approx(-0.0002)
+    assert event.c_mult == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_fee_policy_warning_dedupes_and_logs_original_sanity_ratio(
+    tmp_path: Path, caplog
+):
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="fee_user",
+        fetcher=_StaticFetcher([]),
+        cache_path=tmp_path / "fills",
+        fee_pct_fallback=0.0002,
+        fee_pct_sanity_abs_max=0.001,
+    )
+    raw = {
+        "id": "duplicate-fee-event",
+        "timestamp": 1_700_000_000_000,
+        "symbol": "BTC/USDT:USDT",
+        "qty": 1.0,
+        "price": 1000.0,
+        "fees": {"currency": "USDT", "cost": 10.0},
+    }
+
+    caplog.set_level(logging.WARNING, logger=fem.logger.name)
+    await manager._apply_fee_policy_to_batch([dict(raw)])
+    await manager._apply_fee_policy_to_batch([dict(raw)])
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "fee policy used non-exact fee accounting" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "new_degraded=1" in warnings[0]
+    assert "symbols=BTC/USDT:USDT:1" in warnings[0]
+    assert "reasons=sanity_replaced:1" in warnings[0]
+    assert "id=duplicate-fee-event" in warnings[0]
+    assert "ratio=-0.00020000" in warnings[0]
+    assert "orig_source=reported_quote" in warnings[0]
+    assert "orig_ratio=-0.01000000" in warnings[0]
+    assert "orig_paid=-10.00000000" in warnings[0]
+
+
+def test_fee_policy_does_not_trust_fee_source_none_over_fee_entries():
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "qty": 1.0,
+            "price": 1000.0,
+            "fee_paid": 0.0,
+            "fee_source": fem.FEE_SOURCE_NONE,
+            "fees": {"currency": "USDT", "cost": 0.25},
+        },
+        fee_pct_fallback=0.0002,
+    )
+
+    assert fee_paid == pytest.approx(-0.25)
+    assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+    assert meta["fee_quality"] == fem.FEE_QUALITY_EXACT
+
+
+@pytest.mark.asyncio
+async def test_fee_conversion_cache_does_not_reuse_stale_fill_age(tmp_path: Path):
+    class _TickerApi:
+        markets = {"BNB/USDT": {}}
+
+        def __init__(self, ts: int) -> None:
+            self.ts = ts
+            self.calls = 0
+
+        async def fetch_ticker(self, symbol: str):
+            self.calls += 1
+            return {"symbol": symbol, "timestamp": self.ts, "last": 300.0}
+
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    fetcher = _StaticFetcher([])
+    api = _TickerApi(now_ms)
+    fetcher.api = api
+    manager = FillEventsManager(
+        exchange="binance",
+        user="user",
+        fetcher=fetcher,
+        cache_path=tmp_path,
+        fee_conversion_max_age_ms=24 * 60 * 60 * 1000,
+    )
+
+    stale_fill_ts = now_ms - 2 * 24 * 60 * 60 * 1000
+    assert await manager._fee_conversion_rate("BNB", "USDT", stale_fill_ts) is None
+    assert api.calls == 0
+
+    assert await manager._fee_conversion_rate("BNB", "USDT", now_ms) == pytest.approx(300.0)
+    assert api.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_persist_out_of_range_fetcher_rows(tmp_path: Path):
+    in_range_ts = 1_500
+    manager = FillEventsManager(
+        exchange="hyperliquid",
+        user="user",
+        fetcher=_StaticFetcher(
+            [
+                {
+                    "id": "old",
+                    "timestamp": 500,
+                    "datetime": "",
+                    "symbol": "BTC/USDC:USDC",
+                    "side": "buy",
+                    "qty": 1.0,
+                    "price": 100.0,
+                    "pnl": 0.0,
+                    "fees": {"currency": "USDC", "cost": 0.01},
+                    "pb_order_type": "unknown",
+                    "position_side": "long",
+                    "client_order_id": "",
+                },
+                {
+                    "id": "current",
+                    "timestamp": in_range_ts,
+                    "datetime": "",
+                    "symbol": "BTC/USDC:USDC",
+                    "side": "buy",
+                    "qty": 1.0,
+                    "price": 100.0,
+                    "pnl": 0.0,
+                    "fees": {"currency": "USDC", "cost": 0.01},
+                    "pb_order_type": "unknown",
+                    "position_side": "long",
+                    "client_order_id": "",
+                },
+            ]
+        ),
+        cache_path=tmp_path,
+    )
+
+    await manager.refresh(start_ms=1_000, end_ms=2_000)
+
+    loaded = FillEventCache(tmp_path).load()
+    assert [event.id for event in loaded] == ["current"]
+    assert loaded[0].timestamp == in_range_ts
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_malformed_fetcher_rows_without_partial_persist(tmp_path: Path):
+    valid_event = {
+        "id": "valid",
+        "timestamp": 1_500,
+        "datetime": "",
+        "symbol": "BTC/USDC:USDC",
+        "side": "buy",
+        "qty": 1.0,
+        "price": 100.0,
+        "pnl": 0.0,
+        "fees": {"currency": "USDC", "cost": 0.01},
+        "pb_order_type": "entry_grid_normal_long",
+        "position_side": "long",
+        "client_order_id": "cid-valid",
+    }
+    malformed_event = {
+        "id": "malformed",
+        "timestamp": 1_600,
+        "symbol": "BTC/USDC:USDC",
+    }
+    manager = FillEventsManager(
+        exchange="hyperliquid",
+        user="user",
+        fetcher=_StaticFetcher([valid_event, malformed_event]),
+        cache_path=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="malformed fill event"):
+        await manager.refresh(start_ms=1_000, end_ms=2_000)
+
+    assert FillEventCache(tmp_path).load() == []
+    assert FillEventCache(tmp_path).load_metadata()["last_refresh_ms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_range_empty_bounded_window_does_not_fetch_unbounded_latest(
+    tmp_path: Path,
+):
+    fetcher = _StaticFetcher(
+        [
+            {
+                "id": "old",
+                "timestamp": 500,
+                "datetime": "",
+                "symbol": "BTC/USDC:USDC",
+                "side": "buy",
+                "qty": 1.0,
+                "price": 100.0,
+                "pnl": 0.0,
+                "fees": {"currency": "USDC", "cost": 0.01},
+                "pb_order_type": "unknown",
+                "position_side": "long",
+                "client_order_id": "",
+            }
+        ]
+    )
+    manager = FillEventsManager(
+        exchange="hyperliquid",
+        user="user",
+        fetcher=fetcher,
+        cache_path=tmp_path,
+    )
+
+    await manager.refresh_range(start_ms=1_000, end_ms=2_000)
+
+    assert fetcher.calls == [(1_000, 2_000)]
+    assert FillEventCache(tmp_path).load() == []
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +1713,7 @@ def test_fill_event_cache_roundtrip(tmp_path: Path):
                 qty=1,
                 price=2,
                 pnl=0.0,
+                c_mult=10.0,
                 pb_order_type="entry",
                 position_side="long",
                 client_order_id="cid1",
@@ -891,16 +1737,626 @@ def test_fill_event_cache_roundtrip(tmp_path: Path):
     ]
 
     cache.save(events)
-    daily_files = sorted(p.name for p in cache_dir.glob("*.json"))
+    daily_files = sorted(p.name for p in cache_dir.glob("*.json") if p.name != "metadata.json")
     assert daily_files == ["2023-11-14.json", "2023-11-15.json"]
 
     loaded = cache.load()
     assert [ev.id for ev in loaded] == ["t1", "t0"]
+    assert loaded[0].c_mult == pytest.approx(10.0)
+
+
+def test_fill_event_cache_rejects_malformed_current_contract_record(tmp_path: Path):
+    cache_dir = tmp_path / "fills"
+    cache_dir.mkdir()
+    (cache_dir / "metadata.json").write_text(
+        json.dumps({"pnl_contract": fem.PNL_CONTRACT_CURRENT}),
+        encoding="utf-8",
+    )
+    (cache_dir / "2026-02-02.json").write_text(
+        json.dumps([{"id": "broken", "pnl_contract": fem.PNL_CONTRACT_CURRENT}]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FillEventCacheContractError, match="malformed"):
+        FillEventCache(cache_dir).load()
+
+
+def test_fill_event_cache_malformed_record_omits_exception_value(
+    tmp_path: Path, monkeypatch
+):
+    cache_dir = tmp_path / "fills"
+    cache_dir.mkdir()
+    (cache_dir / "metadata.json").write_text(
+        json.dumps({"pnl_contract": fem.PNL_CONTRACT_CURRENT}),
+        encoding="utf-8",
+    )
+    (cache_dir / "2026-02-02.json").write_text(
+        json.dumps([{"pnl_contract": fem.PNL_CONTRACT_CURRENT}]),
+        encoding="utf-8",
+    )
+    secret = "signature=malformed-record-secret"
+
+    def fail_from_dict(_raw):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(FillEvent, "from_dict", fail_from_dict)
+
+    with pytest.raises(FillEventCacheContractError) as exc_info:
+        FillEventCache(cache_dir).load()
+
+    assert "malformed" in str(exc_info.value)
+    assert "error_type=RuntimeError" in str(exc_info.value)
+    assert secret not in str(exc_info.value)
+
+
+def test_fill_event_cache_rejects_unreadable_current_contract_day(tmp_path: Path):
+    cache_dir = tmp_path / "fills"
+    cache_dir.mkdir()
+    (cache_dir / "metadata.json").write_text(
+        json.dumps({"pnl_contract": fem.PNL_CONTRACT_CURRENT}),
+        encoding="utf-8",
+    )
+    (cache_dir / "2026-02-01.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "good",
+                    "timestamp": 1_700_000_000_000,
+                    "datetime": "",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "buy",
+                    "qty": 1.0,
+                    "price": 100.0,
+                    "pnl": 0.0,
+                    "pb_order_type": "entry",
+                    "position_side": "long",
+                    "client_order_id": "cid",
+                    "pnl_contract": fem.PNL_CONTRACT_CURRENT,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (cache_dir / "2026-02-02.json").write_text("{broken json", encoding="utf-8")
+
+    with pytest.raises(FillEventCacheContractError, match="unreadable"):
+        FillEventCache(cache_dir).load()
+
+
+def test_fill_event_cache_read_failure_omits_exception_value(
+    tmp_path: Path, monkeypatch, caplog
+):
+    cache_dir = tmp_path / "fills"
+    cache_dir.mkdir()
+    (cache_dir / "metadata.json").write_text(
+        json.dumps({"pnl_contract": fem.PNL_CONTRACT_CURRENT}),
+        encoding="utf-8",
+    )
+    (cache_dir / "2026-02-02.json").write_text("[]", encoding="utf-8")
+    secret = "api_key=cache-read-secret"
+
+    class _CacheReadError(RuntimeError):
+        pass
+
+    original_load = fem.json.load
+
+    def fail_day_file(fh):
+        if Path(fh.name).name == "metadata.json":
+            return original_load(fh)
+        raise _CacheReadError(secret)
+
+    monkeypatch.setattr(fem.json, "load", fail_day_file)
+
+    with caplog.at_level(logging.WARNING, logger=fem.logger.name):
+        with pytest.raises(FillEventCacheContractError) as exc_info:
+            FillEventCache(cache_dir).load()
+
+    assert "error_type=RuntimeError" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, _CacheReadError)
+    assert "error_type=RuntimeError" in caplog.text
+    assert secret not in str(exc_info.value)
+    assert secret not in caplog.text
+
+
+def test_fill_event_cache_metadata_failure_omits_exception_value(
+    tmp_path: Path, monkeypatch, caplog
+):
+    cache_dir = tmp_path / "fills"
+    cache_dir.mkdir()
+    (cache_dir / "metadata.json").write_text("{}", encoding="utf-8")
+    secret = "token=cache-metadata-secret"
+
+    def fail_metadata(_fh):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(fem.json, "load", fail_metadata)
+
+    with caplog.at_level(logging.WARNING, logger=fem.logger.name):
+        metadata = FillEventCache(cache_dir).load_metadata()
+
+    assert metadata["history_scope"] == "unknown"
+    assert "error_type=RuntimeError" in caplog.text
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fill_event_cache_rejects_legacy_missing_pnl_contract(tmp_path: Path):
+    cache_dir = tmp_path / "legacy_contract"
+    cache_dir.mkdir()
+    legacy_payload = [
+        {
+            "id": "legacy-entry",
+            "timestamp": 1_700_000_000_000,
+            "datetime": "",
+            "symbol": "TON/USDT:USDT",
+            "side": "buy",
+            "qty": 1.0,
+            "price": 10.0,
+            "pnl": -0.01,
+            "fees": {"currency": "USDT", "cost": 0.01},
+            "pb_order_type": "entry_grid_long",
+            "position_side": "long",
+            "client_order_id": "cid-legacy",
+            "raw": [],
+        }
+    ]
+    (cache_dir / "2023-11-14.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+        fee_pct_sanity_abs_max=1.0,
+    )
+
+    with pytest.raises(FillEventCacheContractError, match="legacy or missing pnl_contract"):
+        await manager.ensure_loaded()
+
+
+@pytest.mark.asyncio
+async def test_doctor_reports_unsupported_legacy_cache_without_raising(tmp_path: Path):
+    cache_dir = tmp_path / "unsupported_legacy_contract"
+    cache_dir.mkdir()
+    legacy_payload = [
+        {
+            "id": "legacy-bitget-entry",
+            "timestamp": 1_700_000_000_000,
+            "datetime": "",
+            "symbol": "TON/USDT:USDT",
+            "side": "buy",
+            "qty": 1.0,
+            "price": 10.0,
+            "pnl": 0.0,
+            "fees": {"currency": "USDT", "cost": 0.01},
+            "pb_order_type": "entry_grid_long",
+            "position_side": "long",
+            "client_order_id": "cid-legacy",
+            "raw": [],
+        }
+    ]
+    (cache_dir / "2023-11-14.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+    manager = FillEventsManager(
+        exchange="bitget",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+        fee_pct_sanity_abs_max=1.0,
+    )
+
+    report = await manager.run_doctor(auto_repair=True)
+
+    assert report["legacy_contract"] is True
+    assert report["unsupported_legacy_contract"] is False
+    assert report["repaired"] is True
+    assert report["action"] == "quarantine_legacy_files"
+    assert report["legacy_files_quarantined"] == 1
+    assert report["backup_path"]
+    assert report["anomaly_events"] == 1
+    assert report["anomaly_examples"] == ["legacy-bitget-entry"]
+    assert report["anomaly_events_after"] == 0
+    assert FillEventCache(cache_dir).load() == []
+
+
+def test_doctor_cache_read_failure_omits_exception_value(
+    tmp_path: Path, monkeypatch, caplog
+):
+    cache_dir = tmp_path / "doctor_read_failure"
+    cache_dir.mkdir()
+    (cache_dir / "2023-11-14.json").write_text("[]", encoding="utf-8")
+    secret = "api_key=doctor-secret"
+
+    def fail_load(_fh):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(fem.json, "load", fail_load)
+
+    with caplog.at_level(logging.WARNING, logger=fem.logger.name):
+        result = FillEventCache(cache_dir).quarantine_legacy_record_files()
+
+    assert result == {"backup_path": None, "moved_files": []}
+    assert "error_type=RuntimeError" in caplog.text
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_doctor_quarantines_only_legacy_files_for_mixed_current_cache(tmp_path: Path):
+    cache_dir = tmp_path / "mixed_legacy_contract"
+    cache_dir.mkdir()
+    legacy_payload = [
+        {
+            "id": "legacy-hl-entry",
+            "timestamp": 1_700_000_000_000,
+            "datetime": "",
+            "symbol": "ETH/USDC:USDC",
+            "side": "buy",
+            "qty": 1.0,
+            "price": 100.0,
+            "pnl": 0.0,
+            "fees": {"currency": "USDC", "cost": 0.01},
+            "pb_order_type": "entry_grid_long",
+            "position_side": "long",
+            "client_order_id": "cid-legacy",
+            "raw": [],
+        }
+    ]
+    current_payload = [
+        {
+            "id": "current-hl-entry",
+            "source_ids": ["current-hl-entry"],
+            "timestamp": 1_700_086_400_000,
+            "datetime": "",
+            "symbol": "ETH/USDC:USDC",
+            "side": "buy",
+            "qty": 1.0,
+            "price": 100.0,
+            "pnl": 0.0,
+            "fee_paid": -0.01,
+            "pnl_contract": fem.PNL_CONTRACT_CURRENT,
+            "fee_source": fem.FEE_SOURCE_REPORTED_QUOTE,
+            "fee_quality": fem.FEE_QUALITY_EXACT,
+            "fee_currency": "USDC",
+            "fee_conversion_source": "same_currency",
+            "fee_notional": 100.0,
+            "fee_ratio": -0.0001,
+            "fees": {"currency": "USDC", "cost": 0.01},
+            "pb_order_type": "entry_grid_long",
+            "position_side": "long",
+            "client_order_id": "cid-current",
+            "raw": [],
+        }
+    ]
+    (cache_dir / "2023-11-14.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+    (cache_dir / "2023-11-15.json").write_text(json.dumps(current_payload), encoding="utf-8")
+    (cache_dir / "metadata.json").write_text(
+        json.dumps({"pnl_contract": fem.PNL_CONTRACT_CURRENT}),
+        encoding="utf-8",
+    )
+    manager = FillEventsManager(
+        exchange="hyperliquid",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+    )
+
+    report = await manager.run_doctor(auto_repair=True)
+
+    assert report["repaired"] is True
+    assert report["action"] == "quarantine_legacy_files"
+    assert report["legacy_files_quarantined"] == 1
+    assert not (cache_dir / "2023-11-14.json").exists()
+    assert (cache_dir / "2023-11-15.json").exists()
+    backup = Path(str(report["backup_path"]))
+    assert (backup / "2023-11-14.json").exists()
+    assert [ev.id for ev in FillEventCache(cache_dir).load()] == ["current-hl-entry"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_loaded_persists_repaired_hyperliquid_fee_notional(tmp_path: Path):
+    cache_dir = tmp_path / "stale_hyperliquid_current"
+    cache_dir.mkdir()
+    stale_payload = [
+        {
+            "id": "tid-a+tid-b",
+            "source_ids": ["tid-a", "tid-b"],
+            "timestamp": 1_700_000_000_000,
+            "datetime": "",
+            "symbol": "SUI/USDC:USDC",
+            "side": "sell",
+            "qty": -335.6,
+            "price": 1.0846,
+            "pnl": -9.796164,
+            "fee_paid": -0.021344928,
+            "pnl_contract": fem.PNL_CONTRACT_CURRENT,
+            "fee_source": fem.FEE_SOURCE_FALLBACK_PCT,
+            "fee_quality": fem.FEE_QUALITY_SANITY_REPLACED,
+            "fee_currency": "USDC",
+            "fee_conversion_source": "same_currency",
+            "fee_notional": 106.72464,
+            "fee_ratio": -0.0002,
+            "pnl_status": "complete",
+            "pnl_source": fem.PNL_SOURCE_AUTHORITATIVE,
+            "fees": {"currency": "USDC", "cost": 0.163796},
+            "pb_order_type": "close_auto_reduce_wel_long",
+            "position_side": "long",
+            "client_order_id": "0xabc",
+            "c_mult": 1.0,
+            "raw": [
+                {
+                    "source": "fetch_my_trades",
+                    "data": {
+                        "cost": 106.72464,
+                        "fee": {"currency": "USDC", "cost": 0.048026},
+                    },
+                },
+                {
+                    "source": "fetch_my_trades",
+                    "data": {
+                        "cost": 257.26712,
+                        "fee": {"currency": "USDC", "cost": 0.11577},
+                    },
+                },
+            ],
+        }
+    ]
+    (cache_dir / "2023-11-14.json").write_text(json.dumps(stale_payload), encoding="utf-8")
+    (cache_dir / "metadata.json").write_text(
+        json.dumps({"pnl_contract": fem.PNL_CONTRACT_CURRENT}),
+        encoding="utf-8",
+    )
+    manager = FillEventsManager(
+        exchange="hyperliquid",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+    )
+
+    await manager.ensure_loaded()
+
+    repaired_payload = json.loads((cache_dir / "2023-11-14.json").read_text(encoding="utf-8"))
+    repaired = repaired_payload[0]
+    assert repaired["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+    assert repaired["fee_quality"] == fem.FEE_QUALITY_EXACT
+    assert repaired["fee_paid"] == pytest.approx(-0.163796)
+    assert repaired["fee_notional"] == pytest.approx(363.99176)
+    assert repaired["fee_ratio"] == pytest.approx(-0.00044999919778403776)
+
+
+@pytest.mark.asyncio
+async def test_doctor_repairs_metadata_only_legacy_cache_for_any_exchange(tmp_path: Path):
+    cache_dir = tmp_path / "metadata_only_legacy"
+    cache_dir.mkdir()
+    event = _kucoin_manager_fill(
+        "current-row",
+        1_700_000_000_000,
+        side="buy",
+        qty=1.0,
+        price=10.0,
+        fees={"currency": "USDT", "cost": 0.1},
+    )
+    event["pnl_contract"] = fem.PNL_CONTRACT_CURRENT
+    event["fee_paid"] = -0.1
+    (cache_dir / "2023-11-14.json").write_text(json.dumps([event]), encoding="utf-8")
+    manager = FillEventsManager(
+        exchange="hyperliquid",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+    )
+
+    report = await manager.run_doctor(auto_repair=True)
+
+    assert report["legacy_contract"] is True
+    assert report["repaired"] is True
+    assert FillEventCache(cache_dir).load_metadata()["pnl_contract"] == fem.PNL_CONTRACT_CURRENT
+    assert [ev.id for ev in FillEventCache(cache_dir).load()] == ["current-row"]
+
+
+def test_fill_event_cache_quarantine_for_rebuild_moves_legacy_payload(tmp_path: Path):
+    cache_dir = tmp_path / "fills"
+    cache_dir.mkdir()
+    (cache_dir / "2023-11-14.json").write_text("[]", encoding="utf-8")
+    cache = FillEventCache(cache_dir)
+
+    quarantined = cache.quarantine_for_rebuild(reason="legacy pnl contract")
+
+    assert quarantined is not None
+    quarantine_path = Path(str(quarantined))
+    assert quarantine_path.exists()
+    assert (quarantine_path / "2023-11-14.json").exists()
+    assert cache_dir.exists()
+    assert list(cache_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_kucoin_doctor_repairs_legacy_contract_with_backup(tmp_path: Path):
+    cache_dir = tmp_path / "legacy_repair"
+    cache_dir.mkdir()
+    ts = 1_700_000_000_000
+    legacy_payload = [
+        _kucoin_manager_fill(
+            "legacy-entry",
+            ts,
+            side="buy",
+            qty=1.0,
+            price=10.0,
+            fees={"currency": "USDT", "cost": 0.1},
+        ),
+        _kucoin_manager_fill(
+            "legacy-close",
+            ts + 60_000,
+            side="sell",
+            qty=-1.0,
+            price=12.0,
+            fees={"currency": "USDT", "cost": 0.2},
+        ),
+    ]
+    legacy_payload[0]["pnl"] = -0.1
+    legacy_payload[1]["pnl"] = 1.7
+    (cache_dir / "2023-11-14.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+        fee_pct_sanity_abs_max=1.0,
+    )
+
+    report = await manager.run_doctor(auto_repair=True)
+
+    assert report["legacy_contract"] is True
+    assert report["repaired"] is True
+    assert report["backup_path"]
+    assert Path(str(report["backup_path"])).exists()
+    repaired = FillEventCache(cache_dir).load()
+    by_id = {event.id: event for event in repaired}
+    assert by_id["legacy-entry"].pnl == pytest.approx(0.0)
+    assert by_id["legacy-entry"].fee_paid == pytest.approx(-0.1)
+    assert by_id["legacy-close"].pnl == pytest.approx(2.0)
+    assert by_id["legacy-close"].fee_paid == pytest.approx(-0.2)
+
+
+@pytest.mark.asyncio
+async def test_kucoin_doctor_clean_cache_does_not_report_repaired(tmp_path: Path):
+    cache_dir = tmp_path / "clean_kucoin"
+    cache_dir.mkdir()
+    event = _kucoin_manager_fill(
+        "clean-entry",
+        1_700_000_000_000,
+        side="buy",
+        qty=1.0,
+        price=10.0,
+        fees={"currency": "USDT", "cost": 0.1},
+    )
+    event["pnl_contract"] = fem.PNL_CONTRACT_CURRENT
+    event["fee_paid"] = -0.1
+    (cache_dir / "2023-11-14.json").write_text(json.dumps([event]), encoding="utf-8")
+    (cache_dir / "metadata.json").write_text(
+        json.dumps({"pnl_contract": fem.PNL_CONTRACT_CURRENT}),
+        encoding="utf-8",
+    )
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+    )
+
+    report = await manager.run_doctor(auto_repair=False)
+
+    assert report["anomaly_events"] == 0
+    assert report["repaired"] is False
+
+
+@pytest.mark.asyncio
+async def test_kucoin_doctor_repair_applies_contract_multiplier(tmp_path: Path):
+    cache_dir = tmp_path / "legacy_repair_c_mult"
+    cache_dir.mkdir()
+    ts = 1_700_000_000_000
+    legacy_payload = [
+        _kucoin_manager_fill(
+            "legacy-entry",
+            ts,
+            side="buy",
+            qty=1.0,
+            price=10.0,
+            fees={"currency": "USDT", "cost": 0.1},
+        ),
+        _kucoin_manager_fill(
+            "legacy-close",
+            ts + 60_000,
+            side="sell",
+            qty=-1.0,
+            price=12.0,
+            fees={"currency": "USDT", "cost": 0.2},
+        ),
+    ]
+    for row in legacy_payload:
+        row["c_mult"] = 5.0
+    (cache_dir / "2023-11-14.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+        fee_pct_sanity_abs_max=1.0,
+    )
+
+    report = await manager.run_doctor(auto_repair=True)
+
+    assert report["repaired"] is True
+    repaired = FillEventCache(cache_dir).load()
+    by_id = {event.id: event for event in repaired}
+    assert by_id["legacy-entry"].c_mult == pytest.approx(5.0)
+    assert by_id["legacy-close"].c_mult == pytest.approx(5.0)
+    assert by_id["legacy-close"].pnl == pytest.approx(10.0)
 
 
 # ---------------------------------------------------------------------------
 # BitgetFetcher tests
 # ---------------------------------------------------------------------------
+
+
+def test_fill_events_manager_custom_id_decode_does_not_return_raw_id():
+    assert custom_id_to_snake("external-order-without-passivbot-marker") == "unknown"
+    assert custom_id_to_snake("12345678") == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_bitget_fetcher_rejects_ambiguous_side_payload(monkeypatch):
+    fills = [
+        [
+            {
+                "tradeId": "tid-ambiguous",
+                "orderId": "oid-ambiguous",
+                "cTime": "1000",
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "baseVolume": "0.1",
+                "price": "10",
+                "profit": "0",
+            }
+        ]
+    ]
+    api = _FakeBitgetAPI(fills)
+    resolver = lambda s: f"{s[:-4]}/USDT:USDT" if s and s.endswith("USDT") else s
+    fetcher = BitgetFetcher(api, symbol_resolver=resolver)
+
+    with pytest.raises(ValueError, match="cannot infer Bitget fill side/position_side"):
+        await fetcher.fetch(since_ms=500, until_ms=2000, detail_cache={})
+
+
+@pytest.mark.asyncio
+async def test_fill_events_cli_prepares_bitget_uta_fetcher_mode():
+    class _Bot:
+        exchange = "bitget"
+
+        def __init__(self):
+            self.cca = types.SimpleNamespace(options={})
+            self.detect_calls = 0
+
+        async def _detect_account_mode(self):
+            self.detect_calls += 1
+            self.cca.options["uta"] = True
+
+    bot = _Bot()
+
+    await fem._prepare_cli_fetcher_bot(bot)
+    fetcher = fem._build_fetcher_for_bot(bot, ["BTC"])
+
+    assert bot.detect_calls == 1
+    assert isinstance(fetcher, BitgetFetcher)
+    assert fetcher.api.options["uta"] is True
+
+
+@pytest.mark.asyncio
+async def test_fill_events_cli_prepare_skips_non_bitget_bot():
+    class _Bot:
+        exchange = "binance"
+
+        async def _detect_account_mode(self):
+            raise AssertionError("non-Bitget CLI fetchers must not probe Bitget UTA mode")
+
+    await fem._prepare_cli_fetcher_bot(_Bot())
 
 
 @pytest.mark.asyncio
@@ -912,6 +2368,8 @@ async def test_bitget_fetcher_enriches_and_deduplicates(monkeypatch):
                 "orderId": "oid-1",
                 "cTime": "1000",
                 "symbol": "BTCUSDT",
+                "tradeSide": "open",
+                "posMode": "hedge_mode",
                 "side": "buy",
                 "baseVolume": "0.1",
                 "price": "10",
@@ -922,6 +2380,8 @@ async def test_bitget_fetcher_enriches_and_deduplicates(monkeypatch):
                 "orderId": "oid-1",
                 "cTime": "1500",
                 "symbol": "BTCUSDT",
+                "tradeSide": "close",
+                "posMode": "hedge_mode",
                 "side": "sell",
                 "baseVolume": "0.1",
                 "price": "11",
@@ -968,6 +2428,100 @@ async def test_bitget_fetcher_enriches_and_deduplicates(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_bitget_fetcher_maps_hedge_bare_close_sides(monkeypatch):
+    fills = [
+        [
+            {
+                "tradeId": "tid-close-short",
+                "orderId": "oid-close-short",
+                "cTime": "1000",
+                "symbol": "BTCUSDT",
+                "tradeSide": "close",
+                "posMode": "hedge_mode",
+                "side": "buy",
+                "baseVolume": "0.1",
+                "price": "10",
+                "profit": "1",
+            },
+            {
+                "tradeId": "tid-close-long",
+                "orderId": "oid-close-long",
+                "cTime": "1001",
+                "symbol": "BTCUSDT",
+                "tradeSide": "close",
+                "posMode": "hedge_mode",
+                "side": "sell",
+                "baseVolume": "0.1",
+                "price": "10",
+                "profit": "1",
+            },
+        ]
+    ]
+    api = _FakeBitgetAPI(fills)
+    monkeypatch.setattr("src.fill_events_manager.custom_id_to_snake", lambda value: value)
+    resolver = lambda s: f"{s[:-4]}/USDT:USDT" if s and s.endswith("USDT") else s
+    fetcher = BitgetFetcher(api, symbol_resolver=resolver)
+
+    events = await fetcher.fetch(
+        since_ms=500,
+        until_ms=2000,
+        detail_cache={
+            "tid-close-short": ("client-short", "close_grid_short"),
+            "tid-close-long": ("client-long", "close_grid_long"),
+        },
+    )
+
+    by_id = {event["id"]: event for event in events}
+    assert by_id["tid-close-short"]["side"] == "buy"
+    assert by_id["tid-close-short"]["position_side"] == "short"
+    assert by_id["tid-close-long"]["side"] == "sell"
+    assert by_id["tid-close-long"]["position_side"] == "long"
+
+
+@pytest.mark.asyncio
+async def test_bitget_fetcher_preserves_signed_fee_detail(monkeypatch):
+    fills = [
+        [
+            {
+                "tradeId": "tid-fee",
+                "orderId": "oid-fee",
+                "cTime": "1000",
+                "symbol": "XLMUSDT",
+                "tradeSide": "open",
+                "posMode": "hedge_mode",
+                "side": "buy",
+                "baseVolume": "174",
+                "price": "0.22375",
+                "profit": "0",
+                "feeDetail": [
+                    {
+                        "feeCoin": "USDT",
+                        "totalFee": "-0.0077865",
+                        "totalDeductionFee": "0",
+                    }
+                ],
+            }
+        ]
+    ]
+    api = _FakeBitgetAPI(fills)
+    monkeypatch.setattr("src.fill_events_manager.custom_id_to_snake", lambda value: value)
+    resolver = lambda s: f"{s[:-4]}/USDT:USDT" if s and s.endswith("USDT") else s
+    fetcher = BitgetFetcher(api, symbol_resolver=resolver)
+
+    events = await fetcher.fetch(
+        since_ms=500,
+        until_ms=2000,
+        detail_cache={"tid-fee": ("client", "entry_grid_long")},
+    )
+
+    assert len(events) == 1
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(events[0])
+    assert fee_paid == pytest.approx(-0.0077865)
+    assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+    assert meta["fee_quality"] == fem.FEE_QUALITY_EXACT
+
+
+@pytest.mark.asyncio
 async def test_bitget_fetcher_paginates_across_sparse_history(monkeypatch):
     day = 24 * 60 * 60 * 1000
     recent = [
@@ -976,6 +2530,8 @@ async def test_bitget_fetcher_paginates_across_sparse_history(monkeypatch):
             "orderId": "oid-new-1",
             "cTime": str(210 * day),
             "symbol": "BTCUSDT",
+            "tradeSide": "open",
+            "posMode": "hedge_mode",
             "side": "buy",
             "baseVolume": "0.1",
             "price": "10",
@@ -986,6 +2542,8 @@ async def test_bitget_fetcher_paginates_across_sparse_history(monkeypatch):
             "orderId": "oid-new-2",
             "cTime": str(209 * day),
             "symbol": "BTCUSDT",
+            "tradeSide": "open",
+            "posMode": "hedge_mode",
             "side": "sell",
             "baseVolume": "0.1",
             "price": "11",
@@ -998,6 +2556,8 @@ async def test_bitget_fetcher_paginates_across_sparse_history(monkeypatch):
             "orderId": "oid-gap",
             "cTime": str(150 * day),
             "symbol": "BTCUSDT",
+            "tradeSide": "open",
+            "posMode": "hedge_mode",
             "side": "buy",
             "baseVolume": "0.05",
             "price": "9",
@@ -1010,6 +2570,8 @@ async def test_bitget_fetcher_paginates_across_sparse_history(monkeypatch):
             "orderId": "oid-old",
             "cTime": str(20 * day),
             "symbol": "BTCUSDT",
+            "tradeSide": "open",
+            "posMode": "hedge_mode",
             "side": "sell",
             "baseVolume": "0.2",
             "price": "8",
@@ -1063,6 +2625,8 @@ async def test_bitget_fetcher_handles_empty_batches(monkeypatch):
                 "orderId": "oid-gap-old",
                 "cTime": str(15 * day),
                 "symbol": "BTCUSDT",
+                "tradeSide": "open",
+                "posMode": "hedge_mode",
                 "side": "buy",
                 "baseVolume": "0.1",
                 "price": "10",
@@ -1103,6 +2667,8 @@ async def test_bitget_fetcher_reuses_detail_cache(monkeypatch):
                 "orderId": "oid-3",
                 "cTime": "3000",
                 "symbol": "ETHUSDT",
+                "tradeSide": "open",
+                "posMode": "hedge_mode",
                 "side": "buy",
                 "baseVolume": "1",
                 "price": "100",
@@ -1143,6 +2709,174 @@ async def test_bitget_fetcher_reuses_detail_cache(monkeypatch):
     assert events[0]["pb_order_type"] == "cached-type"
     assert len(batch_log) == 1
     assert events[0]["symbol"].endswith(":USDT")
+
+
+@pytest.mark.asyncio
+async def test_bitget_uta_fetcher_derives_position_side_without_pos_side(monkeypatch):
+    fills = [
+        [
+            {
+                "execId": "exec-open-short",
+                "orderId": "order-open-short",
+                "clientOid": "0x0001abcdef",
+                "createdTime": "1000",
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "tradeSide": "open",
+                "execQty": "0.1",
+                "execPrice": "10",
+                "execPnl": "0",
+                "feeDetail": [{"feeCoin": "USDT", "fee": "0.0001"}],
+            },
+            {
+                "execId": "exec-close-short",
+                "orderId": "order-close-short",
+                "clientOid": "0x0002abcdef",
+                "createdTime": "1100",
+                "symbol": "BTCUSDT",
+                "side": "buy",
+                "tradeSide": "close",
+                "execQty": "0.1",
+                "execPrice": "9",
+                "execPnl": "1",
+                "feeDetail": [{"feeCoin": "USDT", "fee": "0.0001"}],
+            },
+            {
+                "execId": "exec-close-long",
+                "orderId": "order-close-long",
+                "clientOid": "0x0003abcdef",
+                "createdTime": "1200",
+                "symbol": "BTCUSDT",
+                "side": "sell",
+                "tradeSide": "close",
+                "execQty": "0.1",
+                "execPrice": "11",
+                "execPnl": "1",
+                "feeDetail": [{"feeCoin": "USDT", "fee": "0.0001"}],
+            },
+        ]
+    ]
+    api = _FakeBitgetAPI(fills, options={"uta": True})
+    resolver = lambda s: f"{s[:-4]}/USDT:USDT" if s and s.endswith("USDT") else s
+    monkeypatch.setattr("src.fill_events_manager.custom_id_to_snake", lambda value: value)
+
+    fetcher = BitgetFetcher(
+        api,
+        history_limit=100,
+        now_func=lambda: 2000,
+        symbol_resolver=resolver,
+    )
+
+    events = await fetcher.fetch(
+        since_ms=900,
+        until_ms=2000,
+        detail_cache={},
+        on_batch=None,
+    )
+
+    by_id = {event["id"]: event for event in events}
+    assert by_id["exec-open-short"]["position_side"] == "short"
+    assert by_id["exec-close-short"]["position_side"] == "short"
+    assert by_id["exec-close-short"]["side"] == "buy"
+    assert by_id["exec-close-long"]["position_side"] == "long"
+    assert by_id["exec-close-long"]["side"] == "sell"
+    assert by_id["exec-open-short"]["fees"][0]["fee_paid"] == pytest.approx(-0.0001)
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(by_id["exec-open-short"])
+    assert fee_paid == pytest.approx(-0.0001)
+    assert meta["fee_source"] == fem.FEE_SOURCE_REPORTED_QUOTE
+    assert api.detail_calls == []
+    assert api.history_calls[0]["category"] == "USDT-FUTURES"
+    assert api.history_calls[0]["startTime"] == 900
+
+
+@pytest.mark.asyncio
+async def test_bitget_uta_fetcher_rejects_malformed_rows():
+    api = _FakeBitgetAPI(
+        [
+            [
+                {
+                    "execId": "exec-bad",
+                    "orderId": "order-bad",
+                    "createdTime": "1000",
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "tradeSide": "open",
+                    "execPrice": "10",
+                    "execPnl": "0",
+                }
+            ]
+        ],
+        options={"uta": True},
+    )
+    resolver = lambda s: f"{s[:-4]}/USDT:USDT" if s and s.endswith("USDT") else s
+    fetcher = BitgetFetcher(
+        api,
+        history_limit=100,
+        now_func=lambda: 2000,
+        symbol_resolver=resolver,
+    )
+
+    with pytest.raises(ValueError, match="execQty"):
+        await fetcher.fetch(since_ms=900, until_ms=2000, detail_cache={}, on_batch=None)
+
+
+@pytest.mark.asyncio
+async def test_bitget_uta_fetcher_splits_long_lookback_into_30_day_windows(monkeypatch):
+    day_ms = 24 * 60 * 60 * 1000
+    api = _FakeBitgetAPI(
+        [
+            [
+                {
+                    "execId": "exec-new",
+                    "orderId": "order-new",
+                    "clientOid": "0x0001abcdef",
+                    "createdTime": str(59 * day_ms),
+                    "symbol": "BTCUSDT",
+                    "side": "sell",
+                    "tradeSide": "open",
+                    "execQty": "0.1",
+                    "execPrice": "10",
+                    "execPnl": "0",
+                }
+            ],
+            [
+                {
+                    "execId": "exec-old",
+                    "orderId": "order-old",
+                    "clientOid": "0x0002abcdef",
+                    "createdTime": str(10 * day_ms),
+                    "symbol": "BTCUSDT",
+                    "side": "buy",
+                    "tradeSide": "close",
+                    "execQty": "0.1",
+                    "execPrice": "9",
+                    "execPnl": "1",
+                }
+            ],
+        ],
+        options={"uta": True},
+    )
+    resolver = lambda s: f"{s[:-4]}/USDT:USDT" if s and s.endswith("USDT") else s
+    monkeypatch.setattr("src.fill_events_manager.custom_id_to_snake", lambda value: value)
+
+    fetcher = BitgetFetcher(
+        api,
+        history_limit=100,
+        now_func=lambda: 60 * day_ms,
+        symbol_resolver=resolver,
+    )
+
+    events = await fetcher.fetch(
+        since_ms=0,
+        until_ms=60 * day_ms,
+        detail_cache={},
+        on_batch=None,
+    )
+
+    assert [event["id"] for event in events] == ["exec-old", "exec-new"]
+    assert len(api.history_calls) == 2
+    for call in api.history_calls:
+        assert int(call["endTime"]) - int(call["startTime"]) < 30 * day_ms
 
 
 @pytest.mark.asyncio
@@ -1206,11 +2940,102 @@ async def test_bybit_fetcher_merges_pnl_and_batches(monkeypatch):
     event = events[0]
     assert event["id"] == "trade-1"
     assert event["pb_order_type"] == "close_grid_long"
-    # PnL = (105 - 100) * 0.1 - fees = 0.5 - 0.0002 = 0.4998
-    assert event["pnl"] == pytest.approx(0.4998, rel=1e-3)
+    # Canonical PnL is gross; fees are carried separately as signed fee_paid.
+    assert event["pnl"] == pytest.approx(0.5, rel=1e-3)
+    assert FillEvent.from_dict(event).fee_paid == pytest.approx(-0.0001)
+    assert event["pnl_status"] == "complete"
     assert event["client_order_id"] == "0xabc"
     assert event["symbol"] == "BTC/USDT"
     assert batches and batches[0][0]["id"] == "trade-1"
+
+
+@pytest.mark.asyncio
+async def test_bybit_closed_pnl_uses_contiguous_cursor_paginated_windows():
+    day_ms = 24 * 60 * 60 * 1000
+    end_ms = 2_000_000_000_000
+    start_ms = end_ms - 14 * day_ms
+
+    def record(order_id: str, timestamp: int) -> Dict[str, object]:
+        return {
+            "symbol": "XMRUSDT",
+            "orderId": order_id,
+            "side": "Sell",
+            "closedPnl": "1.0",
+            "closedSize": "0.1",
+            "avgEntryPrice": "300.0",
+            "avgExitPrice": "310.0",
+            "updatedTime": str(timestamp),
+            "createdTime": str(timestamp),
+            "leverage": "1",
+        }
+
+    class _WindowedBybitAPI:
+        markets = {}
+
+        def __init__(self):
+            self.calls: List[Dict[str, object]] = []
+            self.responses = [
+                {
+                    "result": {
+                        "list": [record("recent-1", end_ms - day_ms)],
+                        "nextPageCursor": "recent-page-2",
+                    }
+                },
+                {
+                    "result": {
+                        "list": [record("recent-2", end_ms - 2 * day_ms)],
+                        "nextPageCursor": "",
+                    }
+                },
+                {"result": {"list": [], "nextPageCursor": ""}},
+                {
+                    "result": {
+                        "list": [record("old-sparse", start_ms + day_ms)],
+                        "nextPageCursor": "",
+                    }
+                },
+            ]
+
+        async def private_get_v5_position_closed_pnl(self, params):
+            self.calls.append(dict(params))
+            return self.responses.pop(0)
+
+    api = _WindowedBybitAPI()
+    fetcher = BybitFetcher(api, max_span_days=6.5)
+
+    positions = await fetcher._fetch_positions_history(start_ms, end_ms)
+
+    assert {row["info"]["orderId"] for row in positions} == {
+        "recent-1",
+        "recent-2",
+        "old-sparse",
+    }
+    assert len(api.calls) == 4
+    assert api.calls[1]["cursor"] == "recent-page-2"
+    assert api.calls[1]["startTime"] == api.calls[0]["startTime"]
+    assert api.calls[1]["endTime"] == api.calls[0]["endTime"]
+    window_calls = [api.calls[0], api.calls[2], api.calls[3]]
+    assert window_calls[1]["endTime"] == window_calls[0]["startTime"] - 1
+    assert window_calls[2]["endTime"] == window_calls[1]["startTime"] - 1
+    assert window_calls[-1]["startTime"] == start_ms
+    assert all(
+        call["endTime"] - call["startTime"] <= fetcher._max_span_ms
+        for call in window_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_bybit_closed_pnl_fetch_propagates_api_error():
+    api = types.SimpleNamespace(
+        markets={},
+        private_get_v5_position_closed_pnl=AsyncMock(
+            side_effect=RuntimeError("closed-pnl unavailable")
+        ),
+    )
+    fetcher = BybitFetcher(api)
+
+    with pytest.raises(RuntimeError, match="closed-pnl unavailable"):
+        await fetcher._fetch_positions_history(1_900_000_000_000, 1_900_000_060_000)
 
 
 @pytest.mark.asyncio
@@ -1249,6 +3074,7 @@ async def test_bybit_fetcher_uses_detail_cache(monkeypatch):
     event = events[0]
     assert event["client_order_id"] == "cached-id"
     assert event["pb_order_type"] == "cached-type"
+    assert event["pnl_status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -1320,6 +3146,7 @@ async def test_bybit_fetcher_distributes_pnl_across_fills():
     # Second fill: (10.5 - 11.0) * 3.0 = -1.5
     assert pnls[0] == pytest.approx(-2.0, rel=1e-3)
     assert pnls[1] == pytest.approx(-1.5, rel=1e-3)
+    assert [event["pnl_status"] for event in events] == ["complete", "complete"]
 
     # Verify raw field includes positions_history data for close fills
     for event in events:
@@ -1676,6 +3503,73 @@ async def test_bybit_fetcher_deduplicates_duplicate_exec_ids_before_coalescing()
 
 
 @pytest.mark.asyncio
+async def test_manager_refresh_replaces_bybit_source_id_subsets_without_double_count(
+    tmp_path: Path,
+):
+    ts = 1_770_000_000_000
+
+    def event_payload(event_id: str, source_ids: List[str], qty: float) -> Dict[str, object]:
+        return {
+            "id": event_id,
+            "source_ids": source_ids,
+            "timestamp": ts,
+            "datetime": "2026-02-28T00:00:00",
+            "symbol": "BTC/USDT:USDT",
+            "side": "sell",
+            "qty": qty,
+            "price": 100.0,
+            "pnl": -1.0,
+            "fees": {"currency": "USDT", "cost": 0.01},
+            "pb_order_type": "close_auto_reduce_wel_long",
+            "position_side": "long",
+            "client_order_id": "0xabc",
+            "raw": [],
+        }
+
+    # A richer fetched coalesced event replaces cached singleton source coverage.
+    cache_path = tmp_path / "fills_bybit_source_overlap_superset"
+    FillEventCache(cache_path).save(
+        [FillEvent.from_dict(event_payload("exec-a", ["exec-a"], -0.4))]
+    )
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="u",
+        fetcher=_StaticFetcher(
+            [event_payload("exec-a+exec-b", ["exec-a", "exec-b"], 1.0)]
+        ),
+        cache_path=cache_path,
+    )
+
+    await manager.refresh(start_ms=ts - 1_000, end_ms=ts + 1_000)
+
+    events = manager.get_events()
+    assert len(events) == 1
+    assert events[0].id == "exec-a+exec-b"
+    assert events[0].source_ids == ["exec-a", "exec-b"]
+    assert events[0].qty == pytest.approx(-1.0)
+
+    # A partial fetched event is skipped when the cache already has richer coverage.
+    cache_path = tmp_path / "fills_bybit_source_overlap_subset"
+    FillEventCache(cache_path).save(
+        [FillEvent.from_dict(event_payload("exec-a+exec-b", ["exec-a", "exec-b"], -1.0))]
+    )
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="u",
+        fetcher=_StaticFetcher([event_payload("exec-a", ["exec-a"], 0.4)]),
+        cache_path=cache_path,
+    )
+
+    await manager.refresh(start_ms=ts - 1_000, end_ms=ts + 1_000)
+
+    events = manager.get_events()
+    assert len(events) == 1
+    assert events[0].id == "exec-a+exec-b"
+    assert events[0].source_ids == ["exec-a", "exec-b"]
+    assert events[0].qty == pytest.approx(-1.0)
+
+
+@pytest.mark.asyncio
 async def test_fill_events_manager_bybit_doctor_detects_cross_event_duplicates(tmp_path: Path):
     cache_path = tmp_path / "fills_doctor_detect"
     ts = 1_770_000_000_000
@@ -1858,6 +3752,166 @@ async def test_fill_events_manager_bybit_doctor_auto_repairs_cross_event_duplica
 
 
 @pytest.mark.asyncio
+async def test_fill_events_manager_bybit_doctor_repairs_legacy_duplicate_cache(tmp_path: Path):
+    cache_path = tmp_path / "fills_doctor_legacy_bybit"
+    cache_path.mkdir()
+    ts = 1_770_000_000_000
+    trade_a = {
+        "id": "exec-a",
+        "timestamp": ts,
+        "amount": 0.4,
+        "price": 100.0,
+        "side": "sell",
+        "symbol": "BTC/USDT:USDT",
+        "fee": {"currency": "USDT", "cost": 0.02},
+        "info": {"execId": "exec-a", "orderId": "order-1", "execQty": "0.4", "closedSize": "0.4"},
+    }
+    pos_hist = {
+        "source": "positions_history",
+        "data": {
+            "info": {
+                "orderId": "order-1",
+                "avgEntryPrice": "110.0",
+                "closedSize": "0.4",
+                "closeFee": "0.02",
+                "openFee": "0.0",
+            }
+        },
+    }
+    legacy_payload = [
+        {
+            "id": "exec-a+exec-a",
+            "source_ids": ["exec-a"],
+            "timestamp": ts,
+            "datetime": "2026-02-02T00:00:00",
+            "symbol": "BTC/USDT:USDT",
+            "side": "sell",
+            "qty": -0.8,
+            "price": 100.0,
+            "pnl": -8.0,
+            "c_mult": 10.0,
+            "fees": {"currency": "USDT", "cost": 0.04},
+            "pb_order_type": "close_auto_reduce_wel_long",
+            "position_side": "long",
+            "client_order_id": "0xabc",
+            "raw": [
+                {"source": "fetch_my_trades", "data": dict(trade_a)},
+                {"source": "fetch_my_trades", "data": dict(trade_a)},
+                dict(pos_hist),
+            ],
+        }
+    ]
+    (cache_path / "2026-02-02.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="u",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_path,
+    )
+
+    with pytest.raises(FillEventCacheContractError):
+        await manager.ensure_loaded()
+
+    report = await manager.run_doctor(auto_repair=True)
+    assert report["legacy_contract"] is True
+    assert report["anomaly_events"] > 0
+    assert report["repaired"] is True
+
+    repaired = FillEventCache(cache_path).load()
+    assert len(repaired) == 1
+    assert repaired[0].pnl_contract == fem.PNL_CONTRACT_CURRENT
+    assert repaired[0].qty == pytest.approx(-0.4)
+    assert repaired[0].c_mult == pytest.approx(10.0)
+    assert repaired[0].pnl == pytest.approx(-40.0)
+
+
+@pytest.mark.asyncio
+async def test_bybit_doctor_does_not_stamp_unproven_legacy_rows_current(tmp_path: Path):
+    cache_path = tmp_path / "fills_doctor_legacy_bybit_mixed"
+    cache_path.mkdir()
+    ts = 1_770_000_000_000
+    trade_a = {
+        "id": "exec-a",
+        "timestamp": ts,
+        "amount": 0.4,
+        "price": 100.0,
+        "side": "sell",
+        "symbol": "BTC/USDT:USDT",
+        "fee": {"currency": "USDT", "cost": 0.02},
+        "info": {"execId": "exec-a", "orderId": "order-1", "execQty": "0.4", "closedSize": "0.4"},
+    }
+    pos_hist = {
+        "source": "positions_history",
+        "data": {
+            "info": {
+                "orderId": "order-1",
+                "avgEntryPrice": "110.0",
+                "closedSize": "0.4",
+                "closeFee": "0.02",
+                "openFee": "0.0",
+            }
+        },
+    }
+    legacy_payload = [
+        {
+            "id": "exec-a+exec-a",
+            "source_ids": ["exec-a"],
+            "timestamp": ts,
+            "datetime": "2026-02-02T00:00:00",
+            "symbol": "BTC/USDT:USDT",
+            "side": "sell",
+            "qty": -0.8,
+            "price": 100.0,
+            "pnl": -8.0,
+            "fees": {"currency": "USDT", "cost": 0.04},
+            "pb_order_type": "close_auto_reduce_wel_long",
+            "position_side": "long",
+            "client_order_id": "0xabc",
+            "raw": [
+                {"source": "fetch_my_trades", "data": dict(trade_a)},
+                {"source": "fetch_my_trades", "data": dict(trade_a)},
+                dict(pos_hist),
+            ],
+        },
+        {
+            "id": "legacy-unproven",
+            "source_ids": ["legacy-unproven"],
+            "timestamp": ts + 1,
+            "datetime": "2026-02-02T00:00:01",
+            "symbol": "ETH/USDT:USDT",
+            "side": "sell",
+            "qty": -1.0,
+            "price": 100.0,
+            "pnl": 9.95,
+            "fee_paid": -0.05,
+            "fees": {"currency": "USDT", "cost": 0.05},
+            "pb_order_type": "close_grid_long",
+            "position_side": "long",
+            "client_order_id": "0xdef",
+            "raw": [{"source": "fetch_my_trades", "data": {"id": "legacy-unproven"}}],
+        },
+    ]
+    (cache_path / "2026-02-02.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="u",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_path,
+    )
+
+    report = await manager.run_doctor(auto_repair=True)
+    assert report["legacy_contract"] is True
+    assert report["repaired"] is False
+    assert report["legacy_unrepairable_events"] == 1
+    assert report["legacy_unrepairable_examples"] == ["legacy-unproven"]
+
+    with pytest.raises(FillEventCacheContractError):
+        FillEventCache(cache_path).load()
+
+
+@pytest.mark.asyncio
 async def test_hyperliquid_fetcher_basic(monkeypatch):
     base_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
     trades_batches = [
@@ -1911,6 +3965,9 @@ async def test_hyperliquid_fetcher_basic(monkeypatch):
     assert event["client_order_id"] == "0xabc"
     assert isinstance(event["fees"], dict)
     assert event["fees"]["cost"] == pytest.approx(0.7)
+    assert api.calls[0]["since"] == base_ts - 1
+    assert api.calls[0]["limit"] == fetcher.trade_limit
+    assert api.calls[0]["params"] == {}
 
 
 @pytest.mark.asyncio
@@ -1990,6 +4047,7 @@ async def test_manager_refresh_persists_and_queries(tmp_path: Path, sample_event
         user="default",
         fetcher=fetcher,
         cache_path=cache_dir,
+        fee_pct_fallback=0.0,
     )
 
     await manager.refresh()
@@ -2020,6 +4078,78 @@ async def test_manager_refresh_persists_and_queries(tmp_path: Path, sample_event
     await manager2.ensure_loaded()
     assert manager2.get_last_timestamp() == last_ts
     assert manager2.get_pnl_sum() == pytest.approx(0.5)
+
+
+def test_manager_pnl_helpers_report_net_pnl(tmp_path: Path):
+    ts = 1_700_000_000_000
+    manager = FillEventsManager(
+        exchange="bitget",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=tmp_path / "fills_net_pnl",
+    )
+    manager._events = [
+        FillEvent.from_dict(
+            {
+                "id": "gross-profit",
+                "timestamp": ts,
+                "datetime": "",
+                "symbol": "BTC/USDT",
+                "side": "sell",
+                "qty": -1.0,
+                "price": 11.0,
+                "pnl": 1.0,
+                "fees": {"currency": "USDT", "cost": 0.1},
+                "pb_order_type": "close",
+                "position_side": "long",
+                "client_order_id": "cid-1",
+            }
+        ),
+        FillEvent.from_dict(
+            {
+                "id": "rebated-loss",
+                "timestamp": ts + 1_000,
+                "datetime": "",
+                "symbol": "BTC/USDT",
+                "side": "buy",
+                "qty": 1.0,
+                "price": 10.5,
+                "pnl": -0.5,
+                "fees": {"currency": "USDT", "cost": -0.05},
+                "pb_order_type": "close",
+                "position_side": "short",
+                "client_order_id": "cid-2",
+            }
+        ),
+    ]
+    manager._loaded = True
+
+    assert manager.get_pnl_sum() == pytest.approx(0.45)
+    assert manager.get_pnl_cumsum()[-1][1] == pytest.approx(0.45)
+    assert manager.reconstruct_equity_curve(starting_equity=10.0)[-1][1] == pytest.approx(10.45)
+
+
+@pytest.mark.asyncio
+async def test_manager_pnl_helpers_fail_on_pending_close_pnl(tmp_path: Path, sample_events):
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=tmp_path / "fills_pending",
+    )
+    events = [FillEvent.from_dict(dict(ev)) for ev in sample_events]
+    pending_payload = dict(sample_events[-1])
+    pending_payload["pnl_status"] = "pending"
+    events[-1] = FillEvent.from_dict(pending_payload)
+    manager._events = events
+    manager._loaded = True
+
+    with pytest.raises(RuntimeError, match="realized PnL pending"):
+        manager.get_pnl_sum()
+    with pytest.raises(RuntimeError, match="realized PnL pending"):
+        manager.get_pnl_cumsum()
+    with pytest.raises(RuntimeError, match="realized PnL pending"):
+        manager.reconstruct_equity_curve()
 
 
 @pytest.mark.asyncio
@@ -2076,6 +4206,873 @@ async def test_manager_refresh_latest_uses_overlap(tmp_path: Path, sample_events
     assert len(manager.get_events()) == 3
     assert len(fetcher.calls) == 2
     assert fetcher.calls[1][0] == sample_events[0]["timestamp"]
+
+
+@pytest.mark.asyncio
+async def test_manager_refresh_latest_can_bound_start_from_last_successful_refresh(
+    tmp_path: Path, sample_events
+):
+    cache_dir = tmp_path / "fills_latest_bounded"
+    last_refresh_ms = sample_events[-1]["timestamp"] + 24 * 60 * 60 * 1000
+    overlap_ms = 60 * 60 * 1000
+
+    class _RecordingFetcher(BaseFetcher):
+        def __init__(self, batch):
+            self.batch = batch
+            self.calls = []
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            self.calls.append((since_ms, until_ms))
+            if on_batch and self.batch:
+                on_batch(self.batch)
+            batch = self.batch
+            self.batch = []
+            return batch
+
+    fetcher = _RecordingFetcher([dict(event) for event in sample_events])
+    manager = FillEventsManager(
+        exchange="bitget",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+    )
+
+    await manager.refresh()
+    metadata = manager.cache.load_metadata()
+    metadata["last_refresh_ms"] = last_refresh_ms
+    manager.cache.save_metadata(metadata)
+
+    await manager.refresh_latest(overlap=20, last_refresh_overlap_ms=overlap_ms)
+
+    assert fetcher.calls[1] == (last_refresh_ms - overlap_ms, None)
+
+
+@pytest.mark.asyncio
+async def test_manager_replaces_synthetic_pnl_when_authoritative_arrives(
+    tmp_path: Path,
+):
+    cache_dir = tmp_path / "fills_synthetic_replaced"
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    entry_ts = now_ms - 2 * 60_000
+    pending_ts = entry_ts + 60_000
+    last_refresh_ms = pending_ts + 4 * 60 * 60 * 1000
+    overlap_ms = 10 * 60 * 1000
+
+    entry_event = dict(
+        id="entry",
+        timestamp=entry_ts,
+        datetime="",
+        symbol="TON/USDT:USDT",
+        side="buy",
+        qty=10.0,
+        price=2.0,
+        pnl=0.0,
+        pnl_status="complete",
+        pb_order_type="entry_grid_long",
+        position_side="long",
+        client_order_id="cid-entry",
+    )
+    pending_event = dict(
+        id="pending-close",
+        timestamp=pending_ts,
+        datetime="",
+        symbol="TON/USDT:USDT",
+        side="sell",
+        qty=-4.0,
+        price=2.5,
+        pnl=0.0,
+        pnl_status="pending",
+        pb_order_type="close_unstuck_long",
+        position_side="long",
+        client_order_id="cid-pending",
+    )
+    enriched_event = dict(pending_event)
+    enriched_event["pnl"] = 1.23
+    enriched_event["pnl_status"] = "complete"
+
+    fetcher = _SequencedFetcher([[entry_event, pending_event], [enriched_event]])
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+        fee_pct_fallback=0.0,
+    )
+
+    await manager.refresh()
+    close = manager.get_events(symbol="TON/USDT:USDT")[-1]
+    assert close.pnl_status == "complete"
+    assert close.pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+    assert close.pnl == pytest.approx(2.0)
+    assert not FillEventsManager.pending_pnl_events(manager.get_events())
+
+    metadata = manager.cache.load_metadata()
+    metadata["last_refresh_ms"] = last_refresh_ms
+    manager.cache.save_metadata(metadata)
+
+    await manager.refresh_latest(overlap=20, last_refresh_overlap_ms=overlap_ms)
+
+    assert fetcher.calls[1] == (
+        max(0, pending_ts - fem.PENDING_PNL_REFRESH_MARGIN_MS),
+        None,
+    )
+    close = manager.get_events(symbol="TON/USDT:USDT")[-1]
+    assert close.pnl == pytest.approx(1.23)
+    assert close.pnl_source == fem.PNL_SOURCE_AUTHORITATIVE
+    assert not FillEventsManager.pending_pnl_events(manager.get_events())
+
+
+@pytest.mark.asyncio
+async def test_manager_reconciles_cycle_pnl_without_leaving_synthetic_anchor(
+    tmp_path: Path,
+):
+    cache_dir = tmp_path / "fills_cycle_reconciled"
+    entry_ts = 1_700_000_000_000
+
+    entry_event = dict(
+        id="entry",
+        timestamp=entry_ts,
+        datetime="",
+        symbol="TON/USDT:USDT",
+        side="buy",
+        qty=10.0,
+        price=10.0,
+        pnl=0.0,
+        pnl_status="complete",
+        pb_order_type="entry_grid_long",
+        position_side="long",
+        client_order_id="cid-entry",
+    )
+    partial_close = dict(
+        id="partial-close",
+        timestamp=entry_ts + 60_000,
+        datetime="",
+        symbol="TON/USDT:USDT",
+        side="sell",
+        qty=-4.0,
+        price=8.0,
+        pnl=0.0,
+        pnl_status="pending",
+        pb_order_type="close_grid_long",
+        position_side="long",
+        client_order_id="cid-partial",
+    )
+    final_close = dict(
+        id="final-close",
+        timestamp=entry_ts + 120_000,
+        datetime="",
+        symbol="TON/USDT:USDT",
+        side="sell",
+        qty=-6.0,
+        price=12.0,
+        pnl=0.0,
+        pnl_status="pending",
+        pb_order_type="close_grid_long",
+        position_side="long",
+        client_order_id="cid-final",
+    )
+
+    fetcher = _StaticFetcher(
+        [entry_event, partial_close, final_close],
+        observations=[
+            PnlObservation(
+                scope="position_cycle",
+                source="kucoin_positions_history",
+                symbol="TON/USDT:USDT",
+                position_side="long",
+                realized_pnl=5.0,
+                source_id="kucoin-cycle-1",
+                close_time=entry_ts + 120_000,
+            )
+        ],
+    )
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+        fee_pct_fallback=0.0,
+    )
+
+    await manager.refresh()
+
+    events = manager.get_events(symbol="TON/USDT:USDT")
+    by_id = {ev.id: ev for ev in events}
+    assert by_id["partial-close"].pnl == pytest.approx(-7.6)
+    assert by_id["final-close"].pnl == pytest.approx(12.6)
+    assert sum(ev.pnl for ev in events if "close" in ev.pb_order_type) == pytest.approx(5.0)
+    assert by_id["partial-close"].pnl_source == fem.PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
+    assert by_id["final-close"].pnl_source == fem.PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
+    assert not FillEventsManager.pending_pnl_events(events)
+    assert not FillEventsManager.synthetic_pnl_events(events)
+
+    await manager.refresh()
+    refreshed_events = manager.get_events(symbol="TON/USDT:USDT")
+    assert sum(ev.pnl for ev in refreshed_events if "close" in ev.pb_order_type) == pytest.approx(
+        5.0
+    )
+
+    reloaded = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher([]),
+        cache_path=cache_dir,
+    )
+    await reloaded.ensure_loaded()
+    reloaded_events = reloaded.get_events(symbol="TON/USDT:USDT")
+    assert sum(ev.pnl for ev in reloaded_events if "close" in ev.pb_order_type) == pytest.approx(5.0)
+    assert not FillEventsManager.synthetic_pnl_events(reloaded_events)
+
+
+@pytest.mark.asyncio
+async def test_manager_reconciles_multiple_closed_cycles_from_observations(
+    tmp_path: Path,
+):
+    cache_dir = tmp_path / "fills_multiple_cycles_reconciled"
+    entry_ts = 1_700_000_000_000
+    events = [
+        dict(
+            id="entry-1",
+            timestamp=entry_ts,
+            datetime="",
+            symbol="TON/USDT:USDT",
+            side="buy",
+            qty=1.0,
+            price=10.0,
+            pnl=0.0,
+            pnl_status="complete",
+            pb_order_type="entry_grid_long",
+            position_side="long",
+            client_order_id="cid-entry-1",
+        ),
+        dict(
+            id="close-1",
+            timestamp=entry_ts + 60_000,
+            datetime="",
+            symbol="TON/USDT:USDT",
+            side="sell",
+            qty=-1.0,
+            price=11.0,
+            pnl=0.0,
+            pnl_status="pending",
+            pb_order_type="close_grid_long",
+            position_side="long",
+            client_order_id="cid-close-1",
+        ),
+        dict(
+            id="entry-2",
+            timestamp=entry_ts + 120_000,
+            datetime="",
+            symbol="TON/USDT:USDT",
+            side="buy",
+            qty=1.0,
+            price=20.0,
+            pnl=0.0,
+            pnl_status="complete",
+            pb_order_type="entry_grid_long",
+            position_side="long",
+            client_order_id="cid-entry-2",
+        ),
+        dict(
+            id="close-2",
+            timestamp=entry_ts + 180_000,
+            datetime="",
+            symbol="TON/USDT:USDT",
+            side="sell",
+            qty=-1.0,
+            price=22.0,
+            pnl=0.0,
+            pnl_status="pending",
+            pb_order_type="close_grid_long",
+            position_side="long",
+            client_order_id="cid-close-2",
+        ),
+    ]
+    observations = [
+        PnlObservation(
+            scope="position_cycle",
+            source="kucoin_positions_history",
+            symbol="TON/USDT:USDT",
+            position_side="long",
+            realized_pnl=1.0,
+            source_id="kucoin-cycle-1",
+            close_time=entry_ts + 60_000,
+        ),
+        PnlObservation(
+            scope="position_cycle",
+            source="kucoin_positions_history",
+            symbol="TON/USDT:USDT",
+            position_side="long",
+            realized_pnl=2.0,
+            source_id="kucoin-cycle-2",
+            close_time=entry_ts + 180_000,
+        ),
+    ]
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher(events, observations=observations),
+        cache_path=cache_dir,
+        fee_pct_fallback=0.0,
+    )
+
+    await manager.refresh()
+
+    stored = manager.get_events(symbol="TON/USDT:USDT")
+    by_id = {ev.id: ev for ev in stored}
+    assert by_id["close-1"].pnl == pytest.approx(1.0)
+    assert by_id["close-2"].pnl == pytest.approx(2.0)
+    assert sum(ev.pnl for ev in stored if "close" in ev.pb_order_type) == pytest.approx(3.0)
+    assert by_id["close-1"].pnl_source == fem.PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
+    assert by_id["close-2"].pnl_source == fem.PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
+    assert not FillEventsManager.synthetic_pnl_events(stored)
+
+
+@pytest.mark.asyncio
+async def test_manager_refresh_latest_keeps_synthetic_pnl_in_enrichment_window(
+    tmp_path: Path,
+):
+    cache_dir = tmp_path / "fills_synthetic_window"
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    entry_ts = now_ms - 2 * 60_000
+    close_ts = entry_ts + 1_000
+    last_refresh_ms = close_ts + 40 * 60_000
+    overlap_ms = 10 * 60_000
+
+    entry = dict(
+        id="entry",
+        timestamp=entry_ts,
+        datetime="",
+        symbol="SOL/USDT:USDT",
+        side="buy",
+        qty=5.0,
+        price=10.0,
+        pnl=0.0,
+        pnl_status="complete",
+        pb_order_type="entry_grid_long",
+        position_side="long",
+        client_order_id="cid-entry",
+    )
+    pending_close = dict(
+        id="close",
+        timestamp=close_ts,
+        datetime="",
+        symbol="SOL/USDT:USDT",
+        side="sell",
+        qty=-2.0,
+        price=12.0,
+        pnl=0.0,
+        pnl_status="pending",
+        pb_order_type="close_grid_long",
+        position_side="long",
+        client_order_id="cid-close",
+    )
+    authoritative_close = dict(pending_close)
+    authoritative_close["pnl"] = 9.99
+    authoritative_close["pnl_status"] = "complete"
+    later_events = [
+        dict(
+            id=f"later-{idx}",
+            timestamp=close_ts + (idx + 1) * 60_000,
+            datetime="",
+            symbol="SOL/USDT:USDT",
+            side="buy",
+            qty=0.1,
+            price=12.0 + idx,
+            pnl=0.0,
+            pnl_status="complete",
+            pb_order_type="entry_grid_long",
+            position_side="long",
+            client_order_id=f"cid-later-{idx}",
+        )
+        for idx in range(30)
+    ]
+
+    class _SinceFilteringFetcher(BaseFetcher):
+        def __init__(self, batches):
+            self.batches = list(batches)
+            self.calls: List[Tuple[Optional[int], Optional[int]]] = []
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            self.calls.append((since_ms, until_ms))
+            batch = [dict(ev) for ev in (self.batches.pop(0) if self.batches else [])]
+            if since_ms is not None:
+                batch = [ev for ev in batch if int(ev["timestamp"]) >= since_ms]
+            if until_ms is not None:
+                batch = [ev for ev in batch if int(ev["timestamp"]) <= until_ms]
+            if on_batch and batch:
+                on_batch(batch)
+            return batch
+
+    fetcher = _SinceFilteringFetcher(
+        [
+            [entry, pending_close, *later_events],
+            [authoritative_close, *later_events],
+        ]
+    )
+    manager = FillEventsManager(
+        exchange="example",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+    )
+
+    await manager.refresh()
+    close = [ev for ev in manager.get_events(symbol="SOL/USDT:USDT") if ev.id == "close"][0]
+    assert close.pnl == pytest.approx(4.0)
+    assert close.pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+
+    metadata = manager.cache.load_metadata()
+    metadata["last_refresh_ms"] = last_refresh_ms
+    manager.cache.save_metadata(metadata)
+
+    await manager.refresh_latest(overlap=20, last_refresh_overlap_ms=overlap_ms)
+
+    assert fetcher.calls[1] == (
+        max(0, close_ts - fem.PENDING_PNL_REFRESH_MARGIN_MS),
+        None,
+    )
+    close = [ev for ev in manager.get_events(symbol="SOL/USDT:USDT") if ev.id == "close"][0]
+    assert close.pnl == pytest.approx(9.99)
+    assert close.pnl_source == fem.PNL_SOURCE_AUTHORITATIVE
+
+
+@pytest.mark.asyncio
+async def test_manager_refresh_latest_skips_old_synthetic_pnl_repair_window(
+    tmp_path: Path,
+):
+    cache_dir = tmp_path / "fills_old_synthetic_window"
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    entry_ts = now_ms - 30 * 24 * 60 * 60 * 1000
+    close_ts = entry_ts + 1_000
+    later_events = [
+        dict(
+            id=f"later-{idx}",
+            timestamp=close_ts + (idx + 1) * 60_000,
+            datetime="",
+            symbol="SOL/USDT:USDT",
+            side="buy",
+            qty=0.1,
+            price=12.0 + idx,
+            pnl=0.0,
+            pnl_status="complete",
+            pb_order_type="entry_grid_long",
+            position_side="long",
+            client_order_id=f"cid-later-{idx}",
+        )
+        for idx in range(30)
+    ]
+    events = [
+        dict(
+            id="entry",
+            timestamp=entry_ts,
+            datetime="",
+            symbol="SOL/USDT:USDT",
+            side="buy",
+            qty=5.0,
+            price=10.0,
+            pnl=0.0,
+            pnl_status="complete",
+            pb_order_type="entry_grid_long",
+            position_side="long",
+            client_order_id="cid-entry",
+        ),
+        dict(
+            id="close",
+            timestamp=close_ts,
+            datetime="",
+            symbol="SOL/USDT:USDT",
+            side="sell",
+            qty=-2.0,
+            price=12.0,
+            pnl=0.0,
+            pnl_status="pending",
+            pb_order_type="close_grid_long",
+            position_side="long",
+            client_order_id="cid-close",
+        ),
+        *later_events,
+    ]
+
+    class _RecordingFetcher(BaseFetcher):
+        def __init__(self, batches):
+            self.batches = list(batches)
+            self.calls: List[Tuple[Optional[int], Optional[int]]] = []
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            self.calls.append((since_ms, until_ms))
+            batch = [dict(ev) for ev in (self.batches.pop(0) if self.batches else [])]
+            if since_ms is not None:
+                batch = [ev for ev in batch if int(ev["timestamp"]) >= since_ms]
+            if until_ms is not None:
+                batch = [ev for ev in batch if int(ev["timestamp"]) <= until_ms]
+            if on_batch and batch:
+                on_batch(batch)
+            return batch
+
+    fetcher = _RecordingFetcher([events, events])
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+    )
+
+    await manager.refresh()
+    close = [ev for ev in manager.get_events(symbol="SOL/USDT:USDT") if ev.id == "close"][0]
+    assert close.pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+
+    metadata = manager.cache.load_metadata()
+    metadata["last_refresh_ms"] = close_ts + 40 * 60_000
+    manager.cache.save_metadata(metadata)
+
+    await manager.refresh_latest(overlap=20, last_refresh_overlap_ms=10 * 60_000)
+
+    assert fetcher.calls[1][1] is None
+    assert fetcher.calls[1][0] > close_ts
+    assert fetcher.calls[1][0] != max(0, close_ts - fem.PENDING_PNL_REFRESH_MARGIN_MS)
+
+
+@pytest.mark.asyncio
+async def test_manager_synthesizes_pending_close_pnl_with_contract_value(
+    tmp_path: Path, caplog
+):
+    entry_ts = 1_700_000_000_000
+    close_ts = entry_ts + 1_000
+    events = [
+        dict(
+            id="entry-contract",
+            timestamp=entry_ts,
+            datetime="",
+            symbol="BTC/USDT:USDT",
+            side="buy",
+            qty=1.0,
+            price=10.0,
+            pnl=0.0,
+            pnl_status="complete",
+            fees=None,
+            raw=[{"source": "fetch_my_trades", "data": {"cost": "1.0"}}],
+            pb_order_type="entry_grid_long",
+            position_side="long",
+            client_order_id="cid-entry",
+        ),
+        dict(
+            id="close-contract",
+            timestamp=close_ts,
+            datetime="",
+            symbol="BTC/USDT:USDT",
+            side="sell",
+            qty=-1.0,
+            price=20.0,
+            pnl=0.0,
+            pnl_status="pending",
+            fees={"currency": "USDT", "cost": 0.1},
+            raw=[{"source": "fetch_my_trades", "data": {"cost": "2.0"}}],
+            pb_order_type="close_grid_long",
+            position_side="long",
+            client_order_id="cid-close",
+        ),
+    ]
+    manager = FillEventsManager(
+        exchange="example",
+        user="default",
+        fetcher=_StaticFetcher(events),
+        cache_path=tmp_path / "fills_synthetic_exact",
+        fee_pct_sanity_abs_max=1.0,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=fem.logger.name):
+        await manager.refresh()
+
+    close = manager.get_events(symbol="BTC/USDT:USDT")[-1]
+    assert close.pnl_status == "complete"
+    assert close.pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+    assert close.pnl_synthetic_reason == ""
+    assert close.pnl == pytest.approx(1.0)
+    assert close.fee_paid == pytest.approx(-0.1)
+    assert not FillEventsManager.pending_pnl_events(manager.get_events())
+    assert any(
+        "synthesized missing realized PnL from fill events" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_manager_synthesizes_degraded_pnl_when_cache_starts_mid_position(
+    tmp_path: Path,
+):
+    event = dict(
+        id="orphan-close",
+        timestamp=1_700_000_000_000,
+        datetime="",
+        symbol="ETH/USDT:USDT",
+        side="sell",
+        qty=-2.0,
+        price=1500.0,
+        pnl=0.42,
+        pnl_status="pending",
+        pb_order_type="close_grid_long",
+        position_side="long",
+        client_order_id="cid-close",
+    )
+    manager = FillEventsManager(
+        exchange="example",
+        user="default",
+        fetcher=_StaticFetcher([event]),
+        cache_path=tmp_path / "fills_synthetic_degraded",
+    )
+
+    await manager.refresh()
+
+    close = manager.get_events(symbol="ETH/USDT:USDT")[0]
+    assert close.pnl_status == "complete"
+    assert close.pnl_source == fem.PNL_SOURCE_SYNTHETIC_DEGRADED
+    assert close.pnl_synthetic_reason == "incomplete_position_basis"
+    assert close.pnl == pytest.approx(0.42)
+    assert not FillEventsManager.pending_pnl_events(manager.get_events())
+
+
+@pytest.mark.asyncio
+async def test_manager_preserves_synthetic_pnl_when_later_fetch_is_still_pending(
+    tmp_path: Path,
+):
+    entry_ts = 1_700_000_000_000
+    close_ts = entry_ts + 1_000
+    entry = dict(
+        id="entry",
+        timestamp=entry_ts,
+        datetime="",
+        symbol="SOL/USDT:USDT",
+        side="buy",
+        qty=5.0,
+        price=10.0,
+        pnl=0.0,
+        pnl_status="complete",
+        pb_order_type="entry_grid_long",
+        position_side="long",
+        client_order_id="cid-entry",
+    )
+    close = dict(
+        id="close",
+        timestamp=close_ts,
+        datetime="",
+        symbol="SOL/USDT:USDT",
+        side="sell",
+        qty=-2.0,
+        price=12.0,
+        pnl=0.0,
+        pnl_status="pending",
+        pb_order_type="close_grid_long",
+        position_side="long",
+        client_order_id="cid-close",
+    )
+    later_pending = dict(close)
+    later_pending["pnl"] = 0.0
+    fetcher = _SequencedFetcher([[entry, close], [later_pending]])
+    manager = FillEventsManager(
+        exchange="example",
+        user="default",
+        fetcher=fetcher,
+        cache_path=tmp_path / "fills_synthetic_preserved",
+    )
+
+    await manager.refresh()
+    await manager.refresh_latest()
+
+    close_event = manager.get_events(symbol="SOL/USDT:USDT")[-1]
+    assert close_event.pnl_status == "complete"
+    assert close_event.pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+    assert close_event.pnl == pytest.approx(4.0)
+
+
+@pytest.mark.asyncio
+async def test_manager_refresh_records_successful_empty_refresh(tmp_path: Path):
+    cache_dir = tmp_path / "fills_empty_refresh"
+
+    class _EmptyFetcher(BaseFetcher):
+        def __init__(self):
+            self.calls = []
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            self.calls.append((since_ms, until_ms))
+            return []
+
+    fetcher = _EmptyFetcher()
+    manager = FillEventsManager(
+        exchange="bitget",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+    )
+
+    await manager.refresh()
+    metadata = manager.cache.load_metadata()
+
+    assert fetcher.calls == [(None, None)]
+    assert metadata["last_refresh_ms"] > 0
+    assert manager.get_events() == []
+
+
+@pytest.mark.asyncio
+async def test_manager_refresh_logs_slow_successful_fetcher_request_timing_at_debug(
+    tmp_path: Path, caplog, monkeypatch
+):
+    cache_dir = tmp_path / "fills_request_timing"
+
+    class _Api:
+        async def fetch_a(self):
+            return {"ok": True}
+
+        async def fetch_b(self):
+            return {"ok": True}
+
+    class _ApiFetcher(BaseFetcher):
+        def __init__(self):
+            self.api = _Api()
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            await self.api.fetch_a()
+            await self.api.fetch_b()
+            await self.api.fetch_b()
+            return []
+
+    manager = FillEventsManager(
+        exchange="bitget",
+        user="default",
+        fetcher=_ApiFetcher(),
+        cache_path=cache_dir,
+    )
+    monotonic_times = iter([0.0] * 7 + [11.0])
+    with monkeypatch.context() as timing_patch:
+        timing_patch.setattr(
+            fem.time,
+            "monotonic",
+            lambda: next(monotonic_times, 11.0),
+        )
+        with caplog.at_level(logging.DEBUG, logger=fem.logger.name):
+            await manager.refresh(start_ms=123, end_ms=456)
+
+    timing_records = [
+        record
+        for record in caplog.records
+        if "[fills] fetcher request timing" in record.message
+    ]
+    assert len(timing_records) == 1
+    assert timing_records[0].levelno == logging.DEBUG
+    assert "elapsed=11000ms" in timing_records[0].message
+    assert "requests=3" in timing_records[0].message
+    assert "fetch_b:n=2" in timing_records[0].message
+    assert "range=1970-01-01 00:00:00..1970-01-01 00:00:00" in timing_records[0].message
+
+
+@pytest.mark.asyncio
+async def test_manager_refresh_logs_bounded_fetcher_error_type_without_secret(
+    tmp_path: Path, caplog
+):
+    cache_dir = tmp_path / "fills_request_error_timing"
+    secret = "api_key=fill-fetch-secret"
+    secret_error_type = type("ApiKeyFetchSecretError", (RuntimeError,), {})
+
+    class _Api:
+        async def fetch_a(self):
+            raise secret_error_type(secret)
+
+    class _ApiFetcher(BaseFetcher):
+        def __init__(self):
+            self.api = _Api()
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            await self.api.fetch_a()
+            return []
+
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_ApiFetcher(),
+        cache_path=cache_dir,
+    )
+
+    with caplog.at_level(logging.INFO, logger=fem.logger.name):
+        with pytest.raises(RuntimeError, match=secret):
+            await manager.refresh(start_ms=123, end_ms=456)
+
+    timing_records = [
+        record
+        for record in caplog.records
+        if "[fills] fetcher request timing" in record.message
+    ]
+    assert len(timing_records) == 1
+    assert timing_records[0].levelno == logging.INFO
+    assert "fetch_a:n=1" in timing_records[0].message
+    assert "err_type=RuntimeError" in timing_records[0].message
+    assert "err_msg=" not in timing_records[0].message
+    assert secret_error_type.__name__ not in timing_records[0].message
+    assert secret not in caplog.text
+
+
+def test_fill_fetch_request_timing_error_type_rejects_sensitive_and_hostile_metadata():
+    class _HostileExceptionMeta(type):
+        @property
+        def __name__(cls):
+            raise RuntimeError("api_key=super-secret-value")
+
+    class _HostileError(RuntimeError, metaclass=_HostileExceptionMeta):
+        pass
+
+    long_safe_name = "SafeError" + "x" * 100
+    stats = fem.FillFetchRequestStats()
+    stats.record("safe", 0, ok=False)
+    stats.record_error_detail("safe", type(long_safe_name, (RuntimeError,), {})())
+    stats.record("sensitive", 0, ok=False)
+    stats.record_error_detail("sensitive", type("ApiKeyProdSecret", (RuntimeError,), {})())
+    stats.record("hostile", 0, ok=False)
+    stats.record_error_detail("hostile", _HostileError("api_key=super-secret-value"))
+
+    rendered = stats.format_endpoints()
+
+    assert "err_type=RuntimeError" in rendered
+    assert long_safe_name not in rendered
+    assert rendered.count("err_type=RuntimeError") == 2
+    assert rendered.count("err_type=Error") == 1
+    assert "api_key=super-secret-value" not in rendered
+    assert "ApiKeyProdSecret" not in rendered
+
+
+def test_fill_event_cache_disk_full_raises_clear_error(tmp_path: Path, monkeypatch, sample_events):
+    cache = FillEventCache(tmp_path / "fills_disk_full")
+    event = FillEvent.from_dict(dict(sample_events[0]))
+
+    def fail_replace(src, dst):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(fem.os, "replace", fail_replace)
+
+    with pytest.raises(FillEventCacheDiskFullError, match="disk full"):
+        cache.save([event])
+
+    with pytest.raises(FillEventCacheDiskFullError, match="disk full"):
+        cache.save_metadata({"last_refresh_ms": event.timestamp})
+
+
+def test_fill_event_cache_load_ignores_metadata_file(tmp_path: Path, sample_events, caplog):
+    cache = FillEventCache(tmp_path)
+    cache.save([FillEvent.from_dict(dict(sample_events[0]))])
+    cache.save_metadata(
+        {
+            "last_refresh_ms": sample_events[0]["timestamp"],
+            "oldest_event_ts": sample_events[0]["timestamp"],
+            "newest_event_ts": sample_events[0]["timestamp"],
+            "covered_start_ms": sample_events[0]["timestamp"],
+            "known_gaps": [],
+            "history_scope": "window",
+        }
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        loaded = cache.load()
+
+    assert [event.id for event in loaded] == [sample_events[0]["id"]]
+    assert not any("metadata.json" in record.message for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -2207,6 +5204,196 @@ async def test_manager_refresh_for_lookback_preserves_metadata_only_no_fill_cove
 
 
 @pytest.mark.asyncio
+async def test_manager_refresh_for_lookback_retries_known_gap_before_latest(tmp_path: Path):
+    cache_dir = tmp_path / "fills_lookback_known_gap"
+    cache = FillEventCache(cache_dir)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp() * 1000)
+    gap_start = start_ms + 60 * 60 * 1000
+    gap_end = start_ms + 2 * 60 * 60 * 1000
+    event_ts = start_ms + 3 * 60 * 60 * 1000
+    event = FillEvent.from_dict(
+        dict(
+            id="post-gap-fill",
+            timestamp=event_ts,
+            datetime="",
+            symbol="BTC/USDT",
+            side="buy",
+            qty=0.1,
+            price=10,
+            pnl=0.0,
+            pb_order_type="entry",
+            position_side="long",
+            client_order_id="cid-post-gap-fill",
+        )
+    )
+    cache.save([event])
+    cache.save_metadata(
+        {
+            "last_refresh_ms": event_ts,
+            "oldest_event_ts": event_ts,
+            "newest_event_ts": event_ts,
+            "covered_start_ms": start_ms,
+            "history_scope": "window",
+            "known_gaps": [
+                {
+                    "start_ts": gap_start,
+                    "end_ts": gap_end,
+                    "retry_count": 0,
+                    "reason": GAP_REASON_FETCH_FAILED,
+                    "confidence": 0.0,
+                }
+            ],
+        }
+    )
+
+    class _RecordingFetcher(BaseFetcher):
+        def __init__(self):
+            self.calls: List[Tuple[Optional[int], Optional[int]]] = []
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            self.calls.append((since_ms, until_ms))
+            if on_batch:
+                on_batch([])
+            return []
+
+    fetcher = _RecordingFetcher()
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+    )
+
+    await manager.refresh_for_lookback(start_ms=start_ms)
+
+    assert fetcher.calls[0] == (gap_start, gap_end)
+    assert fetcher.calls[1] == (event_ts, None)
+    assert manager.cache.get_known_gaps() == []
+
+
+@pytest.mark.asyncio
+async def test_manager_refresh_for_lookback_refreshes_latest_when_gap_retries_exhausted(
+    tmp_path: Path,
+):
+    cache_dir = tmp_path / "fills_lookback_exhausted_gap"
+    cache = FillEventCache(cache_dir)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp() * 1000)
+    gap_start = start_ms + 60 * 60 * 1000
+    gap_end = start_ms + 2 * 60 * 60 * 1000
+    event_ts = start_ms + 3 * 60 * 60 * 1000
+    event = FillEvent.from_dict(
+        dict(
+            id="post-gap-fill",
+            timestamp=event_ts,
+            datetime="",
+            symbol="BTC/USDT",
+            side="buy",
+            qty=0.1,
+            price=10,
+            pnl=0.0,
+            pb_order_type="entry",
+            position_side="long",
+            client_order_id="cid-post-gap-fill",
+        )
+    )
+    cache.save([event])
+    cache.save_metadata(
+        {
+            "last_refresh_ms": event_ts,
+            "oldest_event_ts": event_ts,
+            "newest_event_ts": event_ts,
+            "covered_start_ms": start_ms,
+            "history_scope": "window",
+            "known_gaps": [
+                {
+                    "start_ts": gap_start,
+                    "end_ts": gap_end,
+                    "retry_count": 3,
+                    "reason": GAP_REASON_FETCH_FAILED,
+                    "confidence": 0.0,
+                }
+            ],
+        }
+    )
+
+    class _RecordingFetcher(BaseFetcher):
+        def __init__(self):
+            self.calls: List[Tuple[Optional[int], Optional[int]]] = []
+
+        async def fetch(self, since_ms, until_ms, detail_cache, on_batch=None):
+            self.calls.append((since_ms, until_ms))
+            if on_batch:
+                on_batch([])
+            return []
+
+    fetcher = _RecordingFetcher()
+    manager = FillEventsManager(
+        exchange="bybit",
+        user="default",
+        fetcher=fetcher,
+        cache_path=cache_dir,
+    )
+
+    completed = await manager.refresh_for_lookback(start_ms=start_ms)
+
+    assert completed is True
+    assert fetcher.calls == [(event_ts, None)]
+    assert manager.cache.get_known_gaps()[0]["retry_count"] == 3
+
+
+def test_clear_gap_persists_partial_trim_and_middle_split(tmp_path: Path):
+    cache = FillEventCache(tmp_path / "fills_clear_gap")
+    cache.save_metadata(
+        {
+            "last_refresh_ms": 1,
+            "oldest_event_ts": 0,
+            "newest_event_ts": 0,
+            "covered_start_ms": 0,
+            "known_gaps": [
+                {
+                    "start_ts": 1_000,
+                    "end_ts": 5_000,
+                    "retry_count": 0,
+                    "reason": GAP_REASON_FETCH_FAILED,
+                    "confidence": 0.0,
+                }
+            ],
+        }
+    )
+
+    assert cache.clear_gap(3_000, 5_000) is True
+    assert cache.get_known_gaps() == [
+        {
+            "start_ts": 1_000,
+            "end_ts": 3_000,
+            "retry_count": 0,
+            "reason": GAP_REASON_FETCH_FAILED,
+            "confidence": 0.0,
+        }
+    ]
+    assert cache.load_metadata()["known_gaps"] == cache.get_known_gaps()
+
+    assert cache.clear_gap(1_500, 2_000) is True
+    assert cache.get_known_gaps() == [
+        {
+            "start_ts": 1_000,
+            "end_ts": 1_500,
+            "retry_count": 0,
+            "reason": GAP_REASON_FETCH_FAILED,
+            "confidence": 0.0,
+        },
+        {
+            "start_ts": 2_000,
+            "end_ts": 3_000,
+            "retry_count": 0,
+            "reason": GAP_REASON_FETCH_FAILED,
+            "confidence": 0.0,
+        },
+    ]
+    assert cache.load_metadata()["known_gaps"] == cache.get_known_gaps()
+
+
+@pytest.mark.asyncio
 async def test_manager_refresh_range_detects_gaps(tmp_path: Path):
     cache_dir = tmp_path / "fills_range"
     cache = FillEventCache(cache_dir)
@@ -2329,7 +5516,13 @@ async def test_hyperliquid_fetcher_raises_after_max_rate_limit_retries(monkeypat
         def __init__(self):
             self.calls = 0
 
-        async def fetch_my_trades(self, params: Dict[str, Any]):
+        async def fetch_my_trades(
+            self,
+            symbol: Optional[str] = None,
+            since: Optional[int] = None,
+            limit: Optional[int] = None,
+            params: Optional[Dict[str, Any]] = None,
+        ):
             self.calls += 1
             raise RateLimitExceeded("429 too many requests")
 
@@ -2707,6 +5900,40 @@ async def test_okx_fetcher_symbol_normalization(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_okx_fetcher_uses_market_contract_size_for_fee_notional(monkeypatch):
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    fill = _make_okx_fill(
+        trade_id="tid-doge",
+        ts=now_ms - 100,
+        inst_id="DOGE-USDT-SWAP",
+        qty="1",
+        price="0.20",
+    )
+    fill["fee"] = "-0.004"
+    api = _FakeOkxAPI([[fill]])
+    api.markets = {"DOGE/USDT:USDT": {"id": "DOGE-USDT-SWAP", "contractSize": 100.0}}
+    monkeypatch.setattr("src.fill_events_manager.custom_id_to_snake", lambda v: v or "unknown")
+
+    fetcher = OkxFetcher(api, trade_limit=100)
+    events = await fetcher.fetch(
+        since_ms=now_ms - 1_000,
+        until_ms=now_ms,
+        detail_cache={},
+    )
+
+    assert events[0]["c_mult"] == pytest.approx(100.0)
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        events[0],
+        fee_pct_fallback=0.0002,
+        fee_pct_sanity_abs_max=0.001,
+    )
+    assert fee_paid == pytest.approx(-0.004)
+    assert meta["fee_notional"] == pytest.approx(20.0)
+    assert meta["fee_ratio"] == pytest.approx(-0.0002)
+    assert meta["fee_quality"] == fem.FEE_QUALITY_EXACT
+
+
+@pytest.mark.asyncio
 async def test_okx_fetcher_hedge_mode(monkeypatch):
     """Test hedge mode with explicit long/short position sides."""
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -2827,162 +6054,725 @@ async def test_okx_fetcher_on_batch_callback(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_kucoin_match_pnls_distributes_proportionally():
-    """Test that _match_pnls distributes PnL proportionally across multiple fills."""
-    # Mock fetcher (we only need the _match_pnls method)
+def _kucoin_manager_fill(
+    fill_id: str,
+    ts: int,
+    *,
+    side: str,
+    qty: float,
+    price: float,
+    symbol: str = "TON/USDT:USDT",
+    position_side: str = "long",
+    pb_order_type: Optional[str] = None,
+    fees: Optional[object] = None,
+) -> Dict[str, object]:
+    is_close = (position_side == "long" and side == "sell") or (
+        position_side == "short" and side == "buy"
+    )
+    return {
+        "id": fill_id,
+        "timestamp": ts,
+        "datetime": "",
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "pnl": 0.0,
+        "fees": fees,
+        "pnl_status": "pending" if is_close else "complete",
+        "pb_order_type": pb_order_type
+        or ("close_grid_long" if is_close else "entry_grid_long"),
+        "position_side": position_side,
+        "client_order_id": f"cid-{fill_id}",
+    }
+
+
+def _kucoin_cycle_observation(
+    source_id: str,
+    *,
+    realized_pnl: float,
+    close_time: Optional[int] = None,
+    update_time: Optional[int] = None,
+    open_time: Optional[int] = None,
+    close_size: Optional[float] = None,
+    symbol: str = "TON/USDT:USDT",
+    position_side: str = "long",
+) -> PnlObservation:
+    return PnlObservation(
+        scope="position_cycle",
+        source="kucoin_positions_history",
+        symbol=symbol,
+        position_side=position_side,
+        realized_pnl=realized_pnl,
+        source_id=source_id,
+        close_time=close_time,
+        update_time=update_time,
+        open_time=open_time,
+        close_size=close_size,
+    )
+
+
+def test_kucoin_position_history_observation_preserves_cycle_scope():
+    obs = KucoinFetcher._position_history_observation(
+        {
+            "symbol": "TON/USDT:USDT",
+            "side": "long",
+            "contracts": "3.5",
+            "lastUpdateTimestamp": 1_700_000_240_000,
+            "realizedPnl": "12.34",
+            "info": {
+                "closeId": "123",
+                "openTime": "1700000000000",
+                "closeTime": "1700000060000",
+            },
+        }
+    )
+
+    assert obs is not None
+    assert obs.scope == "position_cycle"
+    assert obs.source == "kucoin_positions_history"
+    assert obs.symbol == "TON/USDT:USDT"
+    assert obs.position_side == "long"
+    assert obs.realized_pnl == pytest.approx(12.34)
+    assert obs.source_id == "123"
+    assert obs.open_time == 1_700_000_000_000
+    assert obs.close_time == 1_700_000_060_000
+    assert obs.update_time == 1_700_000_240_000
+    assert obs.close_size == pytest.approx(3.5)
+
+
+def test_kucoin_trade_reconstruction_uses_raw_contract_multiplier():
+    ts = 1_700_000_000_000
+    trades = [
+        {
+            "id": "entry",
+            "timestamp": ts,
+            "symbol": "ZEC/USDT:USDT",
+            "side": "buy",
+            "qty": 100.0,
+            "price": 600.0,
+            "position_side": "long",
+            "raw": [
+                {
+                    "source": "fetch_my_trades",
+                    "data": {"info": {"value": "600.0"}},
+                }
+            ],
+        },
+        {
+            "id": "close",
+            "timestamp": ts + 60_000,
+            "symbol": "ZEC/USDT:USDT",
+            "side": "sell",
+            "qty": 100.0,
+            "price": 610.0,
+            "position_side": "long",
+            "raw": [
+                {
+                    "source": "fetch_my_trades",
+                    "data": {"info": {"value": "610.0"}},
+                }
+            ],
+        },
+    ]
+
+    pnls, final_positions = fem.compute_realized_pnls_from_trades(trades)
+
+    assert pnls["entry"] == pytest.approx(0.0)
+    assert pnls["close"] == pytest.approx(10.0)
+    assert final_positions[("ZEC/USDT:USDT", "long")] == pytest.approx((0.0, 0.0))
+
+
+@pytest.mark.asyncio
+async def test_kucoin_fetcher_emits_observations_without_mutating_fill_pnl(monkeypatch):
+    fetcher = KucoinFetcher(api=object())
+    ts = 1_700_000_000_000
+    trades = [
+        _kucoin_manager_fill("entry", ts, side="buy", qty=1.0, price=10.0),
+        _kucoin_manager_fill(
+            "close",
+            ts + 60_000,
+            side="sell",
+            qty=1.0,
+            price=12.0,
+        ),
+    ]
+    positions = [
+        {
+            "symbol": "TON/USDT:USDT",
+            "lastUpdateTimestamp": ts + 180_000,
+            "realizedPnl": "9.99",
+            "info": {"closeId": "123", "closeTime": ts + 60_000},
+        }
+    ]
+
+    async def _fetch_trades(since_ms, until_ms):
+        return [dict(trade) for trade in trades]
+
+    async def _fetch_positions_history(start_ms, end_ms):
+        return positions
+
+    async def _enrich_with_order_details_bulk(events, detail_cache):
+        return None
+
+    monkeypatch.setattr(fetcher, "_fetch_trades", _fetch_trades)
+    monkeypatch.setattr(fetcher, "_fetch_positions_history", _fetch_positions_history)
+    monkeypatch.setattr(fetcher, "_enrich_with_order_details_bulk", _enrich_with_order_details_bulk)
+
+    out = await fetcher.fetch(ts, ts + 240_000, detail_cache={})
+    by_id = {event["id"]: event for event in out}
+
+    assert by_id["close"]["pnl_status"] == "pending"
+    assert by_id["close"]["pnl_source"] == fem.PNL_SOURCE_PENDING
+    assert "pnl_cycle_realized_pnl" not in by_id["close"]
+    assert len(fetcher.pnl_observations) == 1
+    assert fetcher.pnl_observations[0].realized_pnl == pytest.approx(9.99)
+    assert fetcher.pnl_observations[0].close_time == ts + 60_000
+
+
+@pytest.mark.asyncio
+async def test_kucoin_fetcher_entry_fee_is_signed_fee_paid(monkeypatch):
+    fetcher = KucoinFetcher(api=object())
+    ts = 1_700_000_000_000
+    trades = [
+        _kucoin_manager_fill(
+            "entry-fee",
+            ts,
+            side="buy",
+            qty=1.0,
+            price=10.0,
+            fees={"currency": "USDT", "cost": 0.25},
+        )
+    ]
+
+    async def _fetch_trades(since_ms, until_ms):
+        return [dict(trade) for trade in trades]
+
+    async def _enrich_with_order_details_bulk(events, detail_cache):
+        return None
+
+    monkeypatch.setattr(fetcher, "_fetch_trades", _fetch_trades)
+    monkeypatch.setattr(fetcher, "_enrich_with_order_details_bulk", _enrich_with_order_details_bulk)
+
+    out = await fetcher.fetch(ts, ts + 1_000, detail_cache={})
+
+    assert out[0]["pnl"] == pytest.approx(0.0)
+    assert out[0]["fee_paid"] == pytest.approx(-0.25)
+
+
+def test_kucoin_normalize_trade_reads_plural_fees():
+    ts = 1_700_000_000_000
+    event = KucoinFetcher._normalize_trade(
+        {
+            "id": "plural-fee",
+            "timestamp": ts,
+            "symbol": "BTC/USDT:USDT",
+            "side": "buy",
+            "amount": 1.0,
+            "price": 10.0,
+            "fees": [{"currency": "USDT", "cost": 0.25}],
+            "info": {"tradeId": "plural-fee", "orderId": "order-1"},
+        }
+    )
+
+    assert event["fees"] == [{"currency": "USDT", "cost": 0.25}]
+    assert event["fee_paid"] == pytest.approx(-0.25)
+
+
+def test_signed_fee_paid_sums_raw_kucoin_fee_fields():
+    fee_paid = fem.signed_fee_paid_from_payload(
+        {
+            "raw": [
+                {
+                    "source": "fetch_my_trades",
+                    "data": {
+                        "info": {
+                            "openFeePay": "0.1",
+                            "closeFeePay": "0.2",
+                            "fee": "-0.03",
+                        }
+                    },
+                }
+            ]
+        }
+    )
+
+    assert fee_paid == pytest.approx(-0.27)
+
+
+@pytest.mark.asyncio
+async def test_kucoin_fetcher_maker_rebate_is_positive_fee_paid(monkeypatch):
+    fetcher = KucoinFetcher(api=object())
+    ts = 1_700_000_000_000
+    trades = [
+        _kucoin_manager_fill(
+            "entry-rebate",
+            ts,
+            side="buy",
+            qty=1.0,
+            price=10.0,
+            fees={"currency": "USDT", "cost": -0.03, "rate": -0.0001},
+        )
+    ]
+
+    async def _fetch_trades(since_ms, until_ms):
+        return [dict(trade) for trade in trades]
+
+    async def _enrich_with_order_details_bulk(events, detail_cache):
+        return None
+
+    monkeypatch.setattr(fetcher, "_fetch_trades", _fetch_trades)
+    monkeypatch.setattr(fetcher, "_enrich_with_order_details_bulk", _enrich_with_order_details_bulk)
+
+    out = await fetcher.fetch(ts, ts + 1_000, detail_cache={})
+
+    assert out[0]["pnl"] == pytest.approx(0.0)
+    assert out[0]["fee_paid"] == pytest.approx(0.03)
+
+
+def test_kucoin_positions_history_window_extends_for_delayed_pnl_records():
     fetcher = KucoinFetcher(api=None)
-
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    # Create closing trades that match a single position close
+    close_ts = 1_700_000_000_000
     closes = [
+        {
+            "id": "delayed-close",
+            "symbol": "TON/USDT:USDT",
+            "timestamp": close_ts,
+            "qty": 7.0,
+        }
+    ]
+
+    start_ms, end_ms = fetcher._positions_history_window(
+        closes, close_ts + 4 * 60 * 1000
+    )
+
+    assert start_ms == close_ts - 60_000
+    assert end_ms == close_ts + 4 * 60 * 1000
+
+    _start_ms, capped_end_ms = fetcher._positions_history_window(
+        closes, close_ts + 60 * 60 * 1000
+    )
+    assert capped_end_ms == close_ts + KUCOIN_POSITION_HISTORY_LOOKAHEAD_MS
+
+
+@pytest.mark.asyncio
+async def test_manager_reconciles_rapid_lifecycles_by_observation_close_time(
+    tmp_path: Path,
+):
+    ts = 1_700_000_000_000
+    events = [
+        _kucoin_manager_fill("entry-1", ts, side="buy", qty=1.0, price=10.0),
+        _kucoin_manager_fill("close-1", ts + 60_000, side="sell", qty=-1.0, price=11.0),
+        _kucoin_manager_fill("entry-2", ts + 120_000, side="buy", qty=1.0, price=20.0),
+        _kucoin_manager_fill("close-2", ts + 180_000, side="sell", qty=-1.0, price=22.0),
+    ]
+    observations = [
+        _kucoin_cycle_observation("100", realized_pnl=1.25, close_time=ts + 60_000),
+        _kucoin_cycle_observation("101", realized_pnl=2.5, close_time=ts + 180_000),
+    ]
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher(events, observations),
+        cache_path=tmp_path / "rapid_cycles",
+        fee_pct_fallback=0.0,
+    )
+
+    await manager.refresh()
+
+    by_id = {event.id: event for event in manager.get_events(symbol="TON/USDT:USDT")}
+    assert by_id["close-1"].pnl == pytest.approx(1.25)
+    assert by_id["close-2"].pnl == pytest.approx(2.5)
+    assert by_id["close-1"].pnl_source == fem.PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
+    assert by_id["close-2"].pnl_source == fem.PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
+
+
+@pytest.mark.asyncio
+async def test_manager_reconciles_kucoin_net_cycle_pnl_to_gross_close_pnl(tmp_path: Path):
+    ts = 1_700_000_000_000
+    events = [
+        _kucoin_manager_fill(
+            "entry-fee",
+            ts,
+            side="buy",
+            qty=1.0,
+            price=10.0,
+            fees={"currency": "USDT", "cost": 0.10},
+        ),
+        _kucoin_manager_fill(
+            "close-fee",
+            ts + 60_000,
+            side="sell",
+            qty=-1.0,
+            price=12.0,
+            fees={"currency": "USDT", "cost": 0.20},
+        ),
+    ]
+    observations = [
+        _kucoin_cycle_observation("100", realized_pnl=1.70, close_time=ts + 60_000),
+    ]
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher(events, observations),
+        cache_path=tmp_path / "net_to_gross_cycle",
+        fee_pct_sanity_abs_max=1.0,
+    )
+
+    await manager.refresh()
+
+    by_id = {event.id: event for event in manager.get_events(symbol="TON/USDT:USDT")}
+    assert by_id["entry-fee"].pnl == pytest.approx(0.0)
+    assert by_id["entry-fee"].fee_paid == pytest.approx(-0.10)
+    assert by_id["close-fee"].pnl == pytest.approx(2.0)
+    assert by_id["close-fee"].fee_paid == pytest.approx(-0.20)
+    net_pnl = (
+        by_id["close-fee"].pnl
+        + by_id["entry-fee"].fee_paid
+        + by_id["close-fee"].fee_paid
+    )
+    assert net_pnl == pytest.approx(1.70)
+
+
+@pytest.mark.asyncio
+async def test_manager_distributes_kucoin_gross_cycle_delta_across_multiple_closes(
+    tmp_path: Path,
+):
+    ts = 1_700_000_000_000
+    events = [
+        _kucoin_manager_fill(
+            "entry",
+            ts,
+            side="buy",
+            qty=10.0,
+            price=10.0,
+            fees={"currency": "USDT", "cost": 1.0},
+        ),
+        _kucoin_manager_fill(
+            "close-a",
+            ts + 60_000,
+            side="sell",
+            qty=-4.0,
+            price=11.0,
+            fees={"currency": "USDT", "cost": 0.4},
+        ),
+        _kucoin_manager_fill(
+            "close-b",
+            ts + 120_000,
+            side="sell",
+            qty=-6.0,
+            price=12.0,
+            fees={"currency": "USDT", "cost": 0.6},
+        ),
+    ]
+    observations = [
+        _kucoin_cycle_observation("100", realized_pnl=8.0, close_time=ts + 120_000),
+    ]
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher(events, observations),
+        cache_path=tmp_path / "multi_close_net_to_gross",
+        fee_pct_sanity_abs_max=1.0,
+    )
+
+    await manager.refresh()
+
+    by_id = {event.id: event for event in manager.get_events(symbol="TON/USDT:USDT")}
+    assert by_id["close-a"].pnl == pytest.approx(1.6)
+    assert by_id["close-b"].pnl == pytest.approx(8.4)
+    gross_sum = by_id["close-a"].pnl + by_id["close-b"].pnl
+    fee_sum = sum(event.fee_paid for event in by_id.values())
+    assert gross_sum == pytest.approx(10.0)
+    assert gross_sum + fee_sum == pytest.approx(8.0)
+
+
+@pytest.mark.asyncio
+async def test_manager_reconciles_out_of_order_delayed_rows_by_close_time(
+    tmp_path: Path,
+):
+    ts = 1_700_000_000_000
+    events = [
+        _kucoin_manager_fill("entry-1", ts, side="buy", qty=1.0, price=10.0),
+        _kucoin_manager_fill("close-1", ts + 60_000, side="sell", qty=-1.0, price=11.0),
+        _kucoin_manager_fill("entry-2", ts + 120_000, side="buy", qty=1.0, price=20.0),
+        _kucoin_manager_fill("close-2", ts + 180_000, side="sell", qty=-1.0, price=22.0),
+    ]
+    observations = [
+        _kucoin_cycle_observation(
+            "101",
+            realized_pnl=2.5,
+            close_time=ts + 180_000,
+            update_time=ts + 180_000,
+        ),
+        _kucoin_cycle_observation(
+            "100",
+            realized_pnl=1.25,
+            close_time=ts + 60_000,
+            update_time=ts + 240_000,
+        ),
+    ]
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher(events, observations),
+        cache_path=tmp_path / "out_of_order_delayed",
+        fee_pct_fallback=0.0,
+    )
+
+    await manager.refresh()
+
+    by_id = {event.id: event for event in manager.get_events(symbol="TON/USDT:USDT")}
+    assert by_id["close-1"].pnl == pytest.approx(1.25)
+    assert by_id["close-2"].pnl == pytest.approx(2.5)
+
+
+@pytest.mark.asyncio
+async def test_manager_defers_source_id_only_observations_when_close_time_missing(
+    caplog,
+    tmp_path: Path,
+):
+    ts = 1_700_000_000_000
+    events = [
+        _kucoin_manager_fill("entry-1", ts, side="buy", qty=1.0, price=10.0),
+        _kucoin_manager_fill("close-1", ts + 60_000, side="sell", qty=-1.0, price=11.0),
+        _kucoin_manager_fill("entry-2", ts + 120_000, side="buy", qty=1.0, price=20.0),
+        _kucoin_manager_fill("close-2", ts + 180_000, side="sell", qty=-1.0, price=22.0),
+    ]
+    observations = [
+        _kucoin_cycle_observation("101", realized_pnl=2.5, update_time=ts + 180_000),
+        _kucoin_cycle_observation("100", realized_pnl=1.25, update_time=ts + 240_000),
+    ]
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher(events, observations),
+        cache_path=tmp_path / "source_id_order",
+    )
+
+    caplog.set_level(logging.WARNING, logger=fem.logger.name)
+    await manager.refresh()
+
+    by_id = {event.id: event for event in manager.get_events(symbol="TON/USDT:USDT")}
+    assert by_id["close-1"].pnl == pytest.approx(1.0)
+    assert by_id["close-2"].pnl == pytest.approx(2.0)
+    assert by_id["close-1"].pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+    assert by_id["close-2"].pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+    assert any(
+        "deferred aggregate realized PnL observation matching" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_manager_defers_ambiguous_cycle_observations(caplog, tmp_path: Path):
+    ts = 1_700_000_000_000
+    events = [
+        _kucoin_manager_fill("entry-1", ts, side="buy", qty=1.0, price=10.0),
+        _kucoin_manager_fill("close-1", ts + 60_000, side="sell", qty=-1.0, price=11.0),
+        _kucoin_manager_fill("entry-2", ts + 120_000, side="buy", qty=1.0, price=20.0),
+        _kucoin_manager_fill("close-2", ts + 180_000, side="sell", qty=-1.0, price=22.0),
+    ]
+    observations = [
+        _kucoin_cycle_observation("", realized_pnl=1.25, update_time=ts + 240_000),
+        _kucoin_cycle_observation("", realized_pnl=2.5, update_time=ts + 180_000),
+    ]
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher(events, observations),
+        cache_path=tmp_path / "ambiguous_cycles",
+    )
+
+    caplog.set_level(logging.WARNING, logger=fem.logger.name)
+    await manager.refresh()
+
+    by_id = {event.id: event for event in manager.get_events(symbol="TON/USDT:USDT")}
+    assert by_id["close-1"].pnl == pytest.approx(1.0)
+    assert by_id["close-2"].pnl == pytest.approx(2.0)
+    assert by_id["close-1"].pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+    assert by_id["close-2"].pnl_source == fem.PNL_SOURCE_SYNTHETIC_EXACT
+    assert any(
+        "deferred aggregate realized PnL observation matching" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_manager_mid_position_cycle_observation_stays_degraded(
+    caplog,
+    tmp_path: Path,
+):
+    ts = 1_700_000_000_000
+    events = [
+        _kucoin_manager_fill(
+            "close-1a",
+            ts + 60_000,
+            side="sell",
+            qty=-0.4,
+            price=11.0,
+        ),
+        _kucoin_manager_fill(
+            "close-1b",
+            ts + 61_000,
+            side="sell",
+            qty=-0.6,
+            price=12.0,
+        ),
+    ]
+    observations = [
+        _kucoin_cycle_observation("100", realized_pnl=1.25, close_time=ts + 61_000),
+    ]
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=_StaticFetcher(events, observations),
+        cache_path=tmp_path / "mid_position",
+    )
+
+    caplog.set_level(logging.WARNING, logger=fem.logger.name)
+    await manager.refresh()
+
+    by_id = {event.id: event for event in manager.get_events(symbol="TON/USDT:USDT")}
+    assert by_id["close-1a"].pnl_source == fem.PNL_SOURCE_SYNTHETIC_DEGRADED
+    assert by_id["close-1b"].pnl_source == fem.PNL_SOURCE_SYNTHETIC_DEGRADED
+    assert by_id["close-1a"].pnl_synthetic_reason == "incomplete_position_basis"
+    assert by_id["close-1b"].pnl_synthetic_reason == "incomplete_position_basis"
+    assert any(
+        "deferred aggregate realized PnL observation matching" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_kucoin_fetcher_empty_fetch_logs_debug(monkeypatch, caplog):
+    fetcher = KucoinFetcher(api=object())
+
+    async def _fetch_trades(since_ms, until_ms):
+        return []
+
+    monkeypatch.setattr(fetcher, "_fetch_trades", _fetch_trades)
+
+    with caplog.at_level(logging.DEBUG, logger=fem.logger.name):
+        out = await fetcher.fetch(
+            since_ms=1_700_000_000_000,
+            until_ms=None,
+            detail_cache={},
+        )
+
+    assert out == []
+    records = [
+        record
+        for record in caplog.records
+        if "KucoinFetcher: fetched 0 trade events" in record.message
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert not any(
+        "KucoinFetcher: fetching fill history" in record.message
+        and record.levelno >= logging.INFO
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_latest_does_not_extend_to_old_synthetic_pnl(tmp_path: Path):
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    old_ts = now_ms - 3 * 24 * 60 * 60 * 1000
+    events = [
+        _kucoin_manager_fill(
+            "old-synthetic",
+            old_ts,
+            side="sell",
+            qty=-1.0,
+            price=10.0,
+        )
+    ]
+    events[0]["pnl_status"] = "complete"
+    events[0]["pnl_source"] = fem.PNL_SOURCE_SYNTHETIC_DEGRADED
+    events[0]["pnl_synthetic_reason"] = "incomplete_position_basis"
+    for idx in range(30):
+        ts = now_ms - (30 - idx) * 60_000
+        events.append(
+            _kucoin_manager_fill(
+                f"recent-{idx}",
+                ts,
+                side="buy",
+                qty=1.0,
+                price=10.0 + idx,
+            )
+        )
+    fetcher = _StaticFetcher([])
+    manager = FillEventsManager(
+        exchange="kucoin",
+        user="default",
+        fetcher=fetcher,
+        cache_path=tmp_path / "refresh_latest_synthetic_bound",
+        fee_pct_fallback=0.0,
+    )
+    manager._events = [FillEvent.from_dict(ev) for ev in events]
+    manager._loaded = True
+
+    await manager.refresh_latest(overlap=20)
+
+    assert fetcher.calls
+    assert fetcher.calls[-1][0] is not None
+    assert fetcher.calls[-1][0] > old_ts
+
+
+def test_kucoin_pnl_discrepancy_logs_symbol_diagnostics(caplog):
+    fetcher = KucoinFetcher(api=object())
+    fem._pnl_discrepancy_last_log.clear()
+    fem._pnl_discrepancy_last_delta.clear()
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    trades = [
         {
             "id": "close-1",
-            "symbol": "BTC/USDT:USDT",
-            "timestamp": now_ms,
-            "qty": 80.0,  # 80% of position
+            "symbol": "TAO/USDT:USDT",
+            "side": "sell",
+            "position_side": "long",
         },
         {
-            "id": "close-2",
-            "symbol": "BTC/USDT:USDT",
-            "timestamp": now_ms + 100,
-            "qty": 20.0,  # 20% of position
+            "id": "open-1",
+            "symbol": "SUI/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
         },
     ]
-
-    # Position history entry with total PnL
     positions = [
         {
-            "symbol": "BTC/USDT:USDT",
-            "lastUpdateTimestamp": now_ms + 50,  # Between the two closes
-            "realizedPnl": 100.0,  # Total PnL to distribute
+            "symbol": "TAO/USDT:USDT",
+            "lastUpdateTimestamp": now_ms,
+            "realizedPnl": 1.25,
         },
-    ]
-
-    # Events dict that _match_pnls will modify
-    events = {
-        "close-1": {"id": "close-1", "pnl": 0.0, "symbol": "BTC/USDT:USDT"},
-        "close-2": {"id": "close-2", "pnl": 0.0, "symbol": "BTC/USDT:USDT"},
-    }
-
-    fetcher._match_pnls(closes, positions, events)
-
-    # PnL should be distributed 80/20
-    assert events["close-1"]["pnl"] == pytest.approx(80.0, rel=0.01)
-    assert events["close-2"]["pnl"] == pytest.approx(20.0, rel=0.01)
-
-
-def test_kucoin_match_pnls_handles_unmatched_closes():
-    """Test that unmatched closes get PnL set to 0."""
-    fetcher = KucoinFetcher(api=None)
-
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    # Close trade with no matching position
-    closes = [
         {
-            "id": "orphan-close",
-            "symbol": "ETH/USDT:USDT",
-            "timestamp": now_ms,
-            "qty": 10.0,
+            "symbol": "SUI/USDT:USDT",
+            "lastUpdateTimestamp": now_ms + 1000,
+            "realizedPnl": -0.25,
         },
     ]
 
-    # Position history from a different time window (>5 min away)
-    positions = [
-        {
-            "symbol": "ETH/USDT:USDT",
-            "lastUpdateTimestamp": now_ms - 10 * 60 * 1000,  # 10 min earlier
-            "realizedPnl": 50.0,
-        },
-    ]
+    caplog.set_level(logging.DEBUG, logger=fem.logger.name)
+    fetcher._log_discrepancies(
+        {"close-1": 25.0, "open-1": 0.0},
+        positions,
+        trades,
+    )
 
-    events = {
-        "orphan-close": {"id": "orphan-close", "pnl": 999.0, "symbol": "ETH/USDT:USDT"},
-    }
-
-    fetcher._match_pnls(closes, positions, events)
-
-    # Unmatched close should have PnL set to 0
-    assert events["orphan-close"]["pnl"] == 0.0
-
-
-def test_kucoin_match_pnls_single_fill_gets_full_pnl():
-    """Test that a single fill matching a position gets the full PnL."""
-    fetcher = KucoinFetcher(api=None)
-
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    closes = [
-        {
-            "id": "single-close",
-            "symbol": "SOL/USDT:USDT",
-            "timestamp": now_ms,
-            "qty": 50.0,
-        },
-    ]
-
-    positions = [
-        {
-            "symbol": "SOL/USDT:USDT",
-            "lastUpdateTimestamp": now_ms + 10,
-            "realizedPnl": 25.5,
-        },
-    ]
-
-    events = {
-        "single-close": {"id": "single-close", "pnl": 0.0, "symbol": "SOL/USDT:USDT"},
-    }
-
-    fetcher._match_pnls(closes, positions, events)
-
-    assert events["single-close"]["pnl"] == pytest.approx(25.5)
-
-
-def test_kucoin_match_pnls_multiple_positions_multiple_fills():
-    """Test matching multiple position closes to their respective fills."""
-    fetcher = KucoinFetcher(api=None)
-
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    ten_min_ms = 10 * 60 * 1000  # 10 minutes to ensure clear separation
-
-    closes = [
-        # First position close fills (at time 0)
-        {"id": "btc-close-1", "symbol": "BTC/USDT:USDT", "timestamp": now_ms, "qty": 10.0},
-        {"id": "btc-close-2", "symbol": "BTC/USDT:USDT", "timestamp": now_ms + 50, "qty": 10.0},
-        # Second position close fills (10 min later - well outside 5-min window)
-        {
-            "id": "btc-close-3",
-            "symbol": "BTC/USDT:USDT",
-            "timestamp": now_ms + ten_min_ms,
-            "qty": 5.0,
-        },
-    ]
-
-    positions = [
-        # First position close (near time 0)
-        {"symbol": "BTC/USDT:USDT", "lastUpdateTimestamp": now_ms + 25, "realizedPnl": 100.0},
-        # Second position close (10 min later)
-        {
-            "symbol": "BTC/USDT:USDT",
-            "lastUpdateTimestamp": now_ms + ten_min_ms + 10,
-            "realizedPnl": 50.0,
-        },
-    ]
-
-    events = {
-        "btc-close-1": {"id": "btc-close-1", "pnl": 0.0, "symbol": "BTC/USDT:USDT"},
-        "btc-close-2": {"id": "btc-close-2", "pnl": 0.0, "symbol": "BTC/USDT:USDT"},
-        "btc-close-3": {"id": "btc-close-3", "pnl": 0.0, "symbol": "BTC/USDT:USDT"},
-    }
-
-    fetcher._match_pnls(closes, positions, events)
-
-    # First position: 100 PnL distributed 50/50 (10+10 qty)
-    assert events["btc-close-1"]["pnl"] == pytest.approx(50.0)
-    assert events["btc-close-2"]["pnl"] == pytest.approx(50.0)
-    # Second position: 50 PnL to single fill
-    assert events["btc-close-3"]["pnl"] == pytest.approx(50.0)
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
+    assert any(
+        "diagnostic trade-derived local sum 25.00 differs from authoritative positions_history 1.00"
+        in msg
+        for msg in messages
+    )
+    assert any("top=TAO/USDT:USDT:local=25.00,history=1.25" in msg for msg in messages)
+    assert any(
+        "KucoinFetcher reconciliation detail symbol=TAO/USDT:USDT" in msg
+        and "close_fills=1" in msg
+        and "KuCoin contract multiplier/PnL model mismatch" in msg
+        for msg in messages
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3049,6 +6839,77 @@ class _FakeGateioAPI:
         if not self._orders_batches:
             return []
         return self._orders_batches.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_gateio_fetcher_hostile_error_text_preserves_original_failure():
+    secret = "api_key=gateio-hostile-string"
+
+    class HostileError(RuntimeError):
+        def __str__(self):
+            raise KeyboardInterrupt(secret)
+
+    original = HostileError()
+
+    class FailingGateioAPI:
+        async def private_futures_get_settle_my_trades_timerange(self, _params):
+            raise original
+
+    fetcher = GateioFetcher(FailingGateioAPI(), trade_limit=100)
+
+    with pytest.raises(HostileError) as captured:
+        await fetcher._fetch_trades(1_700_000_000_000, 1_700_000_060_000)
+
+    assert captured.value is original
+
+
+@pytest.mark.asyncio
+async def test_gateio_fetcher_classifies_late_rate_limit_marker(monkeypatch):
+    class LateRateLimitAPI:
+        def __init__(self):
+            self.calls = 0
+
+        async def private_futures_get_settle_my_trades_timerange(self, _params):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError(("x" * 5000) + " TOO_MANY_REQUESTS")
+            return []
+
+    api = LateRateLimitAPI()
+    sleep = AsyncMock()
+    monkeypatch.setattr(fem.asyncio, "sleep", sleep)
+    fetcher = GateioFetcher(api, trade_limit=100)
+
+    assert await fetcher._fetch_trades(1_700_000_000_000, 1_700_000_060_000) == []
+    assert api.calls == 2
+    sleep.assert_awaited_once_with(2)
+
+
+@pytest.mark.asyncio
+async def test_gateio_fetcher_does_not_broaden_rate_limit_marker_case(monkeypatch):
+    class LowercaseMarkerAPI:
+        def __init__(self):
+            self.calls = 0
+
+        async def private_futures_get_settle_my_trades_timerange(self, _params):
+            self.calls += 1
+            raise RuntimeError("too_many_requests")
+
+    api = LowercaseMarkerAPI()
+    sleep = AsyncMock()
+    monkeypatch.setattr(fem.asyncio, "sleep", sleep)
+    fetcher = GateioFetcher(api, trade_limit=100)
+
+    with pytest.raises(RuntimeError, match="too_many_requests"):
+        await fetcher._fetch_trades(1_700_000_000_000, 1_700_000_060_000)
+
+    assert api.calls == 1
+    sleep.assert_not_awaited()
+
+
+def test_disk_full_text_fallback_preserves_marker_case():
+    assert fem._is_disk_full_error(RuntimeError("No space left on device"))
+    assert not fem._is_disk_full_error(RuntimeError("no space left on device"))
 
 
 def _make_gateio_trade(
@@ -3317,6 +7178,44 @@ async def test_gateio_fetcher_captures_fees(monkeypatch):
     assert events[0]["fees"] is not None
     assert events[0]["fees"]["cost"] == pytest.approx(0.05)
     assert events[0]["fees"]["currency"] == "USDT"
+
+
+@pytest.mark.asyncio
+async def test_gateio_fetcher_uses_market_contract_size_for_fee_notional(monkeypatch):
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    trades = [
+        _make_gateio_trade(
+            trade_id="trade-doge",
+            order_id="order-doge",
+            ts=now_ms - 100,
+            symbol="DOGE/USDT:USDT",
+            amount=1.0,
+            price=0.20,
+            fee_cost=0.004,
+        ),
+    ]
+    orders = [_make_gateio_order(order_id="order-doge", ts=now_ms - 100)]
+    api = _FakeGateioAPI([trades], [orders])
+    api.markets = {"DOGE/USDT:USDT": {"id": "DOGE_USDT", "contractSize": 100.0}}
+    monkeypatch.setattr("src.fill_events_manager.custom_id_to_snake", lambda v: v or "unknown")
+
+    fetcher = GateioFetcher(api, trade_limit=100)
+    events = await fetcher.fetch(
+        since_ms=now_ms - 1_000,
+        until_ms=now_ms,
+        detail_cache={},
+    )
+
+    assert events[0]["c_mult"] == pytest.approx(100.0)
+    fee_paid, meta = fem._normalize_fee_paid_from_payload(
+        events[0],
+        fee_pct_fallback=0.0002,
+        fee_pct_sanity_abs_max=0.001,
+    )
+    assert fee_paid == pytest.approx(-0.004)
+    assert meta["fee_notional"] == pytest.approx(20.0)
+    assert meta["fee_ratio"] == pytest.approx(-0.0002)
+    assert meta["fee_quality"] == fem.FEE_QUALITY_EXACT
 
 
 @pytest.mark.asyncio
@@ -3661,3 +7560,145 @@ def test_compute_psize_pprice_initial_state():
     # VWAP: (2*100 + 1*120) / 3 = 320/3 ≈ 106.67
     assert abs(events[0]["pprice"] - 106.66666666666667) < 0.01
     assert result[("BTC", "long")] == (3.0, events[0]["pprice"])
+
+
+def test_hyperliquid_raw_start_position_overrides_wrong_reconstructed_psize():
+    events = [
+        {
+            "id": "hl-close",
+            "timestamp": 1779396722362,
+            "symbol": "HYPE/USDC:USDC",
+            "side": "sell",
+            "qty": 496.4,
+            "price": 56.663393493150686,
+            "pnl": -548.82307,
+            "position_side": "long",
+            "raw": [
+                {
+                    "source": "fetch_my_trades",
+                    "data": {
+                        "id": "5",
+                        "side": "sell",
+                        "amount": 12.45,
+                        "price": 56.64,
+                        "pnl": -13.8,
+                        "info": {
+                            "tid": "5",
+                            "side": "sell",
+                            "sz": "12.45",
+                            "px": "56.64",
+                            "closedPnl": "-13.8",
+                            "startPosition": "12.45",
+                            "dir": "Close Long",
+                        },
+                    },
+                },
+                {
+                    "source": "fetch_my_trades",
+                    "data": {
+                        "id": "1",
+                        "side": "sell",
+                        "amount": 119.0,
+                        "price": 56.66,
+                        "pnl": -131.5,
+                        "info": {
+                            "tid": "1",
+                            "side": "sell",
+                            "sz": "119",
+                            "px": "56.66",
+                            "closedPnl": "-131.5",
+                            "startPosition": "496.4",
+                            "dir": "Close Long",
+                        },
+                    },
+                },
+            ],
+        }
+    ]
+    ensure_qty_signage(events)
+    compute_psize_pprice(
+        events,
+        {("HYPE/USDC:USDC", "long"): (739.53, 56.79734)},
+    )
+
+    assert events[0]["psize"] == pytest.approx(243.13)
+
+    apply_hyperliquid_raw_psize_overrides(events)
+
+    assert events[0]["psize"] == 0.0
+    assert events[0]["pprice"] == 0.0
+
+
+def _provenance_test_fill() -> Dict[str, object]:
+    return {
+        "id": "fill-provenance-1",
+        "timestamp": 1_700_000_000_000,
+        "datetime": "",
+        "symbol": "BTC/USDT:USDT",
+        "side": "buy",
+        "qty": 0.1,
+        "price": 10_000.0,
+        "pnl": 0.0,
+        "fee_paid": -0.01,
+        "pb_order_type": "entry_trailing_normal_long",
+        "position_side": "long",
+        "client_order_id": "cid-provenance",
+    }
+
+
+def test_fill_event_provenance_round_trips_defensively():
+    payload = _provenance_test_fill()
+    payload["provenance"] = {
+        "schema_version": 1,
+        "attribution": "first_ingested_by_runtime",
+        "runtime": {"run_id": "run-1"},
+    }
+    event = FillEvent.from_dict(payload)
+    serialized = event.to_dict()
+    serialized["provenance"]["runtime"]["run_id"] = "mutated"
+    assert event.provenance["runtime"]["run_id"] == "run-1"
+    assert FillEvent.from_dict(event.to_dict()).provenance == event.provenance
+
+
+@pytest.mark.asyncio
+async def test_new_fill_records_first_ingesting_runtime(tmp_path: Path):
+    runtime = {"schema_version": 1, "run_id": "run-current"}
+    manager = FillEventsManager(
+        exchange="hyperliquid",
+        user="user",
+        fetcher=_StaticFetcher([_provenance_test_fill()]),
+        cache_path=tmp_path,
+        runtime_identity=runtime,
+    )
+
+    await manager.refresh()
+
+    event = manager.get_events()[0]
+    assert event.provenance["schema_version"] == 1
+    assert event.provenance["attribution"] == "first_ingested_by_runtime"
+    assert event.provenance["runtime"] == runtime
+    assert event.provenance["first_ingested_at_ms"] >= event.timestamp
+    assert FillEventCache(tmp_path).load()[0].provenance == event.provenance
+
+
+@pytest.mark.asyncio
+async def test_refresh_does_not_reattribute_legacy_cached_fill(tmp_path: Path):
+    cached = FillEvent.from_dict(_provenance_test_fill())
+    FillEventCache(tmp_path).save([cached])
+    manager = FillEventsManager(
+        exchange="hyperliquid",
+        user="user",
+        fetcher=_StaticFetcher([_provenance_test_fill()]),
+        cache_path=tmp_path,
+        runtime_identity={"schema_version": 1, "run_id": "run-later"},
+    )
+
+    await manager.ensure_loaded()
+    assert manager.get_events()[0].provenance == {}
+    await manager.refresh()
+
+    assert manager.get_events()[0].provenance == {}
+    assert FillEventCache(tmp_path).load()[0].provenance == {}
+    data_files = [path for path in tmp_path.glob("*.json") if path.name != "metadata.json"]
+    persisted = json.loads(data_files[0].read_text())
+    assert "provenance" not in persisted[0]

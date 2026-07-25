@@ -4,10 +4,23 @@ import argparse
 import sys
 import os
 import traceback
+from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from utils import symbol_to_coin, ts_to_date, utc_ms
 from pure_funcs import calc_hash
+
+
+EXCHANGE_MAP = {
+    "bybit": ("bybit", "USDT"),
+    "binance": ("binanceusdm", "USDT"),
+    "bitget": ("bitget", "USDT"),
+    "kucoin": ("kucoinfutures", "USDT"),
+    "hyperliquid": ("hyperliquid", "USDC"),
+    "gateio": ("gateio", "USDT"),
+    "okx": ("okx", "USDT"),
+    "weex": ("weex", "USDT"),
+}
 
 
 def is_stablecoin(elm):
@@ -50,25 +63,17 @@ def get_top_market_caps(n_coins, minimum_market_cap_millions, exchange=None):
         exchanges = exchange.split(",")
         import ccxt
 
-        exchange_map = {
-            "bybit": ("bybit", "USDT"),
-            "binance": ("binanceusdm", "USDT"),
-            "bitget": ("bitget", "USDT"),
-            "hyperliquid": ("hyperliquid", "USDC"),
-            "gateio": ("gateio", "USDT"),
-            "okx": ("okx", "USDT"),
-        }
         exchange_approved_coins = set()
         for exchange in exchanges:
             try:
-                cc = getattr(ccxt, exchange_map[exchange][0])()
+                cc = getattr(ccxt, EXCHANGE_MAP[exchange][0])()
                 cc.options["defaultType"] = "swap"
                 markets = cc.fetch_markets()
                 for elm in markets:
                     if (
                         elm["swap"]
                         and elm["active"]
-                        and elm["symbol"].endswith(f":{exchange_map[exchange][1]}")
+                        and elm["symbol"].endswith(f":{EXCHANGE_MAP[exchange][1]}")
                     ):
                         exchange_approved_coins.add(symbol_to_coin(elm["symbol"]))
                 print(f"Added coin filter for {exchange}")
@@ -129,7 +134,7 @@ def get_top_market_caps(n_coins, minimum_market_cap_millions, exchange=None):
     return approved_coins
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="mcap generator", description="generate_mcap_list")
     parser.add_argument(
         f"--n_coins",
@@ -167,7 +172,7 @@ if __name__ == "__main__":
         default=None,
         help="Optional: Output path. Default=configs/approved_coins_{n_coins}_{min_mcap}.json",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     market_caps = get_top_market_caps(args.n_coins, args.minimum_market_cap_millions, args.exchange)
     if args.output is None:
@@ -179,5 +184,13 @@ if __name__ == "__main__":
     else:
         fname = args.output
     print(f"Dumping output to {fname}")
-    json.dump(market_caps, open(fname.replace(".json", "_full.json"), "w"))
-    json.dump(list(market_caps), open(fname, "w"))
+    Path(fname).parent.mkdir(parents=True, exist_ok=True)
+    with open(fname.replace(".json", "_full.json"), "w", encoding="utf-8") as f:
+        json.dump(market_caps, f)
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(list(market_caps), f)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

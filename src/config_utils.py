@@ -22,11 +22,13 @@ from config.bot import (
 from config.load import load_prepared_config as staged_load_prepared_config
 from config.coerce import (
     HSL_COOLDOWN_POSITION_POLICIES,
+    HSL_RESTART_AFTER_RED_POLICIES,
     HSL_SIGNAL_MODES,
     MONITOR_BOOL_KEYS,
     PYMOO_ALGORITHMS,
     PYMOO_REF_DIR_METHODS,
     normalize_hsl_cooldown_position_policy,
+    normalize_hsl_restart_after_red_policy,
     normalize_hsl_signal_mode,
 )
 from config.hydrate import (
@@ -46,6 +48,7 @@ from config.log_output import log_config_message
 from config.metrics import CURRENCY_METRICS, SHARED_METRICS
 from config.pnl_lookback import normalize_pnls_max_lookback_days_config_value
 from config.normalize import normalize_config
+from config.optimize_bounds import prune_inactive_optimize_strategy_bounds
 from config.overrides import (
     apply_allowed_modifications as staged_apply_allowed_modifications,
     get_allowed_modifications as staged_get_allowed_modifications,
@@ -60,6 +63,7 @@ from config.parse import load_raw_config
 from config.project import project_config
 from config.runtime_compile import compile_runtime_config
 from config.schema import get_template_config as get_schema_template_config
+from config.strategy import prune_inactive_strategy_subtrees
 from config.tree_ops import (
     add_missing_keys_recursively,
     remove_unused_keys_recursively,
@@ -70,10 +74,10 @@ from config.migrations import (
     apply_backward_compatibility_renames as apply_migration_renames,
     build_base_config_from_flavor as build_migration_base_config_from_flavor,
     detect_flavor as detect_migration_flavor,
-    migrate_btc_collateral_settings as migrate_btc_collateral_settings_v7,
-    migrate_config_version as migrate_config_version_v7,
-    migrate_empty_means_all_approved as migrate_empty_means_all_approved_v7,
-    migrate_suite_to_scenarios as migrate_suite_to_scenarios_v7,
+    migrate_btc_collateral_settings as migrate_btc_collateral_settings_impl,
+    migrate_config_version as migrate_config_version_impl,
+    migrate_empty_means_all_approved as migrate_empty_means_all_approved_impl,
+    migrate_suite_to_scenarios as migrate_suite_to_scenarios_impl,
     rename_config_keys as rename_migration_config_keys,
 )
 from pure_funcs import sort_dict_keys, str2bool
@@ -85,13 +89,19 @@ def _log_config(verbose: bool, level: int, message: str, *args) -> None:
 
 
 def _canonical_log_json(value: Any) -> str:
-    return json.dumps(sort_dict_keys(deepcopy(value)), sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        sort_dict_keys(deepcopy(value)), sort_keys=True, separators=(",", ":")
+    )
 
 
-def _format_optimize_limits_change_for_log(old_value: Any, new_value: Any) -> Optional[str]:
+def _format_optimize_limits_change_for_log(
+    old_value: Any, new_value: Any
+) -> Optional[str]:
     if not isinstance(old_value, list) or not isinstance(new_value, list):
         return None
-    if not all(isinstance(x, dict) for x in old_value) or not all(isinstance(x, dict) for x in new_value):
+    if not all(isinstance(x, dict) for x in old_value) or not all(
+        isinstance(x, dict) for x in new_value
+    ):
         return None
 
     old_counter = Counter(_canonical_log_json(entry) for entry in old_value)
@@ -118,7 +128,79 @@ def _format_optimize_limits_change_for_log(old_value: Any, new_value: Any) -> Op
     return " | ".join(parts)
 
 
-def _format_config_change_message(full_path: str, old_value: Any, new_value: Any) -> tuple[str, tuple[Any, ...]]:
+_APPROVED_COINS_LOG_SAMPLE_SIZE = 3
+_APPROVED_COINS_LOG_SYMBOL_MAX_LENGTH = 8
+
+
+def _format_approved_coins_symbol_for_log(value: Any) -> str:
+    if not isinstance(value, str):
+        return f"<{type(value).__name__}>"
+    symbol = value[:_APPROVED_COINS_LOG_SYMBOL_MAX_LENGTH].replace("\n", " ").replace(
+        "\r", " "
+    )
+    if len(value) > _APPROVED_COINS_LOG_SYMBOL_MAX_LENGTH:
+        return f"{symbol}..."
+    return symbol
+
+
+def _format_approved_coins_collection_for_log(value: list[Any]) -> str:
+    count = len(value)
+    if not count:
+        return "0[]"
+    sample = [
+        _format_approved_coins_symbol_for_log(symbol)
+        for symbol in value[:_APPROVED_COINS_LOG_SAMPLE_SIZE]
+    ]
+    if count > _APPROVED_COINS_LOG_SAMPLE_SIZE:
+        sample.append(f"+{count - _APPROVED_COINS_LOG_SAMPLE_SIZE}")
+    return f"{count}[{','.join(sample)}]"
+
+
+def _format_approved_coins_list_for_log(value: list[Any]) -> str:
+    return f"list:{_format_approved_coins_collection_for_log(value)}"
+
+
+def _format_approved_coins_shape_for_log(value: Any) -> str:
+    if isinstance(value, list):
+        return _format_approved_coins_list_for_log(value)
+    if isinstance(value, dict):
+        return f"dict:{len(value)}"
+    if isinstance(value, str):
+        return f"str:{len(value)}"
+    if isinstance(value, (tuple, set, frozenset)):
+        return f"{type(value).__name__}:{len(value)}"
+    if value is None:
+        return "none"
+    return f"type={type(value).__name__}"
+
+
+def _format_approved_coins_change_for_log(old_value: Any, new_value: Any) -> str:
+    def format_value(value: Any) -> str:
+        if (
+            isinstance(value, dict)
+            and set(value) == {"long", "short"}
+            and isinstance(value["long"], list)
+            and isinstance(value["short"], list)
+        ):
+            return (
+                "sides("
+                f"long:{_format_approved_coins_collection_for_log(value['long'])},"
+                f"short:{_format_approved_coins_collection_for_log(value['short'])}"
+                ")"
+            )
+        return _format_approved_coins_shape_for_log(value)
+
+    return (
+        "changed live.approved_coins "
+        f"{format_value(old_value)} -> {format_value(new_value)}"
+    )
+
+
+def _format_config_change_message(
+    full_path: str, old_value: Any, new_value: Any
+) -> tuple[str, tuple[Any, ...]]:
+    if full_path == "live.approved_coins":
+        return _format_approved_coins_change_for_log(old_value, new_value), ()
     if full_path == "optimize.limits":
         custom = _format_optimize_limits_change_for_log(old_value, new_value)
         if custom is not None:
@@ -134,6 +216,7 @@ HSL_PSIDE_KEYS = (
     "hsl_ema_span_minutes",
     "hsl_cooldown_minutes_after_red",
     "hsl_no_restart_drawdown_threshold",
+    "hsl_restart_after_red_policy",
     "hsl_orange_tier_mode",
     "hsl_panic_close_order_type",
     "hsl_tier_ratios",
@@ -165,6 +248,45 @@ FIELD_RUNTIME_RULES = {
             "optimize": "Coin Selection",
         },
     },
+    "live.forager_score_hysteresis_pct": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Coin Selection",
+            "optimize": "Coin Selection",
+        },
+    },
+    "live.order_replacement_churn_gate_activation_count": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
+    "live.order_replacement_churn_gate_market_dist_pct": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
+    "live.order_replacement_churn_gate_stability_minutes": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
+    "live.order_replacement_churn_gate_tracking_tolerance_pct": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
+    "live.order_replacement_churn_gate_window_minutes": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
+    "live.limit_order_create_max_market_dist_pct": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
     "live.hedge_mode": {
         "owner": "live",
         "consumed_by": {"live", "backtest", "optimize"},
@@ -192,12 +314,44 @@ FIELD_RUNTIME_RULES = {
             "optimize": "Backtest Runtime",
         },
     },
+    "live.fee_pct_fallback": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
+    "live.fee_pct_sanity_abs_max": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
+    "live.fee_conversion_max_age_ms": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+    },
     "live.max_realized_loss_pct": {
         "owner": "live",
         "consumed_by": {"live", "backtest", "optimize"},
         "cli_exposed_on": {"live", "backtest", "optimize"},
         "help_group": {
             "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
+    "live.max_warmup_minutes": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Date Range",
             "optimize": "Backtest Runtime",
         },
     },
@@ -210,60 +364,120 @@ FIELD_RUNTIME_RULES = {
             "optimize": "Backtest Runtime",
         },
     },
+    "live.hsl_accept_incomplete_history": {
+        "owner": "live",
+        "consumed_by": {"live"},
+        "cli_exposed_on": {"live"},
+        "help_group": {
+            "live": "Behavior",
+        },
+    },
+    "live.hsl_signal_mode": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
 }
 
 OPTIMIZE_FIXED_BOT_RUNTIME_CLI_ARGS = {
-    "bot.long.hsl_enabled": {
-        "visible": ["--bot.long.hsl_enabled"],
-        "hidden": ["--bot_long_hsl_enabled"],
+    "bot.long.hsl.enabled": {
+        "visible": ["--bot.long.hsl.enabled"],
+        "hidden": ["--bot.long.hsl_enabled", "--bot_long_hsl_enabled"],
         "type": str2bool,
         "metavar": "Y/N",
         "commands": {"optimize"},
-        "help": "Override bot.long.hsl_enabled for this optimize run.",
+        "help": "Override bot.long.hsl.enabled for this optimize run.",
     },
-    "bot.short.hsl_enabled": {
-        "visible": ["--bot.short.hsl_enabled"],
-        "hidden": ["--bot_short_hsl_enabled"],
+    "bot.short.hsl.enabled": {
+        "visible": ["--bot.short.hsl.enabled"],
+        "hidden": ["--bot.short.hsl_enabled", "--bot_short_hsl_enabled"],
         "type": str2bool,
         "metavar": "Y/N",
         "commands": {"optimize"},
-        "help": "Override bot.short.hsl_enabled for this optimize run.",
+        "help": "Override bot.short.hsl.enabled for this optimize run.",
     },
-    "bot.long.hsl_orange_tier_mode": {
-        "visible": ["--bot.long.hsl_orange_tier_mode"],
-        "hidden": ["--bot_long_hsl_orange_tier_mode"],
+    "bot.long.hsl.orange_tier_mode": {
+        "visible": ["--bot.long.hsl.orange_tier_mode"],
+        "hidden": ["--bot.long.hsl_orange_tier_mode", "--bot_long_hsl_orange_tier_mode"],
         "type": str,
         "metavar": "VALUE",
         "commands": {"optimize"},
-        "choices": ["manual", "panic", "graceful_stop", "tp_only", "tp_only_with_active_entry_cancellation"],
-        "help": "Override bot.long.hsl_orange_tier_mode for this optimize run.",
+        "choices": [
+            "manual",
+            "panic",
+            "graceful_stop",
+            "tp_only",
+            "tp_only_with_active_entry_cancellation",
+        ],
+        "help": "Override bot.long.hsl.orange_tier_mode for this optimize run.",
     },
-    "bot.short.hsl_orange_tier_mode": {
-        "visible": ["--bot.short.hsl_orange_tier_mode"],
-        "hidden": ["--bot_short_hsl_orange_tier_mode"],
+    "bot.short.hsl.orange_tier_mode": {
+        "visible": ["--bot.short.hsl.orange_tier_mode"],
+        "hidden": ["--bot.short.hsl_orange_tier_mode", "--bot_short_hsl_orange_tier_mode"],
         "type": str,
         "metavar": "VALUE",
         "commands": {"optimize"},
-        "choices": ["manual", "panic", "graceful_stop", "tp_only", "tp_only_with_active_entry_cancellation"],
-        "help": "Override bot.short.hsl_orange_tier_mode for this optimize run.",
+        "choices": [
+            "manual",
+            "panic",
+            "graceful_stop",
+            "tp_only",
+            "tp_only_with_active_entry_cancellation",
+        ],
+        "help": "Override bot.short.hsl.orange_tier_mode for this optimize run.",
     },
-    "bot.long.hsl_panic_close_order_type": {
-        "visible": ["--bot.long.hsl_panic_close_order_type"],
-        "hidden": ["--bot_long_hsl_panic_close_order_type"],
+    "bot.long.hsl.panic_close_order_type": {
+        "visible": ["--bot.long.hsl.panic_close_order_type"],
+        "hidden": [
+            "--bot.long.hsl_panic_close_order_type",
+            "--bot_long_hsl_panic_close_order_type",
+        ],
         "type": str,
         "metavar": "VALUE",
         "commands": {"optimize"},
         "choices": ["limit", "market"],
-        "help": "Override bot.long.hsl_panic_close_order_type for this optimize run.",
+        "help": "Override bot.long.hsl.panic_close_order_type for this optimize run.",
     },
-    "bot.short.hsl_panic_close_order_type": {
-        "visible": ["--bot.short.hsl_panic_close_order_type"],
-        "hidden": ["--bot_short_hsl_panic_close_order_type"],
+    "bot.short.hsl.panic_close_order_type": {
+        "visible": ["--bot.short.hsl.panic_close_order_type"],
+        "hidden": [
+            "--bot.short.hsl_panic_close_order_type",
+            "--bot_short_hsl_panic_close_order_type",
+        ],
         "type": str,
         "metavar": "VALUE",
         "commands": {"optimize"},
         "choices": ["limit", "market"],
-        "help": "Override bot.short.hsl_panic_close_order_type for this optimize run.",
+        "help": "Override bot.short.hsl.panic_close_order_type for this optimize run.",
+    },
+    "bot.long.hsl.restart_after_red_policy": {
+        "visible": ["--bot.long.hsl.restart_after_red_policy"],
+        "hidden": [
+            "--bot.long.hsl_restart_after_red_policy",
+            "--bot_long_hsl_restart_after_red_policy",
+        ],
+        "type": normalize_hsl_restart_after_red_policy,
+        "metavar": "POLICY",
+        "commands": {"optimize"},
+        "choices": tuple(HSL_RESTART_AFTER_RED_POLICIES),
+        "help": "Override bot.long.hsl.restart_after_red_policy for this optimize run.",
+    },
+    "bot.short.hsl.restart_after_red_policy": {
+        "visible": ["--bot.short.hsl.restart_after_red_policy"],
+        "hidden": [
+            "--bot.short.hsl_restart_after_red_policy",
+            "--bot_short_hsl_restart_after_red_policy",
+        ],
+        "type": normalize_hsl_restart_after_red_policy,
+        "metavar": "POLICY",
+        "commands": {"optimize"},
+        "choices": tuple(HSL_RESTART_AFTER_RED_POLICIES),
+        "help": "Override bot.short.hsl.restart_after_red_policy for this optimize run.",
     },
 }
 
@@ -342,7 +556,9 @@ def expand_PB_mode(mode: str) -> str:
         raise Exception(f"unknown passivbot mode {mode}")
 
 
-def apply_allowed_modifications(src, modifications, allowed_overrides, return_full=True):
+def apply_allowed_modifications(
+    src, modifications, allowed_overrides, return_full=True
+):
     return staged_apply_allowed_modifications(
         src, modifications, allowed_overrides, return_full=return_full
     )
@@ -374,7 +590,9 @@ def parse_overrides(config, verbose=True):
 
 
 def load_override_config(config, coin):
-    return staged_load_override_config(config, coin, config_loader=lambda path: load_config(path, verbose=False))
+    return staged_load_override_config(
+        config, coin, config_loader=lambda path: load_config(path, verbose=False)
+    )
 
 
 def parse_old_coin_flags(config) -> dict:
@@ -390,32 +608,34 @@ def _apply_backward_compatibility_renames(
 def _migrate_suite_to_scenarios(
     result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
 ) -> None:
-    migrate_suite_to_scenarios_v7(result, verbose=verbose, tracker=tracker)
+    migrate_suite_to_scenarios_impl(result, verbose=verbose, tracker=tracker)
 
 
 def _migrate_btc_collateral_settings(
     result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
 ) -> None:
-    migrate_btc_collateral_settings_v7(result, verbose=verbose, tracker=tracker)
+    migrate_btc_collateral_settings_impl(result, verbose=verbose, tracker=tracker)
 
 
 def _migrate_config_version(
     result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
 ) -> None:
-    migrate_config_version_v7(result, verbose=verbose, tracker=tracker)
+    migrate_config_version_impl(result, verbose=verbose, tracker=tracker)
 
 
 def _migrate_empty_means_all_approved(
     result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
 ) -> None:
-    migrate_empty_means_all_approved_v7(result, verbose=verbose, tracker=tracker)
+    migrate_empty_means_all_approved_impl(result, verbose=verbose, tracker=tracker)
 
 
 def detect_flavor(config: dict, template: dict) -> str:
     return detect_migration_flavor(config, template)
 
 
-def build_base_config_from_flavor(config: dict, template: dict, flavor: str, verbose: bool) -> dict:
+def build_base_config_from_flavor(
+    config: dict, template: dict, flavor: str, verbose: bool
+) -> dict:
     return build_migration_base_config_from_flavor(config, template, flavor, verbose)
 
 
@@ -443,12 +663,14 @@ def format_bot_config(
     *,
     live_cfg: Optional[dict] = None,
     verbose: bool = True,
+    warn_deprecations: bool = True,
     tracker: Optional[ConfigTransformTracker] = None,
 ) -> dict:
     return staged_format_bot_config(
         bot_cfg,
         live_cfg=live_cfg,
         verbose=verbose,
+        warn_deprecations=warn_deprecations,
         tracker=tracker,
     )
 
@@ -482,7 +704,9 @@ def _hydrate_missing_template_fields(
     verbose: bool = True,
     tracker: Optional[ConfigTransformTracker] = None,
 ) -> None:
-    staged_hydrate_missing_template_fields(template, result, verbose=verbose, tracker=tracker)
+    staged_hydrate_missing_template_fields(
+        template, result, verbose=verbose, tracker=tracker
+    )
 
 
 def _normalize_position_counts(
@@ -507,7 +731,9 @@ def _apply_non_live_adjustments(
     )
 
 
-def format_config(config: dict, verbose=True, live_only=False, base_config_path: str = "") -> dict:
+def format_config(
+    config: dict, verbose=True, live_only=False, base_config_path: str = ""
+) -> dict:
     result = normalize_config(
         config,
         base_config_path=base_config_path,
@@ -554,7 +780,9 @@ def _clean_with_template(template_node, source_node, path: Path = ()):
             cleaned = {}
             for key, value in source_dict.items():
                 if key in template_node:
-                    cleaned[key] = _clean_with_template(template_node[key], value, path + (key,))
+                    cleaned[key] = _clean_with_template(
+                        template_node[key], value, path + (key,)
+                    )
                 else:
                     cleaned[key] = _clean_dynamic_node(value)
             if path == ("backtest", "aggregate") and "default" not in cleaned:
@@ -568,7 +796,9 @@ def _clean_with_template(template_node, source_node, path: Path = ()):
             return _clean_dynamic_node(source_dict)
         result = {}
         for key, tmpl_value in template_node.items():
-            result[key] = _clean_with_template(tmpl_value, source_dict.get(key), path + (key,))
+            result[key] = _clean_with_template(
+                tmpl_value, source_dict.get(key), path + (key,)
+            )
         return result
     if isinstance(template_node, list):
         if isinstance(source_node, list):
@@ -586,6 +816,8 @@ def clean_config(config: dict) -> dict:
     """
     template = get_template_config()
     cleaned = _clean_with_template(template, config or {})
+    prune_inactive_strategy_subtrees(cleaned)
+    prune_inactive_optimize_strategy_bounds(cleaned)
     return sort_dict_keys(cleaned)
 
 
@@ -595,7 +827,9 @@ def strip_config_metadata(config: dict, *, keys: Iterable[str] | None = None) ->
     Defaults to removing `_raw`, `_raw_effective`, and `_transform_log`.
     """
 
-    removal = set(keys or ("_raw", "_raw_effective", "_transform_log", "_coins_sources"))
+    removal = set(
+        keys or ("_raw", "_raw_effective", "_transform_log", "_coins_sources")
+    )
 
     def _strip(node):
         if isinstance(node, dict):
@@ -607,7 +841,9 @@ def strip_config_metadata(config: dict, *, keys: Iterable[str] | None = None) ->
     return _strip(config)
 
 
-def sanitize_prepared_config_for_dump(config: dict, *, extra_keys: Iterable[str] | None = None) -> dict:
+def sanitize_prepared_config_for_dump(
+    config: dict, *, extra_keys: Iterable[str] | None = None
+) -> dict:
     """
     Return a prepared config stripped of runtime/metadata payload so the dumped artifact remains
     clean and directly reusable.
@@ -620,7 +856,9 @@ def sanitize_prepared_config_for_dump(config: dict, *, extra_keys: Iterable[str]
     return clean_config(stripped)
 
 
-def _limits_structurally_equal(raw_limits: Any, normalized_limits: List[Dict[str, Any]]) -> bool:
+def _limits_structurally_equal(
+    raw_limits: Any, normalized_limits: List[Dict[str, Any]]
+) -> bool:
     if not isinstance(raw_limits, list) or len(raw_limits) != len(normalized_limits):
         return False
 
@@ -741,7 +979,7 @@ RESERVED_CLI_ARGS = {
         "help": (
             "Approved coins. Use CSV like BTC,ETH,XRP, the literal 'all', a path to a JSON "
             "coin list file, or a JSON/HJSON per-side object like "
-            "{\"long\":[\"BTC\"],\"short\":\"all\"}. Use coin tickers, not exchange symbols."
+            '{"long":["BTC"],"short":"all"}. Use coin tickers, not exchange symbols.'
         ),
     },
     "live.ignored_coins": {
@@ -768,6 +1006,98 @@ RESERVED_CLI_ARGS = {
             "optimize": "Coin Selection",
         },
         "help": "Minimum coin age in days required before a coin is eligible to trade.",
+    },
+    "live.forager_score_hysteresis_pct": {
+        "visible": ["--forager-score-hysteresis-pct"],
+        "hidden": [
+            "--live.forager_score_hysteresis_pct",
+            "--live_forager_score_hysteresis_pct",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Coin Selection",
+            "backtest": "Coin Selection",
+            "optimize": "Coin Selection",
+        },
+        "help": "Forager incumbent score tolerance. Keeps an already-selected flat forager coin when a challenger score is within this fractional normalized-score gap.",
+    },
+    "live.order_replacement_churn_gate_activation_count": {
+        "visible": ["--order-replacement-churn-gate-activation-count"],
+        "hidden": [
+            "--live.order_replacement_churn_gate_activation_count",
+            "--live_order_replacement_churn_gate_activation_count",
+        ],
+        "type": int,
+        "metavar": "INT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": "Account-wide rolling create-attempt count that activates economy deferral for far unstable orders. Set to 0 to disable only that deferral; reconciliation safety remains active.",
+    },
+    "live.order_replacement_churn_gate_market_dist_pct": {
+        "visible": ["--order-replacement-churn-gate-market-dist-pct"],
+        "hidden": [
+            "--live.order_replacement_churn_gate_market_dist_pct",
+            "--live_order_replacement_churn_gate_market_dist_pct",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": "Final market-distance threshold that always admits a limit order despite churn allowance exhaustion.",
+    },
+    "live.order_replacement_churn_gate_stability_minutes": {
+        "visible": ["--order-replacement-churn-gate-stability-minutes"],
+        "hidden": [
+            "--live.order_replacement_churn_gate_stability_minutes",
+            "--live_order_replacement_churn_gate_stability_minutes",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": "Newest contiguous tight-match duration required to clear older churn evidence.",
+    },
+    "live.order_replacement_churn_gate_tracking_tolerance_pct": {
+        "visible": ["--order-replacement-churn-gate-tracking-tolerance-pct"],
+        "hidden": [
+            "--live.order_replacement_churn_gate_tracking_tolerance_pct",
+            "--live_order_replacement_churn_gate_tracking_tolerance_pct",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": "Wider price/quantity tolerance used only for historical churn evidence.",
+    },
+    "live.order_replacement_churn_gate_window_minutes": {
+        "visible": ["--order-replacement-churn-gate-window-minutes"],
+        "hidden": [
+            "--live.order_replacement_churn_gate_window_minutes",
+            "--live_order_replacement_churn_gate_window_minutes",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": "Window for per-symbol ideal-order evidence and account-wide create-attempt accounting.",
+    },
+    "live.limit_order_create_max_market_dist_pct": {
+        "visible": ["--limit-order-create-max-market-dist-pct"],
+        "hidden": [
+            "--live.limit_order_create_max_market_dist_pct",
+            "--live_limit_order_create_max_market_dist_pct",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": (
+            "Live pre-create guard for limit orders. Set to 0 to disable. "
+            "With the default 0.8, buys below market*0.2 and sells above "
+            "market*1.8 are skipped until price action moves closer."
+        ),
     },
     "live.filter_by_min_effective_cost": {
         "visible": ["--filter-by-min-effective-cost", "-fbmec"],
@@ -817,7 +1147,10 @@ RESERVED_CLI_ARGS = {
             "backtest": "Backtest Runtime",
             "optimize": "Backtest Runtime",
         },
-        "help": "Allow or disallow market orders.",
+        "help": (
+            "Allow Rust to promote crossing/near-touch orders to live market orders. "
+            "Disabled by default; live exchange slippage controls apply."
+        ),
     },
     "live.market_order_near_touch_threshold": {
         "visible": ["--market-order-near-touch-threshold", "-montt"],
@@ -833,7 +1166,10 @@ RESERVED_CLI_ARGS = {
             "backtest": "Backtest Runtime",
             "optimize": "Backtest Runtime",
         },
-        "help": "Distance threshold for allowing market orders near touch.",
+        "help": (
+            "Fractional distance threshold for promoting near-touch orders to market "
+            "when market orders are allowed; this is not a live slippage cap."
+        ),
     },
     "live.max_realized_loss_pct": {
         "visible": ["--max-realized-loss-pct", "-mrlp"],
@@ -848,6 +1184,41 @@ RESERVED_CLI_ARGS = {
         },
         "help": "Maximum realized loss percentage allowed before trading is halted.",
     },
+    "live.fee_pct_fallback": {
+        "visible": ["--fee-pct-fallback"],
+        "hidden": ["--live.fee_pct_fallback", "--live_fee_pct_fallback"],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+        "help": "Fallback fill fee percentage used when reported fee data cannot be converted to quote currency.",
+    },
+    "live.fee_pct_sanity_abs_max": {
+        "visible": ["--fee-pct-sanity-abs-max"],
+        "hidden": ["--live.fee_pct_sanity_abs_max", "--live_fee_pct_sanity_abs_max"],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+        "help": "Absolute fee/notional sanity threshold; outliers are replaced with live.fee_pct_fallback.",
+    },
+    "live.fee_conversion_max_age_ms": {
+        "visible": ["--fee-conversion-max-age-ms"],
+        "hidden": ["--live.fee_conversion_max_age_ms", "--live_fee_conversion_max_age_ms"],
+        "type": int,
+        "metavar": "INT",
+        "commands": {"live"},
+        "group": {"live": "Behavior"},
+        "help": "Maximum age difference allowed when using ticker data to convert non-quote fee tokens.",
+    },
     "live.pnls_max_lookback_days": {
         "visible": ["--pnls-max-lookback-days", "-pmld"],
         "hidden": ["--live.pnls_max_lookback_days", "--live_pnls_max_lookback_days"],
@@ -861,14 +1232,37 @@ RESERVED_CLI_ARGS = {
         },
         "help": "How far into the past to fetch realized PnL history: 0=minimal lookback, positive=float days, 'all'=full history.",
     },
-    "live.price_distance_threshold": {
-        "visible": ["--price-distance-threshold", "-pdt"],
-        "hidden": ["--live.price_distance_threshold", "--live_price_distance_threshold"],
-        "type": float,
-        "metavar": "FLOAT",
-        "commands": {"live"},
-        "group": {"live": "Behavior"},
-        "help": "Reject orders whose price is too far from the market.",
+    "live.hsl_accept_incomplete_history": {
+        "visible": ["--hsl-accept-incomplete-history"],
+        "hidden": [
+            "--live.hsl_accept_incomplete_history",
+            "--live_hsl_accept_incomplete_history",
+        ],
+        "action": "store_true",
+        "default": None,
+        "help": (
+            "DANGEROUS per-run override: start despite incomplete HSL fill-history "
+            "evidence (panic/cooldown/no-restart may be wrong). Per-invocation only; "
+            "values persisted in config files are ignored."
+        ),
+    },
+    "live.hsl_signal_mode": {
+        "visible": ["--hsl-signal-mode"],
+        "hidden": ["--live.hsl_signal_mode", "--live_hsl_signal_mode"],
+        "type": normalize_hsl_signal_mode,
+        "metavar": "MODE",
+        "choices": tuple(HSL_SIGNAL_MODES),
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+        "help": (
+            "HSL signal mode. unified uses one account-level strategy signal for both "
+            "sides; pside tracks long/short independently; coin tracks each coin+side "
+            "slot and panic-closes only the affected slot."
+        ),
     },
     "live.time_in_force": {
         "visible": ["--time-in-force", "-tif"],
@@ -939,6 +1333,56 @@ RESERVED_CLI_ARGS = {
         },
         "help": "Backtest candle interval in minutes.",
     },
+    "backtest.hlcvs_data_dir": {
+        "visible": ["--hlcvs-data-dir"],
+        "hidden": ["--backtest.hlcvs_data_dir", "--backtest_hlcvs_data_dir"],
+        "type": str,
+        "metavar": "PATH",
+        "commands": {"backtest"},
+        "group": {"backtest": "Backtest Runtime"},
+        "help": "Use a specific final HLCV dataset directory instead of resolving by config hash.",
+    },
+    "backtest.hlcvs_data_override_mode": {
+        "visible": ["--hlcvs-data-override-mode"],
+        "hidden": [
+            "--backtest.hlcvs_data_override_mode",
+            "--backtest_hlcvs_data_override_mode",
+        ],
+        "type": str,
+        "metavar": "MODE",
+        "commands": {"backtest"},
+        "group": {"backtest": "Backtest Runtime"},
+        "choices": ("intersection", "dataset"),
+        "help": (
+            "How --hlcvs-data-dir chooses coins/range. intersection keeps the current "
+            "config clipped to the verified dataset; dataset adopts the dataset's "
+            "effective coins and timestamp window for exact artifact replay."
+        ),
+    },
+    "backtest.maker_fee_override": {
+        "visible": ["--maker-fee-override"],
+        "hidden": ["--backtest.maker_fee_override", "--backtest_maker_fee_override"],
+        "type": optional_float,
+        "metavar": "FLOAT",
+        "commands": {"backtest", "optimize"},
+        "group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+        "help": "Override all backtest maker fees. Leave unset to use exchange-derived per-coin maker fees.",
+    },
+    "backtest.taker_fee_override": {
+        "visible": ["--taker-fee-override"],
+        "hidden": ["--backtest.taker_fee_override", "--backtest_taker_fee_override"],
+        "type": optional_float,
+        "metavar": "FLOAT",
+        "commands": {"backtest", "optimize"},
+        "group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+        "help": "Override all backtest taker fees. Leave unset to use exchange-derived per-coin taker fees.",
+    },
     "backtest.starting_balance": {
         "visible": ["--starting-balance", "-sb"],
         "hidden": ["--backtest.starting_balance", "--backtest_starting_balance"],
@@ -952,10 +1396,14 @@ RESERVED_CLI_ARGS = {
         "visible": ["--aggregate-default"],
         "hidden": ["--backtest.aggregate.default", "--backtest_aggregate_default"],
         "type": str,
-        "metavar": "VALUE",
+        "metavar": "MODE",
         "commands": {"backtest"},
         "group": {"backtest": "Suite"},
-        "help": "Suite-only: default aggregation to use for scenario metrics.",
+        "help": (
+            "Suite-only default aggregation for scenario metrics. Allowed modes: "
+            "mean, min, max, std, median. Metric-specific backtest.aggregate entries "
+            "override this default."
+        ),
     },
     "optimize.iters": {
         "visible": ["--iters", "-i"],
@@ -983,6 +1431,18 @@ RESERVED_CLI_ARGS = {
         "commands": {"optimize"},
         "group": {"optimize": "Optimizer"},
         "help": "Optimizer scoring metrics, for example adg_pnl,loss_profit_ratio.",
+    },
+    "optimize.objective_scenario": {
+        "visible": ["--objective-scenario"],
+        "hidden": ["--optimize.objective_scenario", "--optimize_objective_scenario"],
+        "type": str,
+        "metavar": "LABEL",
+        "commands": {"optimize"},
+        "group": {"optimize": "Optimizer"},
+        "help": (
+            "Use one suite scenario for scoring objectives while keeping optimize.limits "
+            "evaluated against suite aggregates."
+        ),
     },
     "optimize.population_size": {
         "visible": ["--population-size", "-ps"],
@@ -1109,7 +1569,150 @@ def _argument_metavar(type_, full_name: str, value):
     return "VALUE"
 
 
+CLI_HELP_OVERRIDES = {
+    "backtest.scenarios": (
+        "Suite scenario definitions. Use --scenarios to select labels; use "
+        "--suite-config for complex scenario files. Scenario entries support "
+        "label, start_date, end_date, coins, ignored_coins, exchanges, "
+        "coin_sources, and overrides."
+    ),
+    "backtest.balance_sample_divider": (
+        "Minutes per saved balance/equity sample. 1 keeps per-minute series; "
+        "higher values thin balance_and_equity.csv.gz and related plots."
+    ),
+    "backtest.btc_collateral_cap": (
+        "Target and ceiling share of equity held as BTC collateral. 0 keeps "
+        "USD-only; 1 targets fully BTC collateral; values >1 allow leveraged "
+        "BTC collateral."
+    ),
+    "backtest.btc_collateral_ltv_cap": (
+        "Optional USD-debt/equity cap while topping up BTC collateral. Leave "
+        "unset for no LTV cap."
+    ),
+    "backtest.compress_cache": (
+        "Compress generated backtest cache artifacts to save disk. Set n/false "
+        "for faster reloads with larger files."
+    ),
+    "backtest.dynamic_wel_by_tradability": (
+        "Backtest-only WEL denominator mode. y grows the denominator with the "
+        "max tradable coin count seen so far; n uses fixed live-style "
+        "n_positions."
+    ),
+    "backtest.filter_by_min_effective_cost": (
+        "Skip coins whose projected initial entry is below the exchange "
+        "effective min cost. y improves live parity; n allows oversized "
+        "min-cost entries."
+    ),
+    "backtest.gap_tolerance_ohlcvs_minutes": (
+        "Largest internal candle gap, in minutes, that preparation may "
+        "tolerate or repair before excluding the affected tradable window."
+    ),
+    "backtest.ohlcv_source_dir": (
+        "Import legacy OHLCV shards before remote fetches. Expected layout: "
+        "<dir>/<exchange>/1m/<coin_or_symbol>/YYYY-MM-DD.npz or .npy."
+    ),
+    "live.max_warmup_minutes": (
+        "Hard cap on calculated EMA/history warmup minutes for backtests and "
+        "live. 0 disables the cap."
+    ),
+    "backtest.base_dir": "Directory where standalone backtest results are written.",
+    "backtest.volume_normalization": (
+        "Normalize volume across exchanges for combined datasets. Leave enabled "
+        "for comparable combined-exchange backtests."
+    ),
+    "backtest.liquidation_threshold": (
+        "Early-stop equity floor as a fraction of starting balance. Must "
+        "satisfy 0 <= x < 1; 0.05 stops once equity is <= 5 percent of start."
+    ),
+    "backtest.market_order_slippage_pct": (
+        "Backtest-only simulated market-order slippage as part-per-one. Applies "
+        "to market-promoted orders and market HSL panic closes; not a live "
+        "slippage cap."
+    ),
+    "backtest.suite_enabled": (
+        "Enable suite mode from config. CLI --suite y/n overrides it for one run."
+    ),
+    "backtest.visible_metrics": (
+        "Terminal metric visibility config. null uses optimize scoring/limits; "
+        "[] shows all; a list adds named metrics. Full analysis is still saved."
+    ),
+    "config_version": "Config schema version. Canonical V8 configs use v8.0.0.",
+}
+
+for _pside in ("long", "short"):
+    CLI_HELP_OVERRIDES.update(
+        {
+            f"bot.{_pside}.hsl.enabled": f"Enable HSL for the {_pside} side.",
+            f"bot.{_pside}.hsl.red_threshold": (
+                f"RED drawdown trigger for {_pside} HSL, as part-per-one."
+            ),
+            f"bot.{_pside}.hsl.ema_span_minutes": (
+                f"EMA span, in minutes, for the {_pside} HSL drawdown signal."
+            ),
+            f"bot.{_pside}.hsl.cooldown_minutes_after_red": (
+                f"Minutes to wait after {_pside} HSL RED is flattened before "
+                "restart is allowed."
+            ),
+            f"bot.{_pside}.hsl.no_restart_drawdown_threshold": (
+                f"Terminal {_pside} HSL drawdown threshold. Values below "
+                "red_threshold are clamped up to red_threshold."
+            ),
+            f"bot.{_pside}.hsl.restart_after_red_policy": (
+                f"Restart policy after {_pside} HSL RED. Allowed values: "
+                "always, threshold, or never."
+            ),
+            f"bot.{_pside}.hsl.tier_ratios.yellow": (
+                f"Multiplier of red_threshold used for the {_pside} YELLOW HSL tier."
+            ),
+            f"bot.{_pside}.hsl.tier_ratios.orange": (
+                f"Multiplier of red_threshold used for the {_pside} ORANGE HSL tier."
+            ),
+            f"bot.{_pside}.hsl.orange_tier_mode": (
+                "Allowed values: graceful_stop or "
+                "tp_only_with_active_entry_cancellation. Controls ORANGE-tier "
+                f"behavior for the {_pside} side."
+            ),
+            f"bot.{_pside}.hsl.panic_close_order_type": (
+                "Allowed values: limit or market. market uses "
+                "backtest.market_order_slippage_pct and taker fees in backtests."
+            ),
+            f"bot.{_pside}.risk.total_exposure_entry_gate_enabled": (
+                f"Enable the {_pside} TWEL entry cap for bot-generated entries."
+            ),
+            f"bot.{_pside}.risk.total_exposure_enforcer_enabled": (
+                f"Enable {_pside} TWEL auto-reduce repair for already-over-target "
+                "same-side exposure."
+            ),
+            f"bot.{_pside}.risk.total_exposure_enforcer_policy": (
+                "Allowed values: reduce_overweight or reduce_portfolio. Controls "
+                f"which managed {_pside} positions TWEL auto-reduce may trim."
+            ),
+            f"bot.{_pside}.risk.total_exposure_enforcer_threshold": (
+                f"Fraction of {_pside} TWEL used by entry gating and TWEL "
+                "auto-reduce repair."
+            ),
+            f"bot.{_pside}.risk.we_excess_allowance_mode": (
+                "Allowed values: bounded or legacy_raw. bounded caps per-symbol "
+                "excess by side TWEL; legacy_raw preserves raw v7-style allowance."
+            ),
+            f"bot.{_pside}.risk.we_excess_allowance_pct": (
+                f"Per-symbol allowance above the configured {_pside} WEL before "
+                "position exposure trimming."
+            ),
+            f"bot.{_pside}.risk.n_positions": (
+                f"Target number of concurrent {_pside} position slots."
+            ),
+            f"bot.{_pside}.risk.total_wallet_exposure_limit": (
+                f"Total wallet exposure limit for the {_pside} side."
+            ),
+        }
+    )
+
+
 def _argument_help_text(full_name: str, appendix: str) -> str:
+    override = CLI_HELP_OVERRIDES.get(full_name)
+    if override is not None:
+        return override
     base = f"Override {full_name}."
     if appendix:
         return f"{base} {appendix}".strip()
@@ -1119,19 +1722,28 @@ def _argument_help_text(full_name: str, appendix: str) -> str:
 def _classify_live_argument(full_name: str, help_all: bool) -> Optional[str]:
     coin_selection = {
         "live.approved_coins",
+        "live.forager_score_hysteresis_pct",
         "live.ignored_coins",
         "live.minimum_coin_age_days",
     }
     behavior = {
         "live.filter_by_min_effective_cost",
+        "live.fee_conversion_max_age_ms",
+        "live.fee_pct_fallback",
+        "live.fee_pct_sanity_abs_max",
         "live.forced_mode_long",
         "live.forced_mode_short",
         "live.hedge_mode",
         "live.leverage",
         "live.market_orders_allowed",
         "live.max_realized_loss_pct",
+        "live.limit_order_create_max_market_dist_pct",
         "live.order_match_tolerance_pct",
-        "live.price_distance_threshold",
+        "live.order_replacement_churn_gate_activation_count",
+        "live.order_replacement_churn_gate_market_dist_pct",
+        "live.order_replacement_churn_gate_stability_minutes",
+        "live.order_replacement_churn_gate_tracking_tolerance_pct",
+        "live.order_replacement_churn_gate_window_minutes",
     }
     runtime = {
         "live.execution_delay_seconds",
@@ -1160,7 +1772,6 @@ def _classify_backtest_argument(full_name: str, help_all: bool) -> Optional[str]
     }
     date_range = {
         "backtest.end_date",
-        "backtest.max_warmup_minutes",
         "backtest.start_date",
     }
     runtime = {
@@ -1176,6 +1787,7 @@ def _classify_backtest_argument(full_name: str, help_all: bool) -> Optional[str]
         "backtest.maker_fee_override",
         "backtest.ohlcv_source_dir",
         "backtest.starting_balance",
+        "backtest.taker_fee_override",
     }
     output = {
         "backtest.base_dir",
@@ -1210,6 +1822,7 @@ def _classify_optimize_argument(full_name: str, help_all: bool) -> Optional[str]
         "optimize.iters",
         "optimize.backend",
         "optimize.n_cpus",
+        "optimize.objective_scenario",
         "optimize.pareto_max_size",
         "optimize.population_size",
         "optimize.scoring",
@@ -1224,9 +1837,9 @@ def _classify_optimize_argument(full_name: str, help_all: bool) -> Optional[str]
         "backtest.filter_by_min_effective_cost",
         "backtest.gap_tolerance_ohlcvs_minutes",
         "backtest.maker_fee_override",
-        "backtest.max_warmup_minutes",
         "backtest.ohlcv_source_dir",
         "backtest.starting_balance",
+        "backtest.taker_fee_override",
         "backtest.volume_normalization",
     }
     optimize_common = {
@@ -1325,26 +1938,38 @@ def add_reserved_arguments(
         if command is not None and commands is not None and command not in commands:
             continue
         visible_group = (
-            spec.get("group", {}).get(command)
-            if command is not None
-            else None
+            spec.get("group", {}).get(command) if command is not None else None
         )
-        container = group_map.get(visible_group, parser) if group_map and visible_group else parser
+        container = (
+            group_map.get(visible_group, parser)
+            if group_map and visible_group
+            else parser
+        )
 
-        register_kwargs = dict(
-            type=spec["type"],
-            dest=config_key,
-            required=False,
-            default=None,
-            metavar=spec["metavar"],
-            help=(
-                spec["help"]
-                if help_all or visible_group is not None or command is None
-                else argparse.SUPPRESS
-            ),
+        help_text = (
+            spec["help"]
+            if help_all or visible_group is not None or command is None
+            else argparse.SUPPRESS
         )
-        if "choices" in spec:
-            register_kwargs["choices"] = spec["choices"]
+        if spec.get("action") == "store_true":
+            register_kwargs = dict(
+                action="store_true",
+                dest=config_key,
+                required=False,
+                default=spec.get("default"),
+                help=help_text,
+            )
+        else:
+            register_kwargs = dict(
+                type=spec["type"],
+                dest=config_key,
+                required=False,
+                default=None,
+                metavar=spec["metavar"],
+                help=help_text,
+            )
+            if "choices" in spec:
+                register_kwargs["choices"] = spec["choices"]
 
         _register_argument(
             container,
@@ -1352,7 +1977,11 @@ def add_reserved_arguments(
             spec["hidden"],
             **register_kwargs,
         )
-        visible_shorts = [name[1:] for name in spec["visible"] if name.startswith("-") and not name.startswith("--")]
+        visible_shorts = [
+            name[1:]
+            for name in spec["visible"]
+            if name.startswith("-") and not name.startswith("--")
+        ]
         for short_name in visible_shorts:
             reserved_acronyms.add(short_name)
         reserved_keys.add(config_key)
@@ -1361,7 +1990,12 @@ def add_reserved_arguments(
 
 
 def add_config_arguments(
-    parser, config, *, command: Optional[str] = None, help_all: bool = False, group_map=None
+    parser,
+    config,
+    *,
+    command: Optional[str] = None,
+    help_all: bool = False,
+    group_map=None,
 ):
     """Add all CLI arguments for config parameters.
 
@@ -1432,7 +2066,9 @@ def add_arguments_recursively(
                 acronym = create_acronym(full_name, acronyms)
                 visible_group = classify_config_argument(full_name, command, help_all)
                 container = (
-                    group_map.get(visible_group, parser) if group_map and visible_group else parser
+                    group_map.get(visible_group, parser)
+                    if group_map and visible_group
+                    else parser
                 )
                 hidden_names = [f"--{full_name.replace('.', '_')}"]
                 if command is None or len(acronym) > 1:
@@ -1447,8 +2083,7 @@ def add_arguments_recursively(
                     default=None,
                     metavar="CSV",
                     help=(
-                        "Override "
-                        f"{full_name}."
+                        "Override " f"{full_name}."
                         if help_all or command is None
                         else argparse.SUPPRESS
                     ),
@@ -1477,12 +2112,19 @@ def add_arguments_recursively(
             if "limits" in full_name:
                 type_ = str
                 appendix = 'Example: "--loss_profit_ratio 0.5 --drawdown_worst 0.3333"'
-            elif any([x in full_name for x in ["approved_coins", "ignored_coins", "exchanges"]]):
+            elif any(
+                [
+                    x in full_name
+                    for x in ["approved_coins", "ignored_coins", "exchanges"]
+                ]
+            ):
                 type_ = comma_separated_values
                 appendix = "item1,item2,item3,..."
             elif "scoring" in full_name:
                 type_ = comma_separated_values
                 appendix = "Examples: adg,sharpe_ratio; mdg,sortino_ratio; ..."
+            elif isinstance(value, list) and "bounds" not in full_name:
+                type_ = comma_separated_values
             elif value is None:
                 if full_name == "backtest.btc_collateral_ltv_cap":
                     type_ = optional_float
@@ -1500,7 +2142,11 @@ def add_arguments_recursively(
                     + appendix
                 )
             visible_group = classify_config_argument(full_name, command, help_all)
-            container = group_map.get(visible_group, parser) if group_map and visible_group else parser
+            container = (
+                group_map.get(visible_group, parser)
+                if group_map and visible_group
+                else parser
+            )
             hidden_names = [f"--{full_name.replace('.', '_')}"]
             if command is None or len(acronym) > 1:
                 hidden_names.append(f"-{acronym}")
@@ -1554,7 +2200,11 @@ def recursive_config_update(config, key, value, path=None, verbose=False):
                 )
                 _log_config(verbose, logging.INFO, message, *args)
                 config[current_key] = coerced_value
-                return {"path": full_path, "old": old_value, "new": deepcopy(coerced_value)}
+                return {
+                    "path": full_path,
+                    "old": old_value,
+                    "new": deepcopy(coerced_value),
+                }
             return None
         _log_config(verbose, logging.INFO, "added %s %s", full_path, value)
         config[current_key] = deepcopy(value)
@@ -1577,7 +2227,9 @@ def recursive_config_update(config, key, value, path=None, verbose=False):
     )
 
 
-def update_config_with_args(config, args, verbose=False, allowed_keys: Optional[set[str]] = None):
+def update_config_with_args(
+    config, args, verbose=False, allowed_keys: Optional[set[str]] = None
+):
     changed_keys = []
     diffs = []
     for key, value in vars(args).items():

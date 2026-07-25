@@ -7,6 +7,7 @@ itself; it only inspects filesystem state.
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import os
 import subprocess
@@ -28,11 +29,15 @@ _LOCK_HANDLE = None
 
 def _extension_suffixes() -> list[str]:
     # Prefer the exact interpreter suffix when available (e.g. `.cpython-312-darwin.so`),
-    # but keep broad fallbacks for non-standard environments.
+    # but also include abi3/generic suffixes that importlib accepts. Abi3 wheels install as
+    # `passivbot_rust.abi3.so`, which does not match the interpreter-specific EXT_SUFFIX.
+    suffixes: list[str] = []
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
     if suffix:
-        return [suffix.lstrip(".")]
-    return ["so", "pyd", "dll", "dylib", "bundle", "sl"]
+        suffixes.append(suffix)
+    suffixes.extend(getattr(importlib.machinery, "EXTENSION_SUFFIXES", ()))
+    suffixes.extend((".so", ".pyd", ".dll", ".dylib", ".bundle", ".sl"))
+    return list(dict.fromkeys(suffix.lstrip(".") for suffix in suffixes if suffix))
 
 
 def _local_extension_candidates() -> list[Path]:
@@ -366,11 +371,17 @@ def _unlock_file(handle) -> None:
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def acquire_lock(lock_file: Path = LOCK_FILE, timeout: Optional[float] = LOCK_TIMEOUT) -> bool:
+def acquire_lock(
+    lock_file: Path = LOCK_FILE,
+    timeout: Optional[float] = LOCK_TIMEOUT,
+    *,
+    wait_message: Optional[str] = None,
+) -> bool:
     global _LOCK_HANDLE
     if _LOCK_HANDLE is not None:
         return True
     start = time.time()
+    logged_wait = False
     try:
         lock_file.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_file.open("a+", encoding="utf-8")
@@ -387,6 +398,9 @@ def acquire_lock(lock_file: Path = LOCK_FILE, timeout: Optional[float] = LOCK_TI
             _LOCK_HANDLE = handle
             return True
         except OSError:
+            if wait_message is not None and not logged_wait:
+                print(wait_message)
+                logged_wait = True
             if timeout is not None and time.time() - start > timeout:
                 try:
                     handle.close()
@@ -464,6 +478,9 @@ def maturin_develop_command() -> list[str]:
 
 def maturin_env() -> dict[str, str]:
     env = os.environ.copy()
+    fingerprint = source_fingerprint()
+    if fingerprint is not None:
+        env["PASSIVBOT_RUST_SOURCE_FINGERPRINT"] = fingerprint
     prefix = Path(sys.prefix)
     base_prefix = Path(getattr(sys, "base_prefix", sys.prefix))
     if prefix != base_prefix:
@@ -540,13 +557,15 @@ def check_and_maybe_compile(
         return
 
     if compiled_path is None:
-        print("Rust extension missing; compiling...")
+        wait_message = "Rust extension missing; waiting for compile lock..."
     elif stale:
-        print("Rust extension is stale; recompiling...")
+        wait_message = "Rust extension is stale; waiting for compile lock..."
     elif force:
-        print("Rust extension rebuild forced; recompiling...")
+        wait_message = "Rust extension rebuild forced; waiting for compile lock..."
+    else:
+        wait_message = "Rust extension rebuild requested; waiting for compile lock..."
 
-    if not acquire_lock():
+    if not acquire_lock(wait_message=wait_message):
         raise RuntimeError("Timed out waiting for Rust compile lock.")
     try:
         prune_shadowing_local_extensions()
@@ -555,7 +574,14 @@ def check_and_maybe_compile(
         compiled_path = preferred_compiled_path()
         stale = extension_needs_rebuild(compiled_path, source_mtime, fingerprint)
         if not (force or stale):
+            print("Rust extension was rebuilt by another process; continuing.")
             return
+        if compiled_path is None:
+            print("Rust extension missing; acquired compile lock; compiling...")
+        elif stale:
+            print("Rust extension is stale; acquired compile lock; recompiling...")
+        elif force:
+            print("Rust extension rebuild forced; acquired compile lock; recompiling...")
         if not recompile_rust():
             raise RuntimeError("Rust compilation failed.")
     finally:

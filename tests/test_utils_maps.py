@@ -41,6 +41,22 @@ def make_dummy_exchange_class(markets):
     return DummyCCXT
 
 
+def test_load_ccxt_instance_defaults_okx_to_swap_only_markets(monkeypatch):
+    class DummyOKX:
+        def __init__(self, config=None):
+            self.config = config or {}
+            self.options = {}
+
+    monkeypatch.setattr(utils.ccxt, "exchanges", ["okx"], raising=False)
+    monkeypatch.setattr(utils.ccxt, "okx", DummyOKX, raising=False)
+    monkeypatch.setattr(utils, "resolve_custom_endpoint_override", lambda _exchange: None)
+
+    cc = utils.load_ccxt_instance("okx")
+
+    assert cc.options["defaultType"] == "swap"
+    assert cc.options["fetchMarkets"] == {"types": ["swap"]}
+
+
 @pytest.mark.asyncio
 async def test_load_markets_fetch_and_cache_creates_maps(tmp_path, monkeypatch):
     # Work inside an isolated temp directory
@@ -232,6 +248,27 @@ def test_filter_markets_with_explicit_quote():
     assert "BTC/USDC:USDC" in eligible
     assert "BTC/USDT:USDT" in ineligible
     assert reasons["BTC/USDT:USDT"] == "wrong quote"
+
+
+def test_filter_markets_demotes_boot_inventory_chatter_to_debug(caplog):
+    markets = {
+        "BTC/USDT:USDT": {"active": True, "swap": True, "linear": True},
+        "SPOT/USDT": {"active": True, "swap": False, "linear": True},
+        "DOGE/USDT:USDT": {"active": True, "swap": True, "linear": False},
+        "BTC/USDC:USDC": {"active": True, "swap": True, "linear": True},
+    }
+
+    with caplog.at_level(logging.DEBUG):
+        utils.filter_markets(markets, "binance", quote="USDT", verbose=True)
+
+    debug_messages = {
+        (record.levelname, record.message)
+        for record in caplog.records
+        if record.message.startswith(("not swap", "not linear", "wrong quote"))
+    }
+    assert ("DEBUG", "not swap: SPOT/USDT") in debug_messages
+    assert ("DEBUG", "not linear: DOGE/USDT:USDT") in debug_messages
+    assert ("DEBUG", "wrong quote: BTC/USDC:USDC") in debug_messages
 
 
 def test_coin_to_symbol_with_explicit_quote(tmp_path, monkeypatch):

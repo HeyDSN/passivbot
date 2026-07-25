@@ -54,6 +54,7 @@ CURRENCY_METRICS = {
 }
 
 SHARED_METRICS = {
+    "backtest_completion_ratio",
     "positions_held_per_day",
     "positions_held_per_day_w",
     "position_held_hours_mean",
@@ -69,6 +70,30 @@ SHARED_METRICS = {
     "trade_loss_max",
     "trade_loss_mean",
     "trade_loss_median",
+    "fills_active_days_count",
+    "fills_active_days_ratio",
+    "fills_active_symbols_count",
+    "fills_analysis_duration_days",
+    "fills_count",
+    "fills_count_close",
+    "fills_count_entry",
+    "fills_count_long",
+    "fills_count_short",
+    "fills_entry_per_close",
+    "fills_gap_longest_days",
+    "fills_gap_mean_hours",
+    "fills_gap_median_hours",
+    "fills_gap_p95_hours",
+    "fills_gap_p99_hours",
+    "fills_per_day",
+    "fills_per_day_close",
+    "fills_per_day_entry",
+    "fills_per_day_long",
+    "fills_per_day_per_position_slot",
+    "fills_per_day_per_position_slot_long",
+    "fills_per_day_per_position_slot_short",
+    "fills_per_day_short",
+    "fills_top_symbol_share",
     "volume_pct_per_day_avg",
     "volume_pct_per_day_avg_w",
     "loss_profit_ratio",
@@ -111,6 +136,15 @@ SHARED_METRICS = {
     "drawdown_worst_ema_strategy_eq",
     "drawdown_worst_mean_1pct_strategy_eq",
     "drawdown_worst_mean_1pct_ema_strategy_eq",
+    "strategy_eq_underwater_pct_mean",
+    "strategy_eq_underwater_pct_median",
+    "strategy_eq_recovery_days_mean",
+    "strategy_eq_recovery_days_median",
+    "strategy_eq_recovery_days_p95",
+    "strategy_eq_recovery_days_p99",
+    "strategy_eq_recovery_days_mean_worst_5pct",
+    "strategy_eq_recovery_days_mean_worst_1pct",
+    "strategy_eq_recovery_days_max",
     "peak_recovery_days_strategy_eq",
     "peak_recovery_hours_strategy_eq",
     "hard_stop_triggers_per_year",
@@ -126,6 +160,9 @@ SHARED_METRICS = {
     "hard_stop_trigger_drawdown_mean",
     "hard_stop_panic_close_loss_sum",
     "hard_stop_panic_close_loss_max",
+    "hard_stop_panic_close_loss_drawdown_pct_min",
+    "hard_stop_panic_close_loss_drawdown_pct_mean",
+    "hard_stop_panic_close_loss_drawdown_pct_max",
     "hard_stop_flatten_time_minutes_mean",
     "hard_stop_post_restart_retrigger_pct",
 }
@@ -141,6 +178,11 @@ ANALYSIS_SHARED_KEYS = SHARED_METRICS | {
     "total_wallet_exposure_median",
     "entry_initial_balance_pct_long",
     "entry_initial_balance_pct_short",
+    "entry_interval_hours_mean",
+    "entry_interval_hours_median",
+    "entry_interval_hours_p95",
+    "entry_interval_hours_p99",
+    "entry_interval_hours_max",
     "drawdown_worst_strategy_eq_long",
     "drawdown_worst_strategy_eq_short",
     "drawdown_worst_ema_strategy_eq_long",
@@ -190,6 +232,7 @@ METRIC_ALIASES = {
     "drawdown_worst_mean_1pct_ema_hsl": "drawdown_worst_mean_1pct_ema_strategy_eq",
     "drawdown_worst_mean_1pct_ema_hsl_long": "drawdown_worst_mean_1pct_ema_strategy_eq_long",
     "drawdown_worst_mean_1pct_ema_hsl_short": "drawdown_worst_mean_1pct_ema_strategy_eq_short",
+    "peak_recovery_days_strategy_eq": "strategy_eq_recovery_days_max",
     "peak_recovery_hours_hsl": "peak_recovery_hours_strategy_eq",
     "peak_recovery_hours_hsl_long": "peak_recovery_hours_strategy_eq_long",
     "peak_recovery_hours_hsl_short": "peak_recovery_hours_strategy_eq_short",
@@ -222,11 +265,13 @@ def canonical_metric_name(metric: str) -> str:
 def metric_aliases(metric: str) -> tuple[str, ...]:
     base, stat = split_metric_stat_suffix(metric)
     canonical_base = METRIC_ALIASES.get(base, base)
-    candidates = [_with_stat_suffix(base, stat), _with_stat_suffix(canonical_base, stat)]
+    canonical = _with_stat_suffix(canonical_base, stat)
+    candidates = [_with_stat_suffix(base, stat), canonical]
     candidates.extend(
         _with_stat_suffix(alias, stat)
         for alias in CANONICAL_TO_ALIASES.get(canonical_base, ())
     )
+    candidates.extend(CANONICAL_TO_ALIASES.get(canonical, ()))
     return tuple(dict.fromkeys(candidates))
 
 

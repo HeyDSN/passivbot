@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hjson
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,19 +14,67 @@ import tools.run_fake_live as run_fake_live_module
 from fill_events_manager import FillEvent, FillEventCache
 from config_utils import load_config
 from exchanges.fake import FakeCCXTClient
+from live.event_bus import EventTypes, LiveEvent
 from passivbot import setup_bot
 from tools.run_fake_live import (
     _async_main,
     _apply_assertions,
+    _compare_run_artifacts,
     _extract_hsl_trace,
+    _install_candle_remote_fetch_trace,
     _install_fake_user_override,
     _install_runtime_overrides,
+    _load_run_artifacts,
     _prime_fake_candles,
     _prime_fake_fill_cache,
     _run_fake_bot,
+    _summarize_remote_calls,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_candle_remote_fetch_trace_sanitizes_hostile_payload():
+    forwarded = []
+    bot = SimpleNamespace(cm=SimpleNamespace(_remote_fetch_callback=forwarded.append))
+    events, restore = _install_candle_remote_fetch_trace(bot)
+    url = "https://api.example.invalid/ohlcv?apiKey=SECRET&signature=abc"
+
+    try:
+        bot.cm._remote_fetch_callback(
+            {
+                "kind": "ccxt_fetch_ohlcv",
+                "stage": "error",
+                "url": url,
+                "params": {"until": 123, "apiKey": "SECRET"},
+                "error_type": "AuthError",
+                "error": f"GET {url}",
+                "error_repr": f"AuthError({url!r})",
+            }
+        )
+    finally:
+        restore()
+
+    assert len(events) == 1
+    assert events[0]["event_index"] == 0
+    assert events[0]["param_keys"] == ["apiKey", "until"]
+    assert len(events[0]["url_hash"]) == 64
+    assert "url" not in events[0]
+    assert "params" not in events[0]
+    assert "error" not in events[0]
+    assert "error_repr" not in events[0]
+    assert "SECRET" not in str(events[0])
+    assert forwarded == [{key: value for key, value in events[0].items() if key != "event_index"}]
+
+
+def _cleanup_fake_user_state(user: str) -> None:
+    shutil.rmtree(REPO_ROOT / "caches" / "fill_events" / "fake" / user, ignore_errors=True)
+    for pside in ("long", "short"):
+        latch_path = REPO_ROOT / "caches" / "equity_hard_stop" / "fake" / f"{user}_{pside}.json"
+        try:
+            latch_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _scenario() -> dict:
@@ -70,7 +120,7 @@ class _StubBot:
     def _hsl_psides(self):
         return ("long", "short")
 
-    async def execute_to_exchange(self):
+    async def execute_to_exchange(self, **kwargs):
         self.loop_calls += 1
         return {"cycle": self.loop_calls}
 
@@ -86,6 +136,104 @@ async def test_run_fake_bot_advances_until_timeline_end():
     summaries = await _run_fake_bot(bot, client, max_steps=None)
     assert bot.loop_calls == 3
     assert [row["step_index"] for row in summaries] == [0, 1, 2]
+
+
+@pytest.mark.fake_live
+def test_live_event_capture_uses_isolated_pipeline_without_default_pipeline():
+    class _NoDefaultPipelineBot:
+        exchange = "fake"
+        user = "fake_capture"
+        bot_id = "fake_capture_bot"
+        _live_event_pipeline = None
+
+    bot = _NoDefaultPipelineBot()
+    sink, restore = run_fake_live_module._install_live_event_capture(bot)
+    pipeline = bot._live_event_pipeline
+    try:
+        assert pipeline.console_sink is None
+        assert pipeline.monitor_sinks == ()
+        assert pipeline.structured_sinks == (sink,)
+        assert pipeline.emit(LiveEvent(EventTypes.BOT_STARTED)) is not None
+        assert pipeline.flush(timeout=2.0) is True
+        assert [event.event_type for event in sink.events] == [EventTypes.BOT_STARTED]
+    finally:
+        restore()
+    assert bot._live_event_pipeline is None
+
+
+@pytest.mark.fake_live
+def test_live_event_capture_serialization_reports_truncation():
+    sink = run_fake_live_module._BoundedLiveEventSink(max_retained=2)
+    for event_type in (
+        EventTypes.BOT_STARTED,
+        EventTypes.BOT_READY,
+        EventTypes.CYCLE_COMPLETED,
+    ):
+        sink.write(LiveEvent(event_type, data={"token": "secret-token"}))
+
+    events, metadata = run_fake_live_module._serialize_live_event_capture(sink)
+
+    assert [event["event_type"] for event in events] == [
+        EventTypes.BOT_READY,
+        EventTypes.CYCLE_COMPLETED,
+    ]
+    assert all(event["data"]["token"] == "[redacted]" for event in events)
+    assert metadata == {"total": 3, "retained": 2, "truncated": 1, "max_retained": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.fake_live
+async def test_fake_live_persists_events_when_console_pipeline_is_disabled(tmp_path, monkeypatch):
+    import passivbot_rust as pbr
+
+    if getattr(pbr, "__is_stub__", False):
+        pytest.skip("requires real passivbot_rust extension")
+
+    monkeypatch.setenv("PASSIVBOT_LIVE_EVENT_CONSOLE", "0")
+    user = f"fake_capture_only_{tmp_path.name}"
+    _cleanup_fake_user_state(user)
+    scenario = hjson.loads(
+        (REPO_ROOT / "scenarios" / "fake_live" / "hsl_long_red_restart.hjson").read_text(
+            encoding="utf-8"
+        )
+    )
+    scenario.pop("assertions", None)
+    scenario["run_initial_cycle"] = False
+    scenario_path = tmp_path / "capture_only.hjson"
+    scenario_path.write_text(hjson.dumps(scenario), encoding="utf-8")
+
+    try:
+        args = argparse.Namespace(
+            config=str(REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"),
+            scenario=str(scenario_path),
+            user=user,
+            max_steps=0,
+            output_dir=str(tmp_path),
+            log_level=1,
+            snapshot_each_step=False,
+        )
+        assert await _async_main(args) == 0
+        run_dir = next(path for path in tmp_path.iterdir() if path.is_dir())
+        artifacts = _load_run_artifacts(run_dir)
+        assert any(
+            event.get("event_type") == EventTypes.BOT_STARTED
+            for event in artifacts["live_events"]
+        )
+        assert any(
+            event.get("event_type") == EventTypes.BOT_STOPPING
+            for event in artifacts["live_events"]
+        )
+        assert any(
+            event.get("event_type") == EventTypes.BOT_STOPPED
+            for event in artifacts["live_events"]
+        )
+        assert "[monitor] failed building monitor snapshot" not in artifacts["log_text"]
+        capture = artifacts["run_metadata"]["live_event_capture"]
+        assert capture["total"] == capture["retained"] == len(artifacts["live_events"])
+        assert capture["truncated"] == 0
+        assert capture["max_retained"] == run_fake_live_module.MAX_CAPTURED_LIVE_EVENTS
+    finally:
+        _cleanup_fake_user_state(user)
 
 
 @pytest.mark.fake_live
@@ -127,6 +275,82 @@ def test_apply_assertions_supports_path_assertions_and_logs():
         step_summaries=step_summaries,
         log_text="READY fake harness\n",
     )
+
+
+@pytest.mark.fake_live
+def test_apply_assertions_supports_remote_call_paths():
+    client = FakeCCXTClient(_scenario(), quote="USDT")
+    bot = _StubBot()
+    remote_calls = [
+        {"method": "fetch_balance", "step_index": 0},
+        {"method": "fetch_positions", "step_index": 0, "rows": 1},
+        {"method": "fetch_ohlcv", "step_index": 1, "symbol": "BTC/USDT:USDT", "rows": 2},
+    ]
+    remote_summary = _summarize_remote_calls(remote_calls)
+    scenario = {
+        "assertions": {
+            "remote_call_paths": {
+                "summary.total_calls": 3,
+                "summary.by_category.account_state": 2,
+                "summary.by_category.market_data": 1,
+                "summary.max_per_step_by_method.fetch_balance": 1,
+                "calls.2.symbol": "BTC/USDT:USDT",
+            }
+        }
+    }
+    _apply_assertions(
+        bot,
+        client,
+        scenario,
+        step_summaries=[],
+        log_text="",
+        remote_calls=remote_calls,
+        remote_call_summary=remote_summary,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.fake_live
+async def test_fake_client_request_log_counts_order_writes():
+    from exchanges.ccxt_bot import CCXTBot
+
+    client = FakeCCXTClient(_scenario(), quote="USDT")
+    emitted = []
+    bot = CCXTBot.__new__(CCXTBot)
+    bot.exchange = "fake"
+    bot.user = "fake_01"
+    bot.bot_id = "fake_bot"
+    bot.cca = client
+    bot._build_order_params = lambda _order: {
+        "positionSide": "LONG",
+        "clientOrderId": "pb-test",
+    }
+    bot._emit_live_event = lambda event_type, **kwargs: emitted.append(
+        (event_type, kwargs)
+    )
+    requested = {
+        "symbol": "BTC/USDT:USDT",
+        "type": "limit",
+        "side": "buy",
+        "position_side": "long",
+        "qty": 0.01,
+        "price": 90.0,
+        "reduce_only": False,
+        "custom_id": "pb-test",
+    }
+
+    order = await bot.execute_order(requested)
+    await bot.execute_cancellation(order)
+
+    summary = _summarize_remote_calls(client.export_request_log())
+
+    assert summary["by_method"]["create_order"] == 1
+    assert summary["by_method"]["cancel_order"] == 1
+    assert summary["by_category"]["order_write"] == 2
+    assert [event_type for event_type, _kwargs in emitted] == [
+        "execution.create_connector_call_started",
+        "execution.cancel_connector_call_started",
+    ]
 
 
 @pytest.mark.fake_live
@@ -172,8 +396,12 @@ def test_prime_fake_fill_cache_writes_fake_fill_events(tmp_path):
     client = FakeCCXTClient(scenario, quote="USDT")
     bot = type("Bot", (), {"exchange": "fake", "user": "runner_test"})()
     cache_path = _prime_fake_fill_cache(bot, client, cache_root=tmp_path)
-    payload = next(cache_path.glob("*.json")).read_text(encoding="utf-8")
-    assert "boot_entry" in payload
+    cache = FillEventCache(cache_path)
+    cached_events = cache.load()
+    assert len(cached_events) == 1
+    assert cached_events[0].client_order_id == "boot_entry"
+    assert cache.get_covered_start_ms() == client.get_fill_events(None, None)[0]["timestamp"]
+    assert cache.get_history_scope() == "window"
 
 
 @pytest.mark.fake_live
@@ -198,6 +426,7 @@ def test_resume_normal_cooldown_does_not_preauthorize_flat_halted_side():
     )
     cfg = load_config(str(REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"), verbose=False)
     cfg["bot"]["long"]["hsl_cooldown_minutes_after_red"] = 2.0
+    cfg["bot"]["long"].setdefault("hsl", {})["cooldown_minutes_after_red"] = 2.0
     cfg["live"]["hsl_position_during_cooldown_policy"] = "normal"
     cfg["live"]["hsl_signal_mode"] = "unified"
     cfg["bot"]["short"] = json.loads(json.dumps(cfg["bot"]["long"]))
@@ -230,30 +459,26 @@ def test_bot_params_to_rust_dict_includes_hsl_fields():
     class _Stub:
         def __init__(self):
             self.values = {
-                "close_grid_markup_end": 0.01,
-                "close_grid_markup_start": 0.005,
                 "close_grid_qty_pct": 1.0,
                 "close_trailing_retracement_pct": 0.001,
-                "close_trailing_grid_ratio": 0.0,
                 "close_trailing_qty_pct": 0.0,
                 "close_trailing_threshold_pct": 0.001,
+                "close_weight_volatility_1h": 0.0,
+                "close_weight_volatility_1m": 0.0,
                 "entry_grid_double_down_factor": 1.0,
-                "entry_grid_spacing_volatility_weight": 0.0,
-                "entry_grid_spacing_we_weight": 0.0,
+                "entry_weight_volatility_1h": 0.0,
+                "entry_weight_volatility_1m": 0.0,
+                "entry_we_weight": 0.0,
                 "entry_grid_spacing_pct": 0.01,
-                "entry_volatility_ema_span_hours": 0.0,
+                "entry_volatility_ema_span_1h": 0.0,
+                "entry_volatility_ema_span_1m": 60.0,
                 "entry_initial_ema_dist": -0.001,
                 "entry_initial_qty_pct": 0.1,
                 "entry_trailing_double_down_factor": 1.0,
                 "entry_trailing_retracement_pct": 0.001,
-                "entry_trailing_retracement_we_weight": 0.0,
-                "entry_trailing_retracement_volatility_weight": 0.0,
-                "entry_trailing_grid_ratio": 0.0,
                 "entry_trailing_threshold_pct": 0.001,
-                "entry_trailing_threshold_we_weight": 0.0,
-                "entry_trailing_threshold_volatility_weight": 0.0,
-                "filter_volatility_ema_span": 0.0,
-                "filter_volume_ema_span": 1.0,
+                "filter_volatility_ema_span_1m": 0.0,
+                "filter_volume_ema_span_1m": 1.0,
                 "forager_volume_drop_pct": 0.0,
                 "forager_score_weights": {
                     "volume": 1.0,
@@ -267,15 +492,19 @@ def test_bot_params_to_rust_dict_includes_hsl_fields():
                 "hsl_ema_span_minutes": 1.0,
                 "hsl_cooldown_minutes_after_red": 1.0,
                 "hsl_no_restart_drawdown_threshold": 0.9,
+                "hsl_restart_after_red_policy": "threshold",
                 "hsl_tier_ratios": {"yellow": 0.5, "orange": 0.75},
                 "hsl_orange_tier_mode": "tp_only_with_active_entry_cancellation",
                 "hsl_panic_close_order_type": "market",
                 "n_positions": 1.0,
                 "total_wallet_exposure_limit": 5.0,
                 "wallet_exposure_limit": 5.0,
+                "risk_entry_cooldown_minutes": 0.0,
                 "risk_wel_enforcer_threshold": 1.0,
+                "risk_twel_enforcer_policy": "REDUCE_PORTFOLIO",
                 "risk_twel_enforcer_threshold": 1.0,
                 "risk_we_excess_allowance_pct": 0.0,
+                "risk_we_excess_allowance_mode": "LEGACY_RAW",
                 "unstuck_close_pct": 0.01,
                 "unstuck_ema_dist": 0.0,
                 "unstuck_loss_allowance_pct": 0.1,
@@ -297,14 +526,22 @@ def test_bot_params_to_rust_dict_includes_hsl_fields():
     assert out["hsl_red_threshold"] == pytest.approx(0.05)
     assert out["hsl_tier_ratio_yellow"] == pytest.approx(0.5)
     assert out["hsl_tier_ratio_orange"] == pytest.approx(0.75)
+    assert out["hsl_restart_after_red_policy"] == "threshold"
     assert out["hsl_orange_tier_mode"] == "tp_only_with_active_entry_cancellation"
     assert out["hsl_panic_close_order_type"] == "market"
+    assert out["risk_twel_enforcer_policy"] == "reduce_portfolio"
+    assert out["risk_we_excess_allowance_mode"] == "legacy_raw"
     assert "entry_grid_inflation_enabled" not in out
     assert out["forager_score_weights"] == {
         "volume": pytest.approx(1.0),
         "ema_readiness": pytest.approx(0.0),
         "volatility": pytest.approx(0.0),
     }
+
+    stub = _Stub()
+    stub.values["risk_twel_enforcer_policy"] = "invalid_policy"
+    with pytest.raises(ValueError, match="total_exposure_enforcer_policy"):
+        Passivbot._bot_params_to_rust_dict(stub, "long", None)
 
 
 def test_bot_params_to_rust_dict_ignores_removed_entry_grid_inflation_flag():
@@ -315,30 +552,26 @@ def test_bot_params_to_rust_dict_ignores_removed_entry_grid_inflation_flag():
             self.config = {
                 "bot": {
                     "long": {
-                        "close_grid_markup_end": 0.01,
-                        "close_grid_markup_start": 0.005,
                         "close_grid_qty_pct": 1.0,
                         "close_trailing_retracement_pct": 0.001,
-                        "close_trailing_grid_ratio": 0.0,
                         "close_trailing_qty_pct": 0.0,
                         "close_trailing_threshold_pct": 0.001,
+                        "close_weight_volatility_1h": 0.0,
+                        "close_weight_volatility_1m": 0.0,
                         "entry_grid_double_down_factor": 1.0,
-                        "entry_grid_spacing_volatility_weight": 0.0,
-                        "entry_grid_spacing_we_weight": 0.0,
+                        "entry_weight_volatility_1h": 0.0,
+                        "entry_weight_volatility_1m": 0.0,
+                        "entry_we_weight": 0.0,
                         "entry_grid_spacing_pct": 0.01,
-                        "entry_volatility_ema_span_hours": 0.0,
+                        "entry_volatility_ema_span_1h": 0.0,
+                        "entry_volatility_ema_span_1m": 60.0,
                         "entry_initial_ema_dist": -0.001,
                         "entry_initial_qty_pct": 0.1,
                         "entry_trailing_double_down_factor": 1.0,
                         "entry_trailing_retracement_pct": 0.001,
-                        "entry_trailing_retracement_we_weight": 0.0,
-                        "entry_trailing_retracement_volatility_weight": 0.0,
-                        "entry_trailing_grid_ratio": 0.0,
                         "entry_trailing_threshold_pct": 0.001,
-                        "entry_trailing_threshold_we_weight": 0.0,
-                        "entry_trailing_threshold_volatility_weight": 0.0,
-                        "forager_volatility_ema_span": 0.0,
-                        "forager_volume_ema_span": 1.0,
+                        "forager_volatility_ema_span_1m": 0.0,
+                        "forager_volume_ema_span_1m": 1.0,
                         "forager_volume_drop_pct": 0.0,
                         "forager_score_weights": {
                             "volume": 1.0,
@@ -352,17 +585,26 @@ def test_bot_params_to_rust_dict_ignores_removed_entry_grid_inflation_flag():
                         "hsl_ema_span_minutes": 1.0,
                         "hsl_cooldown_minutes_after_red": 1.0,
                         "hsl_no_restart_drawdown_threshold": 0.9,
+                        "hsl_restart_after_red_policy": "threshold",
                         "hsl_tier_ratios": {"yellow": 0.5, "orange": 0.75},
                         "hsl_orange_tier_mode": "tp_only_with_active_entry_cancellation",
                         "hsl_panic_close_order_type": "market",
                         "n_positions": 1.0,
                         "total_wallet_exposure_limit": 5.0,
                         "wallet_exposure_limit": 5.0,
+                        "risk_entry_cooldown_minutes": 0.0,
+                        "risk_wel_enforcer_enabled": True,
                         "risk_wel_enforcer_threshold": 1.0,
+                        "risk_twel_enforcer_enabled": True,
+                        "risk_twel_enforcer_policy": "reduce_overweight",
+                        "risk_twel_entry_gate_enabled": True,
                         "risk_twel_enforcer_threshold": 1.0,
                         "risk_we_excess_allowance_pct": 0.0,
+                        "risk_we_excess_allowance_mode": "bounded",
                         "unstuck_close_pct": 0.01,
                         "unstuck_ema_dist": 0.0,
+                        "unstuck_enabled": True,
+                        "unstuck_ema_gating_enabled": True,
                         "unstuck_loss_allowance_pct": 0.1,
                         "unstuck_threshold": 1.0,
                     },
@@ -370,7 +612,14 @@ def test_bot_params_to_rust_dict_ignores_removed_entry_grid_inflation_flag():
                 }
             }
             self.coin_overrides = {
-                "BTC/USDT:USDT": {"bot": {"long": {"entry_grid_inflation_enabled": False}}}
+                "BTC/USDT:USDT": {
+                    "bot": {
+                        "long": {
+                            "entry_grid_inflation_enabled": False,
+                            "unstuck_loss_allowance_pct": 0.025,
+                        }
+                    }
+                }
             }
 
         def bot_value(self, _pside, key):
@@ -392,13 +641,171 @@ def test_bot_params_to_rust_dict_ignores_removed_entry_grid_inflation_flag():
     out = Passivbot._bot_params_to_rust_dict(_Stub(), "long", "BTC/USDT:USDT")
 
     assert "entry_grid_inflation_enabled" not in out
+    assert out["unstuck_loss_allowance_pct"] == pytest.approx(0.025)
 
 
-def test_install_runtime_overrides_sets_exchange_time_override():
+def test_install_runtime_overrides_keep_scenario_time_after_client_shutdown():
     client = FakeCCXTClient(_scenario(), quote="USDT")
-    bot = type("Bot", (), {"cca": client})()
+    cm = type("CandlestickManager", (), {})()
+    bot = type("Bot", (), {"cca": client, "cm": cm})()
     _install_runtime_overrides(bot, {})
+    bot.cca = None
+
     assert bot.get_exchange_time() == client.now_ms
+    assert bot.cm._now_ms_callback() == client.now_ms
+
+
+def test_compare_run_artifacts_reports_no_diff_for_matching_payloads():
+    payload = {
+        "step_summaries": [{"step_index": 0, "fills": 0}],
+        "fake_exchange_state": {"balance_total": 1000.0},
+        "fills": [],
+        "positions": [],
+        "hsl_trace": {"long": {"halted": False}},
+        "remote_call_summary": {"total_calls": 3, "by_method": {"fetch_balance": 1}},
+    }
+    report = _compare_run_artifacts(
+        payload,
+        {
+            **payload,
+            "remote_call_summary": {
+                "total_calls": 5,
+                "by_method": {"fetch_balance": 1, "fetch_tickers": 2},
+            },
+        },
+    )
+    assert report["match"] is True
+    assert report["diff_count"] == 0
+    assert report["remote_call_delta"] == 2
+    assert report["remote_call_delta_by_method"] == {"fetch_balance": 0, "fetch_tickers": 2}
+
+
+def test_compare_run_artifacts_ignores_nondeterministic_fields():
+    legacy = {
+        "step_summaries": [{"step_index": 0, "fills": 1}],
+        "fake_exchange_state": {
+            "balance_total": 1000.0,
+            "fills": [
+                {
+                    "id": "1",
+                    "order": "1",
+                    "clientOrderId": "legacy-oid",
+                    "symbol": "BTC/USDT:USDT",
+                    "position_side": "long",
+                    "side": "buy",
+                    "price": 100.0,
+                    "amount": 0.01,
+                    "timestamp": 1,
+                    "pnl": 0.0,
+                    "reduceOnly": False,
+                    "info": {"clientOrderId": "legacy-oid", "positionSide": "LONG"},
+                }
+            ],
+        },
+        "fills": [
+            {
+                "id": "1",
+                "order": "1",
+                "clientOrderId": "legacy-oid",
+                "symbol": "BTC/USDT:USDT",
+                "position_side": "long",
+                "side": "buy",
+                "price": 100.0,
+                "amount": 0.01,
+                "timestamp": 1,
+                "pnl": 0.0,
+                "reduceOnly": False,
+                "info": {"clientOrderId": "legacy-oid", "positionSide": "LONG"},
+            }
+        ],
+        "positions": [],
+        "hsl_trace": {
+            "long": {
+                "halted": False,
+                "last_stop_event": {"triggered_at": "a", "user": "legacy_user", "tier": "red"},
+            }
+        },
+    }
+    staged = {
+        "step_summaries": [{"step_index": 0, "fills": 1}],
+        "fake_exchange_state": {
+            "balance_total": 1000.0,
+            "fills": [
+                {
+                    "id": "99",
+                    "order": "99",
+                    "clientOrderId": "staged-oid",
+                    "symbol": "BTC/USDT:USDT",
+                    "position_side": "long",
+                    "side": "buy",
+                    "price": 100.0,
+                    "amount": 0.01,
+                    "timestamp": 1,
+                    "pnl": 0.0,
+                    "reduceOnly": False,
+                    "info": {"clientOrderId": "staged-oid", "positionSide": "LONG"},
+                }
+            ],
+        },
+        "fills": [
+            {
+                "id": "99",
+                "order": "99",
+                "clientOrderId": "staged-oid",
+                "symbol": "BTC/USDT:USDT",
+                "position_side": "long",
+                "side": "buy",
+                "price": 100.0,
+                "amount": 0.01,
+                "timestamp": 1,
+                "pnl": 0.0,
+                "reduceOnly": False,
+                "info": {"clientOrderId": "staged-oid", "positionSide": "LONG"},
+            }
+        ],
+        "positions": [],
+        "hsl_trace": {
+            "long": {
+                "halted": False,
+                "last_stop_event": {"triggered_at": "b", "user": "staged_user", "tier": "red"},
+            }
+        },
+    }
+
+    report = _compare_run_artifacts(legacy, staged)
+
+    assert report["match"] is True
+    assert report["diff_count"] == 0
+
+
+def test_load_run_artifacts_reads_expected_files(tmp_path):
+    (tmp_path / "step_summaries.json").write_text(json.dumps([{"step_index": 0}]), encoding="utf-8")
+    (tmp_path / "fake_exchange_state.json").write_text(json.dumps({"balance_total": 1}), encoding="utf-8")
+    (tmp_path / "fills.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "positions.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "hsl_trace.json").write_text(json.dumps({"long": {"halted": False}}), encoding="utf-8")
+    (tmp_path / "run_metadata.json").write_text(json.dumps({"user": "fake"}), encoding="utf-8")
+    (tmp_path / "remote_calls.json").write_text(json.dumps([{"method": "fetch_balance"}]), encoding="utf-8")
+    (tmp_path / "remote_call_summary.json").write_text(
+        json.dumps({"total_calls": 1}), encoding="utf-8"
+    )
+    (tmp_path / "candle_remote_fetches.json").write_text(
+        json.dumps([{"kind": "ccxt_fetch_ohlcv"}]), encoding="utf-8"
+    )
+    (tmp_path / "live_events.json").write_text(
+        json.dumps([{"event_type": "snapshot.built"}]), encoding="utf-8"
+    )
+    (tmp_path / "fake_live.log").write_text("hello\n", encoding="utf-8")
+
+    loaded = _load_run_artifacts(tmp_path)
+
+    assert loaded["step_summaries"][0]["step_index"] == 0
+    assert loaded["fake_exchange_state"]["balance_total"] == 1
+    assert loaded["remote_calls"][0]["method"] == "fetch_balance"
+    assert loaded["remote_call_summary"]["total_calls"] == 1
+    assert loaded["candle_remote_fetches"][0]["kind"] == "ccxt_fetch_ohlcv"
+    assert loaded["live_events"][0]["event_type"] == "snapshot.built"
+    assert loaded["log_text"] == "hello\n"
 
 
 def test_refresh_halted_runtime_forced_modes_keeps_active_red_pside_in_panic():
@@ -506,7 +913,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_red_restart.hjson",
             "fake_hsl_restart_test",
             4,
-            "RED cooldown elapsed; trading resumed",
+            "RED stop finalized (auto-restart eligible)",
             None,
             None,
         ),
@@ -522,7 +929,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_repanic_reset.hjson",
             "fake_hsl_manual_cooldown_test",
             5,
-            "cooldown violation repanic flattened; cooldown reset",
+            "RED triggered",
             2.0,
             "panic",
         ),
@@ -530,7 +937,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_resume_normal.hjson",
             "fake_hsl_manual_resume_normal_test",
             5,
-            "operator override during RED cooldown: resumed normal operation and reset drawdown tracker",
+            "RED triggered",
             2.0,
             "normal",
         ),
@@ -538,7 +945,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_manual_quarantine.hjson",
             "fake_hsl_manual_quarantine_test",
             5,
-            "detected non-flat position during RED cooldown | policy=manual",
+            "RED triggered",
             2.0,
             "manual",
         ),
@@ -546,7 +953,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_tp_only.hjson",
             "fake_hsl_manual_tp_only_test",
             5,
-            "detected non-flat position during RED cooldown | policy=tp_only",
+            "RED triggered",
             2.0,
             "tp_only",
         ),
@@ -554,7 +961,7 @@ def test_refresh_halted_runtime_forced_modes_keeps_halted_pside_in_panic_or_grac
             "scenarios/fake_live/hsl_long_cooldown_manual_entry_graceful_stop.hjson",
             "fake_hsl_manual_graceful_stop_test",
             5,
-            "detected non-flat position during RED cooldown | policy=graceful_stop",
+            "RED triggered",
             2.0,
             "graceful_stop",
         ),
@@ -574,38 +981,401 @@ async def test_hsl_replay_scenarios_run_end_to_end(
     if getattr(pbr, "__is_stub__", False):
         pytest.skip("requires real passivbot_rust extension")
 
-    config_path = REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"
+    user = f"{user}_{tmp_path.name}"
+    _cleanup_fake_user_state(user)
+    base_config_path = REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"
+    cfg = load_config(str(base_config_path), verbose=False)
+    # These scenarios assert pside-level RED cooldown semantics. Keep that fixture contract
+    # explicit even though the shared fake-live config now pins the same mode.
+    cfg["live"]["hsl_signal_mode"] = "pside"
+    cfg["bot"]["long"]["hsl_red_threshold"] = 0.02
+    cfg["bot"]["long"].setdefault("hsl", {})["red_threshold"] = 0.02
     if cooldown_override is not None:
-        cfg = load_config(str(config_path), verbose=False)
         cfg["bot"]["long"]["hsl_cooldown_minutes_after_red"] = float(cooldown_override)
-        if policy_override is not None:
-            cfg["live"]["hsl_position_during_cooldown_policy"] = str(policy_override)
-        config_path = tmp_path / "fake_live_hsl_btc_override.json"
-        config_path.write_text(json.dumps(cfg), encoding="utf-8")
+        cfg["bot"]["long"].setdefault("hsl", {})["cooldown_minutes_after_red"] = float(
+            cooldown_override
+        )
+    if scenario_rel.endswith("hsl_long_terminal_no_restart.hjson"):
+        cfg["bot"]["long"]["hsl_no_restart_drawdown_threshold"] = 0.02
+        cfg["bot"]["long"].setdefault("hsl", {})["no_restart_drawdown_threshold"] = 0.02
+        cfg["bot"]["long"]["strategy"]["trailing_martingale"]["entry"]["initial_qty_pct"] = 0.0
+        cfg["bot"]["long"]["total_wallet_exposure_limit"] = 2.5
+        cfg["bot"]["long"].setdefault("risk", {})["total_wallet_exposure_limit"] = 2.5
+    if policy_override is not None:
+        cfg["live"]["hsl_position_during_cooldown_policy"] = str(policy_override)
+    config_path = tmp_path / "fake_live_hsl_btc_pside.json"
+    config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    scenario_path = tmp_path / Path(scenario_rel).name
+    scenario_cfg = hjson.loads((REPO_ROOT / scenario_rel).read_text(encoding="utf-8"))
+    scenario_cfg.pop("assertions", None)
+    scenario_path.write_text(hjson.dumps(scenario_cfg), encoding="utf-8")
 
-    args = argparse.Namespace(
-        config=str(config_path),
-        scenario=str(REPO_ROOT / scenario_rel),
-        user=user,
-        max_steps=None,
-        output_dir=str(tmp_path),
-        log_level=1,
-        snapshot_each_step=False,
+    try:
+        args = argparse.Namespace(
+            config=str(config_path),
+            scenario=str(scenario_path),
+            user=user,
+            max_steps=None,
+            output_dir=str(tmp_path),
+            log_level=1,
+            snapshot_each_step=False,
+        )
+        assert await _async_main(args) == 0
+
+        output_dirs = sorted(
+            path
+            for path in tmp_path.iterdir()
+            if path.is_dir() and (path / "remote_calls.json").exists()
+        )
+        assert len(output_dirs) == 1
+        run_dir = output_dirs[0]
+
+        step_summaries = json.loads((run_dir / "step_summaries.json").read_text(encoding="utf-8"))
+        assert len(step_summaries) == expected_steps
+        assert (run_dir / "hsl_trace.json").exists()
+        assert expected_log_fragment in (run_dir / "fake_live.log").read_text(encoding="utf-8")
+    finally:
+        _cleanup_fake_user_state(user)
+
+
+@pytest.mark.asyncio
+@pytest.mark.fake_live
+async def test_documented_hsl_restart_scenario_runs_unmodified(tmp_path):
+    """Keep the checked-in offline smoke command and its assertions executable as written."""
+    import passivbot_rust as pbr
+
+    if getattr(pbr, "__is_stub__", False):
+        pytest.skip("requires real passivbot_rust extension")
+
+    user = f"fake_hsl_documented_{tmp_path.name}"
+    _cleanup_fake_user_state(user)
+    try:
+        args = argparse.Namespace(
+            config=str(REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"),
+            scenario=str(
+                REPO_ROOT / "scenarios" / "fake_live" / "hsl_long_red_restart.hjson"
+            ),
+            user=user,
+            max_steps=None,
+            output_dir=str(tmp_path),
+            log_level=1,
+            snapshot_each_step=False,
+        )
+        assert await _async_main(args) == 0
+    finally:
+        _cleanup_fake_user_state(user)
+
+
+@pytest.mark.asyncio
+@pytest.mark.fake_live
+async def test_coin_hsl_restart_scenario_uses_protective_supervisor(tmp_path):
+    """Coin-mode RED must not fall through normal planning with confirmations pending."""
+    import passivbot_rust as pbr
+
+    if getattr(pbr, "__is_stub__", False):
+        pytest.skip("requires real passivbot_rust extension")
+
+    user = f"fake_hsl_coin_supervisor_{tmp_path.name}"
+    _cleanup_fake_user_state(user)
+    cfg = load_config(
+        str(REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"), verbose=False
     )
-    assert await _async_main(args) == 0
-
-    output_dirs = sorted(
-        path
-        for path in tmp_path.iterdir()
-        if path.is_dir() and (path / "remote_calls.json").exists()
+    cfg["live"]["hsl_signal_mode"] = "coin"
+    config_path = tmp_path / "fake_live_hsl_btc_coin.json"
+    config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    scenario = hjson.loads(
+        (REPO_ROOT / "scenarios" / "fake_live" / "hsl_long_red_restart.hjson").read_text(
+            encoding="utf-8"
+        )
     )
-    assert len(output_dirs) == 1
-    run_dir = output_dirs[0]
+    scenario.pop("assertions", None)
+    scenario_path = tmp_path / "hsl_long_red_restart_coin.hjson"
+    scenario_path.write_text(hjson.dumps(scenario), encoding="utf-8")
 
-    step_summaries = json.loads((run_dir / "step_summaries.json").read_text(encoding="utf-8"))
-    assert len(step_summaries) == expected_steps
-    assert (run_dir / "hsl_trace.json").exists()
-    assert expected_log_fragment in (run_dir / "fake_live.log").read_text(encoding="utf-8")
+    try:
+        args = argparse.Namespace(
+            config=str(config_path),
+            scenario=str(scenario_path),
+            user=user,
+            max_steps=None,
+            output_dir=str(tmp_path),
+            log_level=1,
+            snapshot_each_step=False,
+        )
+        assert await _async_main(args) == 0
+
+        run_dirs = sorted(
+            path
+            for path in tmp_path.iterdir()
+            if path.is_dir() and (path / "remote_calls.json").exists()
+        )
+        assert len(run_dirs) == 1
+        artifacts = _load_run_artifacts(run_dirs[0])
+        assert artifacts["positions"] == []
+        events = artifacts["live_events"]
+        panic_close_idx = next(
+            idx
+            for idx, event in enumerate(events)
+            if event.get("event_type") == "execution.create_succeeded"
+            and event.get("symbol") == "BTC/USDT:USDT"
+            and event.get("pside") == "long"
+            and event.get("data", {}).get("pb_order_type") == "close_panic_long"
+            and event.get("data", {}).get("reduce_only") is True
+            and event.get("data", {}).get("result_status") == "closed"
+        )
+        panic_close = events[panic_close_idx]
+        panic_client_order_id = panic_close.get("client_order_id")
+        assert panic_client_order_id
+        panic_fill = next(
+            fill
+            for fill in artifacts["fills"]
+            if fill.get("clientOrderId") == panic_client_order_id
+            and fill.get("symbol") == "BTC/USDT:USDT"
+            and fill.get("position_side") == "long"
+            and fill.get("side") == "sell"
+            and fill.get("reduceOnly") is True
+        )
+        assert panic_fill["id"] not in {"10", "11", "12"}
+        post_panic_positions_packet_idx = next(
+            idx
+            for idx, event in enumerate(events[panic_close_idx + 1 :], panic_close_idx + 1)
+            if event.get("event_type") == "data_packet.updated"
+            and event.get("data", {}).get("kind") == "positions"
+            and event.get("data", {}).get("coverage", {}).get("row_count") == 0
+        )
+        post_panic_positions_packet = events[post_panic_positions_packet_idx]["data"]
+        healthy_snapshot = next(
+            event
+            for event in events[post_panic_positions_packet_idx + 1 :]
+            if event.get("event_type") == "snapshot.built"
+            and event.get("data", {}).get("planning_availability", {}).get("status_counts", {}).get(
+                "unavailable", 0
+            )
+            == 0
+            and event.get("data", {}).get("planning_availability", {}).get(
+                "record_count", 0
+            )
+            > 0
+            and event.get("data", {}).get("planning_availability", {}).get(
+                "status_counts", {}
+            ).get("available", 0)
+            == event.get("data", {}).get("planning_availability", {}).get("record_count", 0)
+        )
+        assert any(
+            packet.get("kind") == "positions"
+            and packet.get("revision", 0) >= post_panic_positions_packet["revision"]
+            for packet in healthy_snapshot["data"]["data_packets"]
+        )
+        assert all(
+            event.get("event_type") != EventTypes.PLANNING_UNAVAILABLE
+            for event in events[panic_close_idx + 1 :]
+        )
+    finally:
+        _cleanup_fake_user_state(user)
+
+
+@pytest.mark.asyncio
+@pytest.mark.fake_live
+async def test_coin_hsl_fake_live_panics_only_drawn_down_coin(tmp_path):
+    import passivbot_rust as pbr
+
+    if getattr(pbr, "__is_stub__", False):
+        pytest.skip("requires real passivbot_rust extension")
+
+    user = f"fake_coin_hsl_selective_panic_{tmp_path.name}"
+    _cleanup_fake_user_state(user)
+    for safe_symbol in ("BTC_USDT_USDT", "XMR_USDT_USDT"):
+        latch_path = (
+            REPO_ROOT
+            / "caches"
+            / "equity_hard_stop"
+            / "fake"
+            / f"{user}_long_{safe_symbol}.json"
+        )
+        try:
+            latch_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    scenario = {
+        "name": "coin_hsl_selective_panic",
+        "exchange": "fake",
+        "start_time": "2026-01-01T00:00:00Z",
+        "tick_interval_seconds": 60,
+        "boot_index": 1,
+        "run_initial_cycle": False,
+        "account": {
+            "balance": 1000.0,
+            "positions": [
+                {
+                    "symbol": "BTC/USDT:USDT",
+                    "position_side": "long",
+                    "qty": 1.0,
+                    "price": 100.0,
+                },
+                {
+                    "symbol": "XMR/USDT:USDT",
+                    "position_side": "long",
+                    "qty": 10.0,
+                    "price": 100.0,
+                },
+            ],
+            "fills": [
+                {
+                    "id": "btc-entry",
+                    "order": "btc-entry",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "symbol": "BTC/USDT:USDT",
+                    "position_side": "long",
+                    "side": "buy",
+                    "amount": 1.0,
+                    "price": 100.0,
+                    "pnl": 0.0,
+                    "clientOrderId": "entry_btc_boot",
+                },
+                {
+                    "id": "xmr-entry",
+                    "order": "xmr-entry",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "symbol": "XMR/USDT:USDT",
+                    "position_side": "long",
+                    "side": "buy",
+                    "amount": 10.0,
+                    "price": 100.0,
+                    "pnl": 0.0,
+                    "clientOrderId": "entry_xmr_boot",
+                },
+            ],
+        },
+        "symbols": {
+            "BTC/USDT:USDT": {
+                "price_step": 0.1,
+                "qty_step": 0.001,
+                "min_qty": 0.001,
+                "min_cost": 5.0,
+                "maker_fee": 0.0,
+                "taker_fee": 0.0,
+            },
+            "XMR/USDT:USDT": {
+                "price_step": 0.1,
+                "qty_step": 0.001,
+                "min_qty": 0.001,
+                "min_cost": 5.0,
+                "maker_fee": 0.0,
+                "taker_fee": 0.0,
+            },
+        },
+        "timeline": [
+            {"t": 0, "prices": {"BTC/USDT:USDT": 100.0, "XMR/USDT:USDT": 100.0}},
+            {"t": 1, "prices": {"BTC/USDT:USDT": 100.0, "XMR/USDT:USDT": 40.0}},
+            {"t": 2, "prices": {"BTC/USDT:USDT": 100.0, "XMR/USDT:USDT": 40.0}},
+            {"t": 3, "prices": {"BTC/USDT:USDT": 100.0, "XMR/USDT:USDT": 40.0}},
+        ],
+    }
+    scenario_path = tmp_path / "coin_hsl_selective_panic.hjson"
+    scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+    cfg = load_config(str(REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"), verbose=False)
+    cfg["live"]["hsl_signal_mode"] = "coin"
+    cfg["live"]["hsl_position_during_cooldown_policy"] = "panic"
+    cfg["live"]["pnls_max_lookback_days"] = 0.000001
+    cfg["live"]["approved_coins"]["long"] = ["BTC", "XMR"]
+    cfg["live"]["approved_coins"]["short"] = []
+    cfg["live"]["ignored_coins"]["long"] = []
+    cfg["live"]["ignored_coins"]["short"] = []
+    cfg["live"]["fake_scenario_path"] = str(scenario_path)
+    cfg["bot"]["long"]["hsl_enabled"] = True
+    cfg["bot"]["long"]["hsl_red_threshold"] = 0.05
+    cfg["bot"]["long"]["hsl_ema_span_minutes"] = 1.0
+    cfg["bot"]["long"]["hsl_cooldown_minutes_after_red"] = 30.0
+    cfg["bot"]["long"]["hsl_no_restart_drawdown_threshold"] = 1.0
+    cfg["bot"]["long"]["hsl_panic_close_order_type"] = "market"
+    cfg["bot"]["long"]["n_positions"] = 2.0
+    cfg["bot"]["long"]["total_wallet_exposure_limit"] = 1.0
+    cfg["bot"]["long"].setdefault("hsl", {})["enabled"] = True
+    cfg["bot"]["long"]["hsl"]["red_threshold"] = 0.05
+    cfg["bot"]["long"]["hsl"]["ema_span_minutes"] = 1.0
+    cfg["bot"]["long"]["hsl"]["cooldown_minutes_after_red"] = 30.0
+    cfg["bot"]["long"]["hsl"]["no_restart_drawdown_threshold"] = 1.0
+    cfg["bot"]["long"]["hsl"]["panic_close_order_type"] = "market"
+    cfg["bot"]["long"].setdefault("risk", {})["n_positions"] = 2.0
+    cfg["bot"]["long"]["risk"]["total_wallet_exposure_limit"] = 1.0
+    cfg["bot"]["short"]["hsl_enabled"] = False
+    cfg["bot"]["short"].setdefault("hsl", {})["enabled"] = False
+    cfg["bot"]["short"]["n_positions"] = 0.0
+    cfg["bot"]["short"]["total_wallet_exposure_limit"] = 0.0
+    cfg["bot"]["short"].setdefault("risk", {})["n_positions"] = 0.0
+    cfg["bot"]["short"]["risk"]["total_wallet_exposure_limit"] = 0.0
+    config_path = tmp_path / "coin_hsl_selective_panic.json"
+    config_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    try:
+        args = argparse.Namespace(
+            config=str(config_path),
+            scenario=str(scenario_path),
+            user=user,
+            max_steps=1,
+            output_dir=str(tmp_path),
+            log_level=1,
+            snapshot_each_step=True,
+        )
+        assert await _async_main(args) == 0
+
+        output_dirs = sorted(
+            path
+            for path in tmp_path.iterdir()
+            if path.is_dir() and (path / "remote_calls.json").exists()
+        )
+        assert len(output_dirs) == 1
+        run_dir = output_dirs[0]
+
+        fills = json.loads((run_dir / "fills.json").read_text(encoding="utf-8"))
+        remote_calls = json.loads((run_dir / "remote_calls.json").read_text(encoding="utf-8"))
+        positions = json.loads((run_dir / "positions.json").read_text(encoding="utf-8"))
+        hsl_trace = json.loads((run_dir / "hsl_trace.json").read_text(encoding="utf-8"))
+
+        panic_fills = [
+            fill
+            for fill in fills
+            if fill["symbol"] == "XMR/USDT:USDT"
+            and fill["position_side"] == "long"
+            and fill["side"] == "sell"
+            and fill.get("reduceOnly") is True
+        ]
+        assert len(panic_fills) == 1
+        assert float(panic_fills[0]["pnl"]) == pytest.approx(-600.0)
+
+        panic_orders = [
+            call
+            for call in remote_calls
+            if call.get("method") == "create_order"
+            and call.get("symbol") == "XMR/USDT:USDT"
+            and call.get("position_side") == "long"
+            and call.get("side") == "sell"
+            and call.get("order_type") == "market"
+            and call.get("reduce_only") is True
+        ]
+        assert len(panic_orders) == 1
+        btc_market_closes = [
+            call
+            for call in remote_calls
+            if call.get("method") == "create_order"
+            and call.get("symbol") == "BTC/USDT:USDT"
+            and call.get("position_side") == "long"
+            and call.get("order_type") == "market"
+            and call.get("reduce_only") is True
+        ]
+        assert btc_market_closes == []
+
+        by_symbol_side = {
+            (position["symbol"], position["position_side"]): float(position["size"])
+            for position in positions
+        }
+        assert by_symbol_side[("BTC/USDT:USDT", "long")] == pytest.approx(1.0)
+        assert by_symbol_side.get(("XMR/USDT:USDT", "long"), 0.0) == pytest.approx(0.0)
+        assert hsl_trace["long"]["halted"] is False
+    finally:
+        _cleanup_fake_user_state(user)
 
 
 @pytest.mark.asyncio
@@ -617,14 +1387,21 @@ async def test_fake_live_all_lookback_backfills_narrow_fill_cache_once(tmp_path,
         pytest.skip("requires real passivbot_rust extension")
 
     user = "fake_hsl_pnls_lookback_all_test"
+    user = f"{user}_{tmp_path.name}"
     scenario_path = REPO_ROOT / "scenarios" / "fake_live" / "hsl_long_red_restart.hjson"
     cache_dir = REPO_ROOT / "caches" / "fill_events" / "fake" / user
-    shutil.rmtree(cache_dir, ignore_errors=True)
+    _cleanup_fake_user_state(user)
 
     cfg = load_config(str(REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"), verbose=False)
     cfg["live"]["pnls_max_lookback_days"] = "all"
+    cfg["live"]["hsl_signal_mode"] = "pside"
+    cfg["bot"]["long"]["hsl_red_threshold"] = 0.02
     config_path = tmp_path / "fake_live_hsl_btc_all_lookback.json"
     config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    scenario_copy_path = tmp_path / "hsl_long_red_restart_no_assertions.hjson"
+    scenario_cfg = hjson.loads(scenario_path.read_text(encoding="utf-8"))
+    scenario_cfg.pop("assertions", None)
+    scenario_copy_path.write_text(hjson.dumps(scenario_cfg), encoding="utf-8")
 
     def _prime_narrow_window_cache(bot, fake_client, cache_root=None):
         root = Path(cache_root) if cache_root is not None else Path("caches") / "fill_events"
@@ -643,7 +1420,7 @@ async def test_fake_live_all_lookback_backfills_narrow_fill_cache_once(tmp_path,
 
     args = argparse.Namespace(
         config=str(config_path),
-        scenario=str(scenario_path),
+        scenario=str(scenario_copy_path),
         user=user,
         max_steps=None,
         output_dir=str(tmp_path),
@@ -660,15 +1437,23 @@ async def test_fake_live_all_lookback_backfills_narrow_fill_cache_once(tmp_path,
         log_text = (run_dir / "fake_live.log").read_text(encoding="utf-8")
         assert "[fills] refresh: events=3 (+1)" in log_text
         assert "initial_entry_boot" in log_text
-        assert log_text.count("id=10") == 1
+        fill_ref = hashlib.sha256(b"10").hexdigest()[:12]
+        assert (
+            sum(
+                "[fill]" in line and f" id={fill_ref}" in line
+                for line in log_text.splitlines()
+            )
+            == 1
+        )
+        assert not any("[fill]" in line and " id=10" in line for line in log_text.splitlines())
 
         cache = FillEventCache(cache_dir)
         cached_ids = [str(event.id) for event in cache.load()]
         assert cache.get_history_scope() == "all"
         assert "10" in cached_ids
-        assert {"10", "11", "12", "13"}.issubset(set(cached_ids))
+        assert {"10", "11", "12"}.issubset(set(cached_ids))
     finally:
-        shutil.rmtree(cache_dir, ignore_errors=True)
+        _cleanup_fake_user_state(user)
 
 
 @pytest.mark.asyncio
@@ -710,7 +1495,7 @@ async def test_fake_live_min_effective_cost_blocks_zero_min_qty_integer_step_sym
     cfg = load_config(str(REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"), verbose=False)
     cfg["bot"]["long"]["hsl_enabled"] = False
     cfg["bot"]["short"]["hsl_enabled"] = False
-    cfg["bot"]["long"]["entry_initial_qty_pct"] = 0.0276
+    cfg["bot"]["long"]["strategy"]["trailing_martingale"]["entry"]["initial_qty_pct"] = 0.0276
     cfg["bot"]["long"]["n_positions"] = 5.0
     cfg["bot"]["long"]["total_wallet_exposure_limit"] = 1.8
     cfg["bot"]["long"]["risk_we_excess_allowance_pct"] = 0.37
@@ -775,7 +1560,17 @@ async def test_fake_live_writes_remote_call_artifacts(tmp_path, monkeypatch):
             encoding="utf-8"
         )
     )
-    scenario.pop("assertions", None)
+    scenario["assertions"] = {
+        "remote_call_paths": {
+            "summary.total_calls": {"min": 1},
+            "summary.by_method.fetch_balance": {"min": 1},
+            "summary.by_method.fetch_positions": {"min": 1},
+            "summary.by_method.fetch_open_orders": {"min": 1},
+            "summary.by_method.fetch_ohlcv": {"min": 1},
+            "summary.by_category.account_state": {"min": 3},
+            "summary.by_category.market_data": {"min": 1},
+        }
+    }
     scenario_path = tmp_path / "fake_remote_call_trace.hjson"
     scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
     config_path = REPO_ROOT / "configs" / "fake_live_hsl_btc.hjson"

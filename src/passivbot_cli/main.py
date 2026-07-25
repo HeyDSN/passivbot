@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cli_utils import help_requested
+from passivbot_version import __version__
 
 
 @dataclass(frozen=True)
@@ -46,10 +47,29 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "audit candle caches (requires full install)",
         requires_full=True,
     ),
+    "cache-integrity-doctor": CommandSpec(
+        "tools.cache_integrity_doctor",
+        "read-only local cache integrity smoke report (requires full install)",
+        requires_full=True,
+    ),
+    "crash-finder": CommandSpec(
+        "tools.crash_finder",
+        "scan local OHLCV cache for crash-window suite scenarios (requires full install)",
+        requires_full=True,
+    ),
+    "compare-backtests": CommandSpec(
+        "tools.compare_backtests",
+        "compare completed backtest artifacts (requires full install)",
+        requires_full=True,
+    ),
     "fetch-balance": CommandSpec("tools.fetch_balance", "fetch exchange balances"),
     "hyperliquid-balance-probe": CommandSpec(
         "tools.probe_hyperliquid_balance",
         "read-only Hyperliquid balance smoke test",
+    ),
+    "hyperliquid-abstraction-probe": CommandSpec(
+        "tools.probe_hyperliquid_abstraction",
+        "read-only Hyperliquid account abstraction probe",
     ),
     "hyperliquid-order-margin-probe": CommandSpec(
         "tools.probe_hyperliquid_order_margin",
@@ -84,15 +104,92 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "plot iterative history files (requires full install)",
         requires_full=True,
     ),
+    "live-event-query": CommandSpec(
+        "tools.live_event_query",
+        "query structured live event NDJSON",
+    ),
+    "log-secret-inventory": CommandSpec(
+        "tools.log_secret_inventory",
+        "read-only value-free inventory of secret-like local log material",
+    ),
+    "runtime-attribution": CommandSpec(
+        "tools.runtime_attribution",
+        "attribute local fills to recorded ingestion and candidate runtime windows",
+    ),
+    "live-incident-bundle": CommandSpec(
+        "tools.live_incident_bundle",
+        "collect local live incident evidence into a tarball",
+    ),
+    "live-performance-report": CommandSpec(
+        "tools.live_performance_report",
+        "summarize local live performance timing events",
+    ),
+    "live-process-report": CommandSpec(
+        "tools.live_process_report",
+        "sample local live process state without monitor or network access",
+    ),
+    "live-config-preflight": CommandSpec(
+        "tools.live_config_preflight",
+        "read-only offline live config preflight report",
+    ),
+    "hsl-startup-preview": CommandSpec(
+        "tools.hsl_startup_preview",
+        "read-only offline HSL startup preview",
+    ),
+    "hsl-replay-benchmark": CommandSpec(
+        "tools.hsl_replay_benchmark",
+        "benchmark the offline coin-HSL replay hot path",
+    ),
+    "live-smoke-report": CommandSpec(
+        "tools.live_smoke_report",
+        "summarize local live monitor events and text logs",
+    ),
+    "live-restart-smoke-plan": CommandSpec(
+        "tools.live_restart_smoke_plan",
+        "build a read-only dry-run live restart smoke plan",
+    ),
+    "live-restart-target-report": CommandSpec(
+        "tools.live_restart_target_report",
+        "resolve exact local tmux restart targets without process control",
+    ),
+    "live-restart-smoke-evidence": CommandSpec(
+        "tools.live_restart_smoke_evidence",
+        "evaluate bounded local restart smoke evidence without live operations",
+    ),
+    "live-restart-smoke-collect": CommandSpec(
+        "tools.live_restart_smoke_collection",
+        "collect and evaluate bounded local restart smoke evidence",
+    ),
+    "live-restart-smoke-run": CommandSpec(
+        "tools.live_restart_smoke_run",
+        "restart exact local targets and collect bounded smoke evidence",
+    ),
+    "live-restart-executor": CommandSpec(
+        "tools.live_restart_executor",
+        "gracefully restart exact verified local tmux targets",
+    ),
+    "live-repository-prepare": CommandSpec(
+        "tools.live_repository_prepare",
+        "fast-forward canonical master and prove the Rust runtime",
+    ),
     "inspect-ohlcvs": CommandSpec(
         "tools.inspect_ohlcvs",
         "inspect v2 OHLCV cache metadata and gaps (requires full install)",
+        requires_full=True,
+    ),
+    "ohlcvs-doctor": CommandSpec(
+        "tools.ohlcvs_doctor",
+        "audit and repair v2 OHLCV catalog metadata (requires full install)",
         requires_full=True,
     ),
     "migrate-historical-data": CommandSpec(
         "tools.migrate_historical_data",
         "migrate historical data layout (requires full install)",
         requires_full=True,
+    ),
+    "migrate-config-v7": CommandSpec(
+        "tools.migrate_config_v7",
+        "migrate a v7 trailing-grid config to v8 trailing_grid_v7",
     ),
     "merge-paretos": CommandSpec(
         "tools.merge_paretos",
@@ -134,6 +231,21 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         "launch Pareto dashboard (requires full install)",
         requires_full=True,
     ),
+    "pareto-analyze": CommandSpec(
+        "tools.pareto_analyzer",
+        "analyze Pareto front config and metric distributions (requires full install)",
+        requires_full=True,
+    ),
+    "pareto-analysis": CommandSpec(
+        "tools.pareto_analyzer",
+        "analyze Pareto front config and metric distributions (requires full install)",
+        requires_full=True,
+    ),
+    "pareto-compress": CommandSpec(
+        "tools.pareto_compress",
+        "select a compact representative subset from a Pareto front (requires full install)",
+        requires_full=True,
+    ),
     "pareto-explorer": CommandSpec(
         "tools.pareto_explorer",
         "select a single candidate from a Pareto front (requires full install)",
@@ -145,6 +257,18 @@ TOOL_COMMANDS: dict[str, CommandSpec] = {
         requires_full=True,
     ),
     "streamline-json": CommandSpec("tools.streamline_json", "reformat config or result JSON"),
+    "trailing-inspect": CommandSpec(
+        "tools.trailing_inspect",
+        "explain trailing_martingale entry and close thresholds",
+    ),
+    "ticker-probe": CommandSpec(
+        "tools.probe_ticker_capabilities",
+        "read-only exchange ticker capability probe",
+    ),
+    "ticker-endpoint-probe": CommandSpec(
+        "tools.probe_ccxt_ticker_endpoints",
+        "multi-user CCXT ticker endpoint latency probe",
+    ),
     "verify-hlcvs-data": CommandSpec(
         "tools.verify_hlcvs_data",
         "verify cached OHLCV datasets (requires full install)",
@@ -172,6 +296,7 @@ FULL_INSTALL_MODULE_HINTS = {
 FULL_INSTALL_MARKER_MODULES = tuple(sorted(FULL_INSTALL_MODULE_HINTS | {"websockets"}))
 ENV_MISMATCH_IGNORE_ENV = "PASSIVBOT_IGNORE_ENV_MISMATCH"
 ENV_REEXEC_GUARD_ENV = "PASSIVBOT_ENV_REEXEC"
+VERSION_FLAGS = {"-V", "--version"}
 
 
 def _build_root_parser() -> argparse.ArgumentParser:
@@ -413,6 +538,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_root_parser()
     if not argv or argv[0] in {"-h", "--help"}:
         parser.print_help()
+        return 0
+    if argv[0] in VERSION_FLAGS:
+        if len(argv) > 1:
+            parser.exit(2, f"passivbot: {argv[0]} does not accept arguments\n")
+        print(f"passivbot {__version__}")
         return 0
 
     if argv[0] == "help":

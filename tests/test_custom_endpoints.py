@@ -1,9 +1,11 @@
 import json
 
 import pytest
+import utils
 
 from custom_endpoint_overrides import (
     CustomEndpointConfig,
+    CustomEndpointConfigError,
     ResolvedEndpointOverride,
     apply_rest_overrides_to_ccxt,
     configure_custom_endpoint_loader,
@@ -57,6 +59,40 @@ def test_load_custom_endpoint_config_parses_binance_override(tmp_path):
     assert override.rest_url_overrides == {}
     assert override.rest_extra_headers == {}
     assert config.get_override("unknown") is None
+
+
+def test_alias_override_merges_between_defaults_and_canonical():
+    config = CustomEndpointConfig(
+        source_path=None,
+        defaults={
+            "disable_ws": False,
+            "rest": {"extra_headers": {"X-Default": "1", "X-Precedence": "default"}},
+        },
+        exchanges={
+            "gate": {
+                "disable_ws": True,
+                "rest": {
+                    "extra_headers": {"X-Alias": "1", "X-Precedence": "alias"},
+                    "url_overrides": {"public": "https://gate-alias.example"},
+                },
+            },
+            "gateio": {
+                "rest": {"extra_headers": {"X-Precedence": "canonical"}},
+            },
+        },
+    )
+
+    override = config.get_override_with_aliases("gateio", ("gate",))
+
+    assert override is not None
+    assert override.exchange_id == "gateio"
+    assert override.disable_ws is True
+    assert override.rest_url_overrides["public"] == "https://gate-alias.example"
+    assert override.rest_extra_headers == {
+        "X-Default": "1",
+        "X-Alias": "1",
+        "X-Precedence": "canonical",
+    }
 
 
 def test_apply_rest_overrides_to_ccxt_updates_urls_and_headers():
@@ -143,3 +179,44 @@ def test_configure_loader_with_explicit_path(tmp_path):
     assert override.disable_ws is False
     assert override.rest_url_overrides["fapiPrivate"] == "https://proxy.example/fapi/v1"
     assert override.rest_domain_rewrites["https://fapi.binance.com"] == "https://proxy.example"
+
+
+def test_configured_loader_raises_on_malformed_endpoint_file(tmp_path):
+    config_path = tmp_path / "custom_endpoints.json"
+    config_path.write_text("{not json", encoding="utf-8")
+
+    configure_custom_endpoint_loader(str(config_path), autodiscover=False, preloaded=None)
+
+    with pytest.raises(CustomEndpointConfigError, match="failed to parse custom endpoint config"):
+        get_cached_custom_endpoint_config()
+
+
+def test_load_ccxt_instance_raises_on_malformed_custom_endpoint_file(monkeypatch, tmp_path):
+    config_path = tmp_path / "custom_endpoints.json"
+    config_path.write_text("{not json", encoding="utf-8")
+
+    class DummyExchange:
+        def __init__(self, _config):
+            self.options = {}
+            self.urls = {"api": {}}
+            self.headers = {}
+
+    monkeypatch.setattr(utils.ccxt, "binanceusdm", DummyExchange, raising=False)
+    configure_custom_endpoint_loader(str(config_path), autodiscover=False, preloaded=None)
+
+    with pytest.raises(CustomEndpointConfigError, match="failed to parse custom endpoint config"):
+        utils.load_ccxt_instance("binanceusdm")
+
+
+def test_apply_rest_overrides_raises_on_invalid_ccxt_api_urls():
+    override = ResolvedEndpointOverride(
+        exchange_id="binanceusdm",
+        rest_domain_rewrites={"https://fapi.binance.com": "https://proxy.example"},
+    )
+
+    class BadExchange:
+        urls = {"api": {"fapiPrivate": 1}}
+        headers = {}
+
+    with pytest.raises(CustomEndpointConfigError, match="failed to apply custom endpoint override"):
+        apply_rest_overrides_to_ccxt(BadExchange(), override)

@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 import passivbot_rust as pbr
 
@@ -23,12 +25,16 @@ async def test_execute_orders_parent_tracks_acknowledged_custom_id():
         _order_identity_fingerprint = pb_mod.Passivbot._order_identity_fingerprint
         _build_emitted_order_record = pb_mod.Passivbot._build_emitted_order_record
         _emitted_order_records = pb_mod.Passivbot._emitted_order_records
+        _is_market_execution_order = staticmethod(
+            pb_mod.Passivbot._is_market_execution_order
+        )
 
         def __init__(self):
             self.monitor_publisher = None
             self._health_orders_placed = 0
             self.debug_mode = False
             self.orders_emitted_to_exchange = []
+            self.recent_order_executions = []
 
         def live_value(self, key):
             assert key == "max_n_creations_per_batch"
@@ -38,12 +44,15 @@ async def test_execute_orders_parent_tracks_acknowledged_custom_id():
             return 123456
 
         def add_to_recent_order_executions(self, order):
-            return None
+            self.recent_order_executions.append(dict(order))
 
         def log_order_action(self, *args, **kwargs):
             return None
 
         def _log_order_action_summary(self, *args, **kwargs):
+            return None
+
+        def _log_market_execution_notice(self, *args, **kwargs):
             return None
 
         async def execute_orders(self, orders):
@@ -80,6 +89,7 @@ async def test_execute_orders_parent_tracks_acknowledged_custom_id():
     assert record["custom_id"] == custom_id
     assert record["canonical_custom_id"] == "0x0004-aaaa"
     assert record["pb_type"] == "entry_grid_normal_long"
+    assert record["status"] == "acknowledged"
     assert record["fingerprint"] == {
         "symbol": "BTC/USDT:USDT",
         "side": "buy",
@@ -89,6 +99,664 @@ async def test_execute_orders_parent_tracks_acknowledged_custom_id():
         "qty": 0.01,
         "price": 100000.0,
     }
+    assert len(bot.recent_order_executions) == 1
+    assert bot.recent_order_executions[0]["custom_id"] == custom_id
+
+
+@pytest.mark.asyncio
+async def test_execute_orders_parent_tracks_ambiguous_create_error_custom_id(
+    caplog, capsys
+):
+    import passivbot as pb_mod
+
+    hostile_type_name = "ApiKeyCreateAcknowledgementFailure"
+    hostile_secret = "https://hostile.example.invalid/create?token=create-secret"
+    HostileError = type(hostile_type_name, (RuntimeError,), {})
+
+    class FakeBot:
+        execute_orders_parent = pb_mod.Passivbot.execute_orders_parent
+        _monitor_record_event = pb_mod.Passivbot._monitor_record_event
+        _monitor_order_payload = pb_mod.Passivbot._monitor_order_payload
+        _record_emitted_order_custom_id = pb_mod.Passivbot._record_emitted_order_custom_id
+        _extract_order_custom_id = pb_mod.Passivbot._extract_order_custom_id
+        _extract_order_exchange_id = pb_mod.Passivbot._extract_order_exchange_id
+        _extract_order_reduce_only = pb_mod.Passivbot._extract_order_reduce_only
+        _extract_order_float = pb_mod.Passivbot._extract_order_float
+        _canonical_passivbot_custom_id = pb_mod.Passivbot._canonical_passivbot_custom_id
+        _order_identity_fingerprint = pb_mod.Passivbot._order_identity_fingerprint
+        _build_emitted_order_record = pb_mod.Passivbot._build_emitted_order_record
+        _emitted_order_records = pb_mod.Passivbot._emitted_order_records
+        _resolve_pb_order_type = pb_mod.Passivbot._resolve_pb_order_type
+        _is_market_execution_order = staticmethod(
+            pb_mod.Passivbot._is_market_execution_order
+        )
+
+        def __init__(self):
+            self.monitor_publisher = None
+            self._health_orders_placed = 0
+            self.debug_mode = False
+            self.orders_emitted_to_exchange = []
+            self.recent_order_executions = []
+
+        def live_value(self, key):
+            assert key == "max_n_creations_per_batch"
+            return 5
+
+        def get_exchange_time(self):
+            return 123456
+
+        def add_to_recent_order_executions(self, order):
+            self.recent_order_executions.append(dict(order))
+
+        def log_order_action(self, *args, **kwargs):
+            return None
+
+        def _log_order_action_summary(self, *args, **kwargs):
+            return None
+
+        def _log_market_execution_notice(self, *args, **kwargs):
+            return None
+
+        async def execute_orders(self, orders):
+            return [HostileError(hostile_secret)]
+
+        def did_create_order(self, executed):
+            return False
+
+        def add_new_order(self, order, source="POST"):
+            raise AssertionError("failed create attempts must not be added locally")
+
+    bot = FakeBot()
+    custom_id = _pb_custom_id("entry_grid_normal_long", "timeout")
+    order = {
+        "symbol": "TON/USDT:USDT",
+        "side": "buy",
+        "position_side": "long",
+        "qty": 25.0,
+        "price": 2.495,
+        "reduce_only": False,
+        "custom_id": custom_id,
+        "pb_order_type": "entry_grid_normal_long",
+    }
+
+    with caplog.at_level(logging.WARNING):
+        res = await pb_mod.Passivbot.execute_orders_parent(bot, [order])
+
+    assert res == []
+    assert len(bot.orders_emitted_to_exchange) == 1
+    record = bot.orders_emitted_to_exchange[0]
+    assert record["timestamp"] == 123456
+    assert record["custom_id"] == custom_id
+    assert record["canonical_custom_id"] == "0x0004-timeout"
+    assert record["pb_type"] == "entry_grid_normal_long"
+    assert record["status"] == "create_error_ambiguous"
+    assert bot._health_orders_placed == 0
+    assert len(bot.recent_order_executions) == 1
+    assert bot.recent_order_executions[0]["custom_id"] == custom_id
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + caplog.text
+    assert hostile_secret not in rendered
+    create_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("[order] create not acknowledged")
+    ]
+    assert [(record.levelno, record.getMessage()) for record in create_records] == [
+        (
+            logging.WARNING,
+            "[order] create not acknowledged | symbol=TON "
+            "type=entry_grid_normal_long reason=result_exception error_type=RuntimeError",
+        )
+    ]
+    assert hostile_type_name not in create_records[0].getMessage()
+    assert hostile_secret not in create_records[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_execute_orders_parent_does_not_throttle_rejected_create_response(
+    caplog, capsys
+):
+    import passivbot as pb_mod
+
+    class FakeBot:
+        execute_orders_parent = pb_mod.Passivbot.execute_orders_parent
+        _monitor_record_event = pb_mod.Passivbot._monitor_record_event
+        _monitor_order_payload = pb_mod.Passivbot._monitor_order_payload
+        _record_emitted_order_custom_id = pb_mod.Passivbot._record_emitted_order_custom_id
+        _extract_order_custom_id = pb_mod.Passivbot._extract_order_custom_id
+        _extract_order_exchange_id = pb_mod.Passivbot._extract_order_exchange_id
+        _extract_order_reduce_only = pb_mod.Passivbot._extract_order_reduce_only
+        _extract_order_float = pb_mod.Passivbot._extract_order_float
+        _canonical_passivbot_custom_id = pb_mod.Passivbot._canonical_passivbot_custom_id
+        _order_identity_fingerprint = pb_mod.Passivbot._order_identity_fingerprint
+        _build_emitted_order_record = pb_mod.Passivbot._build_emitted_order_record
+        _emitted_order_records = pb_mod.Passivbot._emitted_order_records
+        _resolve_pb_order_type = pb_mod.Passivbot._resolve_pb_order_type
+        did_create_order = pb_mod.Passivbot.did_create_order
+        _is_market_execution_order = staticmethod(
+            pb_mod.Passivbot._is_market_execution_order
+        )
+
+        def __init__(self):
+            self.monitor_publisher = None
+            self._health_orders_placed = 0
+            self.debug_mode = False
+            self.orders_emitted_to_exchange = []
+            self.recent_order_executions = []
+
+        def live_value(self, key):
+            assert key == "max_n_creations_per_batch"
+            return 5
+
+        def get_exchange_time(self):
+            return 123456
+
+        def add_to_recent_order_executions(self, order):
+            self.recent_order_executions.append(dict(order))
+
+        def log_order_action(self, *args, **kwargs):
+            return None
+
+        def _log_order_action_summary(self, *args, **kwargs):
+            return None
+
+        def _log_market_execution_notice(self, *args, **kwargs):
+            return None
+
+        async def execute_orders(self, orders):
+            return [
+                {
+                    "id": "reject-1",
+                    "status": "rejected",
+                    "raw_error": "Authorization: Bearer RAW_REJECT_SECRET",
+                    **orders[0],
+                }
+            ]
+
+        def add_new_order(self, order, source="POST"):
+            raise AssertionError("rejected creates must not be added locally")
+
+    bot = FakeBot()
+    order = {
+        "symbol": "TON/USDT:USDT",
+        "side": "sell",
+        "position_side": "long",
+        "qty": 25.0,
+        "price": 2.495,
+        "reduce_only": True,
+        "custom_id": _pb_custom_id("close_grid_long", "reject"),
+        "pb_order_type": "close_grid_long",
+    }
+
+    with caplog.at_level(logging.WARNING):
+        res = await pb_mod.Passivbot.execute_orders_parent(bot, [order])
+
+    assert res == []
+    assert bot.recent_order_executions == []
+    assert bot._health_orders_placed == 0
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + caplog.text
+    assert "RAW_REJECT_SECRET" not in rendered
+    assert "raw_error" not in rendered
+    assert "reason=terminal_rejection" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_execute_orders_parent_tracks_hard_failed_create_as_ambiguous(
+    caplog, capsys
+):
+    import passivbot as pb_mod
+
+    hostile_type_name = "ApiKeyRaisedCreateFailure"
+    hostile_secret = "https://hostile.example.invalid/create?token=raised-secret"
+    HostileError = type(hostile_type_name, (RuntimeError,), {})
+    hostile_error = HostileError(hostile_secret)
+
+    class FakeBot:
+        execute_orders_parent = pb_mod.Passivbot.execute_orders_parent
+        _record_emitted_order_custom_id = pb_mod.Passivbot._record_emitted_order_custom_id
+        _extract_order_custom_id = pb_mod.Passivbot._extract_order_custom_id
+        _extract_order_exchange_id = pb_mod.Passivbot._extract_order_exchange_id
+        _extract_order_reduce_only = pb_mod.Passivbot._extract_order_reduce_only
+        _extract_order_float = pb_mod.Passivbot._extract_order_float
+        _canonical_passivbot_custom_id = pb_mod.Passivbot._canonical_passivbot_custom_id
+        _order_identity_fingerprint = pb_mod.Passivbot._order_identity_fingerprint
+        _build_emitted_order_record = pb_mod.Passivbot._build_emitted_order_record
+        _emitted_order_records = pb_mod.Passivbot._emitted_order_records
+        _resolve_pb_order_type = pb_mod.Passivbot._resolve_pb_order_type
+        _is_market_execution_order = staticmethod(
+            pb_mod.Passivbot._is_market_execution_order
+        )
+
+        def __init__(self):
+            self.debug_mode = False
+            self.orders_emitted_to_exchange = []
+            self.recent_order_executions = []
+
+        def live_value(self, key):
+            assert key == "max_n_creations_per_batch"
+            return 5
+
+        def get_exchange_time(self):
+            return 123456
+
+        def add_to_recent_order_executions(self, order):
+            self.recent_order_executions.append(dict(order))
+
+        def log_order_action(self, *args, **kwargs):
+            return None
+
+        def _log_order_action_summary(self, *args, **kwargs):
+            return None
+
+        def _log_market_execution_notice(self, *args, **kwargs):
+            return None
+
+        async def execute_orders(self, orders):
+            raise hostile_error
+
+    bot = FakeBot()
+    order = {
+        "symbol": "TON/USDT:USDT",
+        "side": "sell",
+        "position_side": "long",
+        "qty": 25.0,
+        "price": 2.495,
+        "reduce_only": True,
+        "custom_id": _pb_custom_id("close_grid_long", "hardfail"),
+        "pb_order_type": "close_grid_long",
+    }
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(HostileError) as exc_info:
+            await pb_mod.Passivbot.execute_orders_parent(bot, [order])
+
+    assert exc_info.value is hostile_error
+    assert len(bot.recent_order_executions) == 1
+    assert bot.recent_order_executions[0]["custom_id"] == order["custom_id"]
+    assert len(bot.orders_emitted_to_exchange) == 1
+    assert bot.orders_emitted_to_exchange[0]["status"] == "create_error_ambiguous"
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + caplog.text
+    assert hostile_type_name not in rendered
+    assert hostile_secret not in rendered
+    ambiguous_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("[order] remembered ambiguous create")
+    ]
+    assert [(record.levelno, record.getMessage()) for record in ambiguous_records] == [
+        (
+            logging.DEBUG,
+            "[order] remembered ambiguous create | symbol=TON type=close_grid_long "
+            "custom_id=pb-0x0007-hardfail status=create_error_ambiguous "
+            "reason=exchange_exception error_type=RuntimeError",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_order_plan_bounds_raised_create_exception_diagnostics(
+    monkeypatch, caplog, capsys
+):
+    import passivbot as pb_mod
+
+    hostile_type_name = "AuthorizationBatchCreateFailure"
+    hostile_secret = "https://hostile.example.invalid/create?token=batch-secret"
+    HostileError = type(hostile_type_name, (RuntimeError,), {})
+
+    async def keep_fresh_creations(_bot, orders):
+        return orders
+
+    monkeypatch.setattr(
+        pb_mod.Passivbot,
+        "_filter_fresh_market_snapshot_creations",
+        keep_fresh_creations,
+    )
+
+    class FakeBot:
+        debug_mode = False
+        balance_threshold = 0.0
+        quote = "USDT"
+        stop_signal_received = False
+        state_change_detected_by_symbol = set()
+        _shutdown_requested = pb_mod.Passivbot._shutdown_requested
+
+        def __init__(self):
+            self.restart_called = False
+            self.execution_scheduled = False
+
+        def get_raw_balance(self):
+            return 100.0
+
+        async def execute_cancellations_parent(self, orders):
+            assert orders == []
+            return []
+
+        def order_was_recently_updated(self, order):
+            return 0
+
+        async def execute_orders_parent(self, orders):
+            raise HostileError(f"exchange create failed {hostile_secret}")
+
+        async def restart_bot_on_too_many_errors(self):
+            self.restart_called = True
+
+        def _resolve_pb_order_type(self, order):
+            return str(order.get("pb_order_type") or "")
+
+    bot = FakeBot()
+    order = {
+        "symbol": "TON/USDT:USDT",
+        "side": "buy",
+        "position_side": "long",
+        "qty": 25.0,
+        "price": 2.495,
+        "reduce_only": False,
+        "custom_id": _pb_custom_id("entry_grid_normal_long", "batchfail"),
+        "pb_order_type": "entry_grid_normal_long",
+    }
+
+    with caplog.at_level(logging.ERROR):
+        await pb_mod.Passivbot.execute_order_plan_to_exchange(
+            bot, [], [order], configure_creations=False
+        )
+
+    assert bot.restart_called is True
+    assert bot.execution_scheduled is True
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + caplog.text
+    assert hostile_type_name not in rendered
+    assert hostile_secret not in rendered
+    assert "Traceback" not in rendered
+    batch_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("[order] create batch raised before completion")
+    ]
+    assert [(record.levelno, record.getMessage()) for record in batch_records] == [
+        (
+            logging.ERROR,
+            "[order] create batch raised before completion | count=1 error_type=RuntimeError",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_orders_parent_tracks_empty_create_response_as_ambiguous():
+    import passivbot as pb_mod
+
+    class FakeBot:
+        execute_orders_parent = pb_mod.Passivbot.execute_orders_parent
+        _record_emitted_order_custom_id = pb_mod.Passivbot._record_emitted_order_custom_id
+        _extract_order_custom_id = pb_mod.Passivbot._extract_order_custom_id
+        _extract_order_exchange_id = pb_mod.Passivbot._extract_order_exchange_id
+        _extract_order_reduce_only = pb_mod.Passivbot._extract_order_reduce_only
+        _extract_order_float = pb_mod.Passivbot._extract_order_float
+        _canonical_passivbot_custom_id = pb_mod.Passivbot._canonical_passivbot_custom_id
+        _order_identity_fingerprint = pb_mod.Passivbot._order_identity_fingerprint
+        _build_emitted_order_record = pb_mod.Passivbot._build_emitted_order_record
+        _emitted_order_records = pb_mod.Passivbot._emitted_order_records
+        _resolve_pb_order_type = pb_mod.Passivbot._resolve_pb_order_type
+        _is_market_execution_order = staticmethod(
+            pb_mod.Passivbot._is_market_execution_order
+        )
+
+        def __init__(self):
+            self.debug_mode = False
+            self.orders_emitted_to_exchange = []
+            self.recent_order_executions = []
+
+        def live_value(self, key):
+            assert key == "max_n_creations_per_batch"
+            return 5
+
+        def get_exchange_time(self):
+            return 123456
+
+        def add_to_recent_order_executions(self, order):
+            self.recent_order_executions.append(dict(order))
+
+        def log_order_action(self, *args, **kwargs):
+            return None
+
+        def _log_order_action_summary(self, *args, **kwargs):
+            return None
+
+        def _log_market_execution_notice(self, *args, **kwargs):
+            return None
+
+        async def execute_orders(self, orders):
+            return []
+
+    bot = FakeBot()
+    order = {
+        "symbol": "TON/USDT:USDT",
+        "side": "buy",
+        "position_side": "long",
+        "qty": 25.0,
+        "price": 2.495,
+        "reduce_only": False,
+        "custom_id": _pb_custom_id("entry_grid_normal_long", "empty"),
+        "pb_order_type": "entry_grid_normal_long",
+    }
+
+    res = await pb_mod.Passivbot.execute_orders_parent(bot, [order])
+
+    assert res == []
+    assert len(bot.recent_order_executions) == 1
+    assert bot.orders_emitted_to_exchange[0]["status"] == "create_response_missing"
+
+
+@pytest.mark.asyncio
+async def test_execute_orders_parent_tracks_partial_create_response_as_ambiguous(
+    caplog, capsys
+):
+    import passivbot as pb_mod
+
+    class FakeBot:
+        execute_orders_parent = pb_mod.Passivbot.execute_orders_parent
+        _record_emitted_order_custom_id = pb_mod.Passivbot._record_emitted_order_custom_id
+        _extract_order_custom_id = pb_mod.Passivbot._extract_order_custom_id
+        _extract_order_exchange_id = pb_mod.Passivbot._extract_order_exchange_id
+        _extract_order_reduce_only = pb_mod.Passivbot._extract_order_reduce_only
+        _extract_order_float = pb_mod.Passivbot._extract_order_float
+        _canonical_passivbot_custom_id = pb_mod.Passivbot._canonical_passivbot_custom_id
+        _order_identity_fingerprint = pb_mod.Passivbot._order_identity_fingerprint
+        _build_emitted_order_record = pb_mod.Passivbot._build_emitted_order_record
+        _emitted_order_records = pb_mod.Passivbot._emitted_order_records
+        _resolve_pb_order_type = pb_mod.Passivbot._resolve_pb_order_type
+        _is_market_execution_order = staticmethod(
+            pb_mod.Passivbot._is_market_execution_order
+        )
+
+        def __init__(self):
+            self.debug_mode = False
+            self.orders_emitted_to_exchange = []
+            self.recent_order_executions = []
+
+        def live_value(self, key):
+            assert key == "max_n_creations_per_batch"
+            return 5
+
+        def get_exchange_time(self):
+            return 123456
+
+        def add_to_recent_order_executions(self, order):
+            self.recent_order_executions.append(dict(order))
+
+        def log_order_action(self, *args, **kwargs):
+            return None
+
+        def _log_order_action_summary(self, *args, **kwargs):
+            return None
+
+        def _log_market_execution_notice(self, *args, **kwargs):
+            return None
+
+        async def execute_orders(self, orders):
+            return [
+                {
+                    "id": "only-first",
+                    "raw_response": "api_key=RAW_PARTIAL_SECRET",
+                    **orders[0],
+                }
+            ]
+
+    bot = FakeBot()
+    orders = [
+        {
+            "symbol": "TON/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 25.0,
+            "price": 2.495,
+            "reduce_only": False,
+            "custom_id": _pb_custom_id("entry_grid_normal_long", "partial1"),
+            "pb_order_type": "entry_grid_normal_long",
+        },
+        {
+            "symbol": "SOL/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 1.0,
+            "price": 100.0,
+            "reduce_only": False,
+            "custom_id": _pb_custom_id("entry_grid_normal_long", "partial2"),
+            "pb_order_type": "entry_grid_normal_long",
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        res = await pb_mod.Passivbot.execute_orders_parent(bot, orders)
+
+    assert res == []
+    assert len(bot.recent_order_executions) == 2
+    assert [rec["status"] for rec in bot.orders_emitted_to_exchange] == [
+        "create_response_partial",
+        "create_response_partial",
+    ]
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + caplog.text
+    assert "RAW_PARTIAL_SECRET" not in rendered
+    assert "raw_response" not in rendered
+    assert "create response count mismatch | requested=2 returned=1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_execute_cancellations_parent_bounds_partial_response_diagnostics(
+    caplog, capsys
+):
+    import passivbot as pb_mod
+
+    hostile_type_name = "ApiKeyCancelAcknowledgementFailure"
+    hostile_secret = "https://hostile.example.invalid/cancel?token=cancel-secret"
+    HostileError = type(hostile_type_name, (RuntimeError,), {})
+
+    class FakeBot:
+        debug_mode = False
+
+        def __init__(self):
+            self._health_orders_cancelled = 0
+            self._order_wave_in_progress = None
+            self.state_change_detected_by_symbol = set()
+
+        def live_value(self, key):
+            assert key == "max_n_cancellations_per_batch"
+            return 5
+
+        def add_to_recent_order_cancellations(self, order):
+            return None
+
+        def log_order_action(self, *args, **kwargs):
+            return None
+
+        def _log_order_action_summary(self, *args, **kwargs):
+            return None
+
+        async def execute_cancellations(self, orders):
+            return [
+                {
+                    "status": "success",
+                    "raw_response": "apiKey=RAW_CANCEL_SECRET",
+                    **orders[0],
+                }
+            ]
+
+        def _resolve_pb_order_type(self, order):
+            return str(order.get("pb_order_type") or "")
+
+    bot = FakeBot()
+    orders = [
+        {
+            "id": "cancel-1",
+            "symbol": "BTC/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 0.01,
+            "price": 100000.0,
+            "reduce_only": True,
+            "pb_order_type": "close_grid_long",
+        },
+        {
+            "id": "cancel-2",
+            "symbol": "ETH/USDT:USDT",
+            "side": "sell",
+            "position_side": "short",
+            "qty": 0.1,
+            "price": 3000.0,
+            "reduce_only": True,
+            "pb_order_type": "close_grid_short",
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        res = await pb_mod.Passivbot.execute_cancellations_parent(bot, orders)
+
+    assert res == []
+    assert bot.state_change_detected_by_symbol == {
+        "BTC/USDT:USDT",
+        "ETH/USDT:USDT",
+    }
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + caplog.text
+    assert "RAW_CANCEL_SECRET" not in rendered
+    assert "raw_response" not in rendered
+    assert "cancel response count mismatch | requested=2 returned=1" in caplog.text
+
+    async def not_acknowledged(_orders):
+        return [HostileError(hostile_secret)]
+
+    bot.execute_cancellations = not_acknowledged
+    bot.did_cancel_order = lambda _executed, _order: False
+    caplog.clear()
+    capsys.readouterr()
+    with caplog.at_level(logging.WARNING):
+        result = await pb_mod.Passivbot.execute_cancellations_parent(bot, [orders[0]])
+
+    assert result == []
+    assert bot.state_change_detected_by_symbol == {
+        "BTC/USDT:USDT",
+        "ETH/USDT:USDT",
+    }
+    assert bot._health_orders_cancelled == 0
+    captured = capsys.readouterr()
+    rendered = captured.out + captured.err + caplog.text
+    assert hostile_secret not in rendered
+    cancel_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("[order] cancel not acknowledged")
+    ]
+    assert [(record.levelno, record.getMessage()) for record in cancel_records] == [
+        (
+            logging.WARNING,
+            "[order] cancel not acknowledged | symbol=BTC "
+            "type=close_grid_long error_type=RuntimeError",
+        )
+    ]
+    assert hostile_type_name not in cancel_records[0].getMessage()
+    assert hostile_secret not in cancel_records[0].getMessage()
 
 
 def _make_detection_bot(now_ts: int, start_ts: int):
@@ -102,6 +770,42 @@ def _make_detection_bot(now_ts: int, start_ts: int):
     bot.bot_start_exchange_ts = start_ts
     bot.get_exchange_time = lambda: now_ts
     return bot
+
+
+@pytest.mark.asyncio
+async def test_apply_open_orders_snapshot_runs_foreign_writer_detector():
+    import passivbot as pb_mod
+
+    bot = _make_detection_bot(now_ts=2_000_000, start_ts=1_000_000)
+    bot.open_orders = {}
+    bot.fetched_open_orders = []
+    bot.state_change_detected_by_symbol = set()
+    bot._record_authoritative_surface = lambda *_args, **_kwargs: None
+    bot.order_matches_recent_execution = lambda _order, max_age_ms=None: False
+    bot.order_matches_bot_cancellation = lambda _order: False
+    bot.order_was_recently_cancelled = lambda _order: 0.0
+    bot.log_order_action = lambda *_args, **_kwargs: None
+    bot._reconcile_balance_after_open_orders_refresh = lambda: False
+
+    foreign_order = {
+        "id": "foreign-1",
+        "symbol": "BTC/USDT:USDT",
+        "side": "buy",
+        "position_side": "long",
+        "qty": 0.01,
+        "amount": 0.01,
+        "price": 99_000.0,
+        "reduce_only": False,
+        "timestamp": 1_020_000,
+        "custom_id": _pb_custom_id("entry_grid_normal_long", "foreign"),
+    }
+
+    ok = await pb_mod.Passivbot._apply_open_orders_snapshot(bot, [foreign_order])
+
+    assert ok is True
+    assert len(bot.foreign_passivbot_seen) == 1
+    assert bot.open_orders["BTC/USDT:USDT"] == [foreign_order]
+    assert bot.stop_signal_received is False
 
 
 @pytest.mark.asyncio
@@ -151,6 +855,99 @@ async def test_detect_foreign_passivbot_orders_ignores_manual_and_prestart_order
     assert bot.foreign_passivbot_seen == {}
     assert bot.orders_emitted_to_exchange == []
     assert bot.stop_signal_received is False
+
+
+@pytest.mark.asyncio
+async def test_detect_foreign_passivbot_orders_accepts_submitted_order_missing_create_ack():
+    import passivbot as pb_mod
+
+    bot = _make_detection_bot(now_ts=2_000_000, start_ts=1_000_000)
+    custom_id = _pb_custom_id("close_grid_long", "bitget-missing-ack")
+    submitted = {
+        "symbol": "TON/USDT:USDT",
+        "side": "sell",
+        "position_side": "long",
+        "qty": 196.0,
+        "price": 2.0186,
+        "reduce_only": True,
+        "custom_id": custom_id,
+    }
+    pb_mod.Passivbot._record_emitted_order_custom_id(
+        bot, submitted, emitted_ts=1_990_000, status="submitted"
+    )
+    fetched_open = [
+        {
+            "id": "1445750250516676621",
+            "symbol": "TON/USDT:USDT",
+            "side": "sell",
+            "position_side": "long",
+            "qty": 196.0,
+            "price": 2.0186,
+            "reduceOnly": True,
+            "timestamp": 1_990_500,
+            "custom_id": f"Passivbot#{custom_id}",
+        }
+    ]
+
+    await pb_mod.Passivbot._detect_foreign_passivbot_orders(bot, fetched_open)
+
+    assert bot.foreign_passivbot_seen == {}
+    assert len(bot.orders_emitted_to_exchange) == 1
+    record = bot.orders_emitted_to_exchange[0]
+    assert record["exchange_id"] == "1445750250516676621"
+    assert record["canonical_custom_id"] == "0x0007-bitget-missing-ack"
+    assert record["status"] == "open_snapshot_confirmed"
+    assert record["order_timestamp"] == 1_990_500
+    assert bot.stop_signal_received is False
+
+
+def test_ambiguous_create_records_use_shorter_prune_window():
+    import passivbot as pb_mod
+
+    now_ts = 2_000_000
+    bot = _make_detection_bot(now_ts=now_ts, start_ts=1_000_000)
+    ack_custom_id = _pb_custom_id("entry_grid_normal_long", "ack")
+    ambiguous_custom_id = _pb_custom_id("entry_grid_normal_long", "amb")
+    bot.orders_emitted_to_exchange = [
+        {
+            "timestamp": now_ts - pb_mod.FOREIGN_PASSIVBOT_AMBIGUOUS_CREATE_LOOKBACK_MS - 1,
+            "exchange_id": "",
+            "custom_id": ambiguous_custom_id,
+            "canonical_custom_id": "0x0004-amb",
+            "pb_type": "entry_grid_normal_long",
+            "status": "create_error_ambiguous",
+            "fingerprint": None,
+        },
+        {
+            "timestamp": now_ts - pb_mod.FOREIGN_PASSIVBOT_AMBIGUOUS_CREATE_LOOKBACK_MS + 1,
+            "exchange_id": "",
+            "custom_id": ambiguous_custom_id,
+            "canonical_custom_id": "0x0004-amb",
+            "pb_type": "entry_grid_normal_long",
+            "status": "create_error_ambiguous",
+            "fingerprint": None,
+        },
+        {
+            "timestamp": now_ts - pb_mod.FOREIGN_PASSIVBOT_AMBIGUOUS_CREATE_LOOKBACK_MS - 1,
+            "exchange_id": "",
+            "custom_id": ack_custom_id,
+            "canonical_custom_id": "0x0004-ack",
+            "pb_type": "entry_grid_normal_long",
+            "status": "acknowledged",
+            "fingerprint": None,
+        },
+    ]
+
+    pb_mod.Passivbot._prune_emitted_order_custom_ids(bot, now_ts)
+
+    assert [record["status"] for record in bot.orders_emitted_to_exchange] == [
+        "create_error_ambiguous",
+        "acknowledged",
+    ]
+    assert [record["canonical_custom_id"] for record in bot.orders_emitted_to_exchange] == [
+        "0x0004-amb",
+        "0x0004-ack",
+    ]
 
 
 @pytest.mark.asyncio
@@ -299,6 +1096,43 @@ async def test_detect_foreign_passivbot_orders_rejects_conflicting_custom_id_des
 
 
 @pytest.mark.asyncio
+async def test_detect_foreign_passivbot_orders_logs_unmatched_order_diagnostics(caplog):
+    import passivbot as pb_mod
+
+    bot = _make_detection_bot(now_ts=2_000_000, start_ts=1_000_000)
+    custom_id = _pb_custom_id("entry_grid_normal_long", "foreign-hl")
+    fetched_open = [
+        {
+            "id": "453338148239",
+            "symbol": "XMR/USDC:USDC",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 0.265,
+            "price": 333.97,
+            "reduceOnly": False,
+            "timestamp": 1_990_500,
+            "custom_id": custom_id,
+        }
+    ]
+
+    with caplog.at_level(logging.ERROR):
+        await pb_mod.Passivbot._detect_foreign_passivbot_orders(bot, fetched_open)
+
+    assert len(bot.foreign_passivbot_seen) == 1
+    assert "order_id=453338148239" in caplog.text
+    assert "side=buy" in caplog.text
+    assert "pside=long" in caplog.text
+    assert "qty=0.265" in caplog.text
+    assert "price=333.97" in caplog.text
+    assert "reduce_only=False" in caplog.text
+    assert "emitted_records=0" in caplog.text
+    assert "match_id=False" in caplog.text
+    assert "match_custom_id=False" in caplog.text
+    assert "match_fingerprint=False" in caplog.text
+    assert bot.stop_signal_received is False
+
+
+@pytest.mark.asyncio
 async def test_detect_foreign_passivbot_orders_stops_after_unique_threshold():
     import passivbot as pb_mod
 
@@ -337,3 +1171,42 @@ async def test_detect_foreign_passivbot_orders_stops_after_unique_threshold():
 
     assert len(bot.foreign_passivbot_seen) == pb_mod.FOREIGN_PASSIVBOT_MAX_UNIQUE_PER_WINDOW
     assert bot.stop_signal_received is True
+
+
+@pytest.mark.asyncio
+async def test_foreign_writer_stop_redacts_maintainer_failure_and_still_propagates(caplog):
+    import passivbot as pb_mod
+
+    bot = _make_detection_bot(now_ts=2_000_000, start_ts=1_000_000)
+    calls = []
+    hostile_error = type("CredentialLeakError", (Exception,), {})
+
+    def fail_maintainer_stop(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise hostile_error("token=foreign-secret https://example.invalid/maintainers")
+
+    bot.stop_data_maintainers = fail_maintainer_stop
+    custom_id = _pb_custom_id("entry_grid_normal_long", "foreign")
+    detections = [
+        (
+            {"symbol": "BTC/USDT:USDT", "custom_id": custom_id},
+            "entry_grid_normal_long",
+            custom_id,
+            2_000_000,
+        )
+    ]
+
+    with caplog.at_level(logging.ERROR), pytest.raises(
+        Exception, match="foreign Passivbot writer detected"
+    ):
+        await pb_mod.Passivbot._stop_for_foreign_passivbot_orders(bot, detections, 1)
+
+    assert calls == [((), {"verbose": False})]
+    assert bot._foreign_passivbot_stop_requested is True
+    assert bot.stop_signal_received is True
+    assert "action=continue_foreign_writer_stop" in caplog.text
+    assert "error_type=Exception" in caplog.text
+    assert "CredentialLeakError" not in caplog.text
+    assert "foreign-secret" not in caplog.text
+    assert "example.invalid" not in caplog.text
+    assert any(record.levelno == logging.ERROR for record in caplog.records)

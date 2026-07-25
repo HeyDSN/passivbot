@@ -1,15 +1,23 @@
 ![Passivbot](docs/images/pbot_logo_full.svg)
 
-# Trading bot running on Bybit, OKX, Bitget, GateIO, Binance, Kucoin and Hyperliquid
+# Trading bot running on Bybit, OKX, Bitget, GateIO, Binance, Kucoin, Hyperliquid and WEEX
 
 :warning: **Used at one's own risk** :warning:
+
+Current stable major version: **v8.0.0**.
+
+> **Upgrading from v7:** v8 is a breaking config and strategy release. Do not
+> start v8 live with an unreviewed v7 config. Read the
+> [v8.0.0 upgrade notes](docs/release_notes_v8.0.0.md) and use the explicit
+> `passivbot tool migrate-config-v7` helper when preserving v7 trailing-grid
+> behavior.
 
 
 ## Overview
 
 Passivbot is a cryptocurrency trading bot written in Python and Rust, intended to require minimal user intervention.  
 
-It operates on perpetual futures derivatives markets, automatically creating and cancelling limit buy and sell orders on behalf of the user. It does not try to predict future price movements, it does not use technical indicators, nor does it follow trends. Rather, it is a contrarian market maker, providing resistance to price changes in both directions, thereby "serving the market" as a price stabilizer.  
+It operates on perpetual futures derivatives markets, automatically creating and cancelling limit buy and sell orders on behalf of the user. It does not try to predict future price movements or follow trends. Rather, it is a contrarian market maker, using price bands, EMA-derived context, and risk controls to provide resistance to price changes in both directions, thereby "serving the market" as a price stabilizer.
 
 Order planning is computed by a shared Rust orchestrator used by both live trading and backtesting for speed and consistency. Also included is an optimizer, which finds better configurations by iterating thousands of backtests with different candidates, converging on the optimal ones with an evolutionary algorithm.  
 
@@ -25,7 +33,7 @@ For trailing entries, the bot waits for the price to move beyond a specified thr
 Grid and trailing orders may be combined, such that the robot enters or closes a whole or a part of the position as grid orders and/or as trailing orders.
 
 ### Forager
-The Forager feature dynamically chooses the most volatile markets on which to open positions. Volatility is defined as the mean of the normalized relative range for the most recent 1m candles, i.e. `mean((ohlcv.high - ohlcv.low) / ohlcv.close)`.
+The Forager feature dynamically chooses which approved markets may open positions. It first prunes low relative-volume candidates, then ranks the remaining markets with configurable weights for quote volume, EMA readiness, and 1m log-range volatility.
 
 ### Unstucking Mechanism
 Passivbot manages underperforming, or "stuck", positions by realizing small losses over time. If multiple positions are stuck, the bot prioritizes positions with the smallest gap between the entry price and current market price for "unstucking". Losses are limited by ensuring that the account balance does not fall under a set percentage below the past peak balance.  
@@ -35,6 +43,27 @@ Passivbot manages underperforming, or "stuck", positions by realizing small loss
 To install Passivbot and its dependencies, follow the steps below.
 
 Passivbot requires **Python 3.12**. Earlier versions are not supported.
+
+### Upgrading a v7 config
+
+V8 does not silently reinterpret v7 strategy fields. To preserve v7
+trailing-grid behavior while moving the config into canonical v8 shape, run:
+
+```sh
+passivbot tool migrate-config-v7 \
+  path/to/config_v7.json \
+  path/to/config_v8_trailing_grid_v7.json \
+  --report path/to/v7_migration_report.json
+```
+
+The helper writes the deprecated compatibility strategy `trailing_grid_v7`;
+it does not translate the config into the new `trailing_martingale` strategy.
+If unsupported or ambiguous fields require manual review, the command returns
+nonzero and does not write the output config unless
+`--allow-manual-review-output` is explicitly supplied. Review the report and
+backtest the result before considering a live run. New configs and new
+optimization work should start from
+`configs/examples/default_trailing_martingale_long.json`.
 
 ### Step 1: Clone the Repository
 
@@ -134,7 +163,7 @@ To start the bot with the default settings, run:
 passivbot live -u {account_name_from_api-keys.json}
 ```
 
-or make a new configuration file, using `configs/examples/default_trailing_grid_long_npos7.json` as a starting point, and start the bot with:
+or make a new configuration file, using `configs/examples/default_trailing_martingale_long.json` as a starting point, and start the bot with:
 
 
 ```sh
@@ -145,13 +174,13 @@ Legacy direct-script entrypoints such as `python3 src/main.py ...`, `python3 src
 and `python3 src/optimize.py ...` still work unchanged for backwards compatibility.
 
 The canonical hardcoded defaults live in `src/config/schema.py`. The example config
-`configs/examples/default_trailing_grid_long_npos7.json` mirrors that default profile exactly, so
+`configs/examples/default_trailing_martingale_long.json` mirrors that default profile exactly, so
 copying it is the recommended starting point for new configs.
 
 ### Logging
 
 Passivbot uses Python's logging module throughout the bot, backtester, and supporting tools.  
-- Use `--debug-level {0-3}` (alias `--log-level`) on `passivbot live` or `passivbot backtest` to adjust verbosity at runtime: `0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`.  
+- Use `--log-level {warning|info|debug|trace}` or `--log-level {0-3}` on `passivbot live` or `passivbot backtest` to adjust verbosity at runtime: `0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`.
 - Use `--verbose` on `passivbot live` to force debug logging (`--log-level debug`).  
 - Persist a default by adding a top-level section to your config: `"logging": {"level": 2}`. The CLI flag always overrides the config value for that run.
 - `passivbot live` now writes a timestamped logfile under `logs/` by default and refreshes `logs/{user}.log` as a stable alias to the current run. Control this with `config.logging.persist_to_file`, `config.logging.dir`, and the optional rotation settings in `config.logging`.

@@ -3,20 +3,34 @@ mod backtest;
 mod closes;
 mod coin_selection;
 mod constants;
+mod dynamic;
 mod entries;
 mod equity_hard_stop_loss;
 mod orchestrator;
 mod python;
 mod risk;
+mod strategies;
 mod trailing;
 mod types;
 mod utils;
 
 use coin_selection::{select_coin_indices_py, select_forager_candidates_py};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3::wrap_pyfunction;
 use python::*;
 use utils::*;
+
+#[pyfunction]
+fn runtime_build_info(py: Python<'_>) -> PyResult<PyObject> {
+    let info = PyDict::new_bound(py);
+    info.set_item("crate_version", env!("CARGO_PKG_VERSION"))?;
+    info.set_item(
+        "source_fingerprint",
+        option_env!("PASSIVBOT_RUST_SOURCE_FINGERPRINT").unwrap_or("unknown"),
+    )?;
+    Ok(info.into())
+}
 
 /// A Python module implemented in Rust.
 #[pymodule]
@@ -24,6 +38,7 @@ fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HlcvsBundlePy>()?;
     m.add_class::<EquityHardStopRollingPeakPy>()?;
     m.add_class::<EquityHardStopRuntimePy>()?;
+    m.add_function(wrap_pyfunction!(runtime_build_info, m)?)?;
     m.add_function(wrap_pyfunction!(round_, m)?)?;
     m.add_function(wrap_pyfunction!(round_up, m)?)?;
     m.add_function(wrap_pyfunction!(round_dn, m)?)?;
@@ -38,6 +53,11 @@ fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(calc_wallet_exposure, m)?)?;
     m.add_function(wrap_pyfunction!(calc_new_psize_pprice, m)?)?;
     m.add_function(wrap_pyfunction!(calc_next_entry_long_py, m)?)?;
+    m.add_function(wrap_pyfunction!(calc_trailing_grid_v7_diagnostic_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        calc_trailing_martingale_close_diagnostic_py,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(calc_next_close_long_py, m)?)?;
     m.add_function(wrap_pyfunction!(calc_entries_long_py, m)?)?;
     m.add_function(wrap_pyfunction!(calc_next_entry_short_py, m)?)?;
@@ -60,13 +80,19 @@ fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(order_type_snake_to_id, m)?)?;
     m.add_function(wrap_pyfunction!(get_order_id_type_from_string_alias, m)?)?;
     m.add_function(wrap_pyfunction!(compute_ideal_orders_json, m)?)?;
+    m.add_function(wrap_pyfunction!(get_strategy_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(get_strategy_kinds, m)?)?;
     m.add_function(wrap_pyfunction!(gate_entries_by_twel_py, m)?)?;
     m.add_function(wrap_pyfunction!(calc_unstucking_close_py, m)?)?;
     m.add_function(wrap_pyfunction!(trailing_bundle_default_py, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_no_restart_triggered, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_coin_drawdown_signal, m)?)?;
+    m.add_function(wrap_pyfunction!(hsl_red_episode_finalization, m)?)?;
     m.add_function(wrap_pyfunction!(update_trailing_bundle_py, m)?)?;
     m.add_function(wrap_pyfunction!(equity_hard_stop_step_py, m)?)?;
     m.add_function(wrap_pyfunction!(select_coin_indices_py, m)?)?;
     m.add_function(wrap_pyfunction!(select_forager_candidates_py, m)?)?;
+    m.add_function(wrap_pyfunction!(calc_ema_anchor_quote_series_py, m)?)?;
 
     Ok(())
 }

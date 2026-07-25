@@ -5,7 +5,7 @@ import ccxt.pro as ccxt_pro
 import ccxt.async_support as ccxt_async
 import asyncio
 import passivbot_rust as pbr
-from utils import ts_to_date, utc_ms
+from utils import symbol_to_coin, ts_to_date, utc_ms
 from procedures import assert_correct_ccxt_version
 from collections import defaultdict
 import hmac
@@ -166,20 +166,23 @@ class KucoinBot(CCXTBot):
         return
 
     def _get_position_side_for_order(self, order: dict) -> str:
-        """KuCoin: Derive position_side from position state."""
-        return self.determine_pos_side(order)
+        """KuCoin: require durable open-order metadata, never current position state."""
+        if not bool(
+            getattr(self, "_config_hedge_mode", True)
+            and getattr(self, "hedge_mode", True)
+        ):
+            return self._normalize_one_way_position_side(order)
+        explicit = order.get("position_side")
+        if explicit is None:
+            info = order.get("info", {}) or {}
+            explicit = info.get("positionSide") or info.get("posSide")
+        if explicit is not None and str(explicit).lower() in {"long", "short"}:
+            return str(explicit).lower()
+        raise ValueError("KuCoin open order missing durable long/short attribution")
 
     def determine_pos_side(self, order):
-        # non hedge mode
-        if self.has_position("long", order["symbol"]):
-            return "long"
-        elif self.has_position("short", order["symbol"]):
-            return "short"
-        elif order["side"] == "buy":
-            return "long"
-        elif order["side"] == "sell":
-            return "short"
-        raise Exception(f"unknown side {order['side']}")
+        """Compatibility route for the authoritative open-order attribution hook."""
+        return self._get_position_side_for_order(order)
 
     async def _do_fetch_open_orders(self, symbol: str = None) -> list:
         """KuCoin: Fetch open orders with pagination.
@@ -221,6 +224,64 @@ class KucoinBot(CCXTBot):
         fetched = await self._do_fetch_open_orders(symbol=symbol)
         return self._normalize_open_orders(fetched)
 
+    @staticmethod
+    def _coerce_positive_ticker_price(value) -> float | None:
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0.0 else None
+
+    def _normalize_tickers(self, fetched: dict) -> dict:
+        """Normalize KuCoin futures tickers with an explicit last-price fallback.
+
+        KuCoin futures CCXT ticker payloads commonly include `last`/`close` but no
+        bid/ask.  The staged market snapshot path requires bid/ask/last, so this
+        exchange-scoped fallback labels the synthetic top-of-book source instead
+        of letting the generic provider fabricate values silently.
+        """
+        tickers = {}
+        fallback_symbols = []
+        for symbol, data in fetched.items():
+            if symbol not in self.markets_dict or not isinstance(data, dict):
+                continue
+            info = data.get("info") if isinstance(data.get("info"), dict) else {}
+            last = (
+                self._coerce_positive_ticker_price(data.get("last"))
+                or self._coerce_positive_ticker_price(data.get("close"))
+                or self._coerce_positive_ticker_price(data.get("markPrice"))
+                or self._coerce_positive_ticker_price(info.get("lastTradePrice"))
+                or self._coerce_positive_ticker_price(info.get("markPrice"))
+                or self._coerce_positive_ticker_price(info.get("indexPrice"))
+            )
+            bid = self._coerce_positive_ticker_price(data.get("bid"))
+            ask = self._coerce_positive_ticker_price(data.get("ask"))
+            source = "kucoin_ccxt_ticker"
+            if (bid is None or ask is None) and last is not None:
+                bid = last
+                ask = last
+                source = "kucoin_last_fallback"
+                fallback_symbols.append(symbol)
+            if last is None or bid is None or ask is None:
+                continue
+            tickers[symbol] = {
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "timestamp": data.get("timestamp"),
+                "source": source,
+            }
+        if fallback_symbols:
+            now_ms = utc_ms()
+            last_log_ms = int(getattr(self, "_kucoin_ticker_fallback_log_ms", 0) or 0)
+            if now_ms - last_log_ms >= 60 * 60 * 1000:
+                logging.warning(
+                    "[market] kucoin ticker bid/ask missing; using last as bid=ask | symbols=%s",
+                    ",".join(symbol_to_coin(symbol) for symbol in fallback_symbols[:12]),
+                )
+                self._kucoin_ticker_fallback_log_ms = now_ms
+        return tickers
+
     def _get_balance(self, fetched: dict) -> float:
         """KuCoin uses marginBalance in info.data."""
         return float(fetched["info"]["data"]["marginBalance"])
@@ -228,11 +289,17 @@ class KucoinBot(CCXTBot):
     async def calc_ideal_orders(self):
         # KuCoin enforces a 150 open-order cap; keep only the closest price targets.
         ideal_orders = await super().calc_ideal_orders()
+        market_prices = await self._get_live_last_prices(
+            ideal_orders.keys(),
+            max_age_ms=10_000,
+            context="kucoin_order_cap_sort",
+            allow_completed_candle_fallback=True,
+        )
         flattened = []
         for symbol, orders in ideal_orders.items():
             if not orders:
                 continue
-            market_price = await self.cm.get_current_close(symbol, max_age_ms=10_000)
+            market_price = market_prices[symbol]
             for order in orders:
                 price_diff = calc_order_price_diff(order["side"], order["price"], market_price)
                 flattened.append((price_diff, symbol, order))
@@ -376,13 +443,15 @@ class KucoinBot(CCXTBot):
                 matches.append((p, best_match))
                 timedelta = best_match["timestamp"] - p["lastUpdateTimestamp"]
                 if timedelta > 1000:
+                    log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
                     logging.debug(
-                        f"best match fill and pos close {symbol} timedelta>1000ms: {best_match['timestamp'] - p['lastUpdateTimestamp']}ms"
+                        f"best match fill and pos close {log_symbol} timedelta>1000ms: {best_match['timestamp'] - p['lastUpdateTimestamp']}ms"
                     )
                 seen_trade_id.add(best_match["id"])
             if len(phd[symbol]) != len(cld[symbol]):
+                log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
                 logging.debug(
-                    f"len mismatch between closes and positions_history for {symbol}: {len(cld[symbol])} {len(phd[symbol])}"
+                    f"len mismatch between closes and positions_history for {log_symbol}: {len(cld[symbol])} {len(phd[symbol])}"
                 )
         # add pnls, dedup and return
         deduped = {}
@@ -452,15 +521,23 @@ class KucoinBot(CCXTBot):
             # Hedge mode enabled so both long/short can coexist.
             if hasattr(self.cca, "set_position_mode"):
                 res = await self.cca.set_position_mode(True)
-                logging.info(f"set_position_mode hedged=True {res}")
+                logging.info(
+                    "[config] set_position_mode hedged=True result=%s",
+                    format_exchange_config_response(res),
+                )
             else:
-                logging.info("set_position_mode not supported by current KuCoin client; continuing")
+                raise NotImplementedError("set_position_mode not supported by current KuCoin client")
         except Exception as e:
-            logging.warning(f"set_position_mode hedged=True not applied: {e}")
+            logging.error(
+                "[config] set_position_mode hedged=True not applied | %s",
+                self._format_exchange_config_error(e),
+            )
+            raise
 
     async def update_exchange_config_by_symbols(self, symbols):
         coros_to_call = []
         for symbol in symbols:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             try:
                 margin_mode = self._get_margin_mode_for_symbol(symbol)
                 params = {
@@ -475,39 +552,63 @@ class KucoinBot(CCXTBot):
                     )
                 )
             except Exception as e:
-                logging.warning(f"{symbol}: error set_margin_mode {e}")
+                logging.warning(
+                    "[config] %s set_margin_mode task creation failed | %s",
+                    log_symbol,
+                    self._format_exchange_config_error(e),
+                )
         for symbol, task_name, task in coros_to_call:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             res = None
             to_print = ""
             try:
                 res = await task
                 to_print += f"{task_name}={format_exchange_config_response(res)}"
             except Exception as e:
-                logging.warning(f"{symbol} error {task_name} {e}")
+                logging.warning(
+                    "[config] %s %s failed | %s",
+                    log_symbol,
+                    task_name,
+                    self._format_exchange_config_error(e),
+                )
             if to_print:
-                logging.info(f"{symbol}: {to_print}")
+                logging.info(f"{log_symbol}: {to_print}")
 
         coros_to_call = []
         for symbol in symbols:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             try:
                 margin_mode = self._get_margin_mode_for_symbol(symbol)
+                leverage = self._calc_leverage_for_symbol(symbol)
                 params = {
-                    "leverage": self._calc_leverage_for_symbol(symbol),
+                    "leverage": leverage,
                     "symbol": symbol,
                     "params": {"marginMode": margin_mode},
                 }
                 coros_to_call.append(
                     (symbol, "set_leverage", asyncio.create_task(self.cca.set_leverage(**params)))
                 )
+            except ValueError:
+                raise
             except Exception as e:
-                logging.warning(f"{symbol}: error set_leverage {e}")
+                logging.warning(
+                    "[config] %s set_leverage task creation failed | %s",
+                    log_symbol,
+                    self._format_exchange_config_error(e),
+                )
         for symbol, task_name, task in coros_to_call:
+            log_symbol = symbol_to_coin(symbol, verbose=False) or symbol
             res = None
             to_print = ""
             try:
                 res = await task
                 to_print += f"{task_name}={format_exchange_config_response(res)}"
             except Exception as e:
-                logging.warning(f"{symbol} error {task_name} {e}")
+                logging.warning(
+                    "[config] %s %s failed | %s",
+                    log_symbol,
+                    task_name,
+                    self._format_exchange_config_error(e),
+                )
             if to_print:
-                logging.info(f"{symbol}: {to_print}")
+                logging.info(f"{log_symbol}: {to_print}")

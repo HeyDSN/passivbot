@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
 
     Fore = _Dummy()
 from prettytable import PrettyTable
+from config.shared_bot import flatten_shared_bot_side
 from config.pnl_lookback import parse_pnls_max_lookback_days
 from config_utils import dump_config
 from utils import make_get_filepath
@@ -742,6 +743,55 @@ def plot_fills_forager(
     return plt
 
 
+def create_strategy_equity_drawdown_figure(
+    bal_eq: pd.DataFrame,
+    figsize=(21, 8),
+    *,
+    autoplot: bool | None = None,
+    return_figures: bool | None = None,
+) -> dict:
+    figures: dict = {}
+    if "strategy_equity" not in bal_eq.columns:
+        return figures
+
+    strategy_eq = pd.to_numeric(bal_eq["strategy_equity"], errors="coerce")
+    if not strategy_eq.notna().any():
+        return figures
+
+    peak_strategy_eq = strategy_eq.cummax()
+    drawdown = (peak_strategy_eq - strategy_eq) / peak_strategy_eq
+
+    autoplot = (_ipy_display is not None) if autoplot is None else autoplot
+    if return_figures is None:
+        return_figures = not autoplot
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    x = bal_eq.index.to_numpy()
+    drawdown_values = drawdown.to_numpy()
+    ax.fill_between(x, 0.0, drawdown_values, alpha=0.25, color="tab:red")
+    ax.plot(x, drawdown_values, linewidth=1.0, color="tab:red")
+    ax.set_title("Strategy Equity Drawdown")
+    ax.set_ylabel("Drawdown")
+    ax.set_xlabel("Time")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+
+    if return_figures:
+        figures["drawdown"] = fig
+    if autoplot:
+        if _ipy_display is not None:
+            _ipy_display(fig)
+        else:  # pragma: no cover
+            try:
+                fig.show()
+            except Exception:
+                pass
+    if not return_figures:
+        plt.close(fig)
+
+    return figures if return_figures else {}
+
+
 def create_forager_balance_figures(
     bal_eq: pd.DataFrame,
     figsize=(21, 13),
@@ -838,6 +888,15 @@ def create_forager_balance_figures(
                     pass
         if not return_figures:
             plt.close(fig)
+
+    figures.update(
+        create_strategy_equity_drawdown_figure(
+            df,
+            figsize=(figsize[0], 8),
+            autoplot=autoplot,
+            return_figures=return_figures,
+        )
+    )
 
     return figures if return_figures else {}
 
@@ -979,7 +1038,7 @@ def create_forager_hard_stop_drawdown_figure(
 
     def _resolve_pside_cfg(pside: str) -> dict:
         bot = ((config or {}).get("bot") or {})
-        pside_cfg = bot.get(pside) or {}
+        pside_cfg = flatten_shared_bot_side(bot.get(pside) or {})
         if not isinstance(pside_cfg, dict):
             return {}
         twel = float(pside_cfg.get("total_wallet_exposure_limit", 0.0) or 0.0)
@@ -1016,6 +1075,9 @@ def create_forager_hard_stop_drawdown_figure(
     autoplot = (_ipy_display is not None) if autoplot is None else autoplot
     if return_figures is None:
         return_figures = not autoplot
+    hsl_signal_mode = str(
+        (((config or {}).get("live") or {}).get("hsl_signal_mode", "coin") or "coin")
+    ).strip().lower()
 
     pside_cfgs = {
         pside: _resolve_pside_cfg(pside)
@@ -1163,6 +1225,13 @@ def create_forager_hard_stop_drawdown_figure(
     threshold_colors = {"yellow": "#d4a017", "orange": "#d95f02", "red": "#b22222"}
     multiple_sides = len(side_order) > 1
 
+    def _drawdown_title(pside: str) -> str:
+        if hsl_signal_mode == "coin":
+            return f"{pside.capitalize()} Coin HSL Max Drawdown"
+        if multiple_sides:
+            return f"{pside.capitalize()} Equity Hard Stop Drawdown"
+        return "Equity Hard Stop Drawdown"
+
     for side_idx, pside in enumerate(side_order):
         series = series_by_side[pside]
         x = series["trace"].index.to_numpy()
@@ -1216,12 +1285,8 @@ def create_forager_hard_stop_drawdown_figure(
             alpha=0.75,
             label="RED Threshold",
         )
-        drawdown_ax.set_title(
-            f"{pside.capitalize()} Equity Hard Stop Drawdown"
-            if multiple_sides
-            else "Equity Hard Stop Drawdown"
-        )
-        drawdown_ax.set_ylabel("Drawdown")
+        drawdown_ax.set_title(_drawdown_title(pside))
+        drawdown_ax.set_ylabel("Max Coin Drawdown" if hsl_signal_mode == "coin" else "Drawdown")
         drawdown_ax.grid(True, linestyle="--", alpha=0.3)
         drawdown_ax.legend(loc="upper left", ncol=3)
 

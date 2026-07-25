@@ -4,8 +4,2427 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Backtests now treat a finite balance depleted by fills as liquidation before recomputing orders,
+  so extreme optimizer candidates terminate normally instead of panicking an optimizer worker.
+  Other invalid orchestrator inputs now propagate as backtest errors without unwinding Rust.
+
+- Bybit closed-PnL refreshes now cover requested history with explicit,
+  contiguous sub-seven-day windows and cursor pagination inside each window.
+  Sparse pages no longer create gaps in older realized-PnL history, and endpoint
+  or pagination failures propagate instead of returning a partial result as a
+  successful refresh.
+
+- Unexpected PyMoo worker failures and process exits now abort optimization visibly instead of
+  leaving the optimizer polling forever for a lost result.
+
+- Live candle orchestration now reads bounded cache-only native 1h EMA carry-forward from the 1h
+  index, requires a complete native window, isolates carried values from the active EMA cache, and
+  applies the background refresher's surface-count staleness limit using the active live/replay
+  clock. A minute-boundary open-tail projection is also retried before reusing a previous close
+  EMA, avoiding transient candidate drops and unnecessary close-EMA fallback on WEEX and other
+  exchanges without weakening active-symbol fail-closed behavior.
+
+- Optimizer suites may set `optimize.objective_scenario` (or
+  `--objective-scenario LABEL`) to score performance objectives on one named scenario while
+  continuing to enforce limits against configured suite aggregates. Suite scenario labels must
+  now be unique. Dataset preparation restricts exchange-specific preloads to the union of
+  explicitly requested scenario coins when every assigned scenario names its coins. Resume
+  validation rejects objective-scenario changes, including old results that predate the setting.
+
+- `passivbot tool crash-finder` can discover ordered low-to-later-high pumps as well as
+  high-to-later-low crashes via `--direction up|both`. Generated idiosyncratic stress scenarios
+  may use `--scenario-force-normal adverse` to isolate long exposure during crashes and short
+  exposure during pumps. CSV regeneration preserves all stored directions unless explicitly
+  filtered with `--direction`.
+
+- Canonical live-event payloads now make a bounded JSON-compatible copy at construction time,
+  revalidate that copy at persistence boundaries, redact sensitive keys before retention, and
+  record aggregate truncation metadata only when a limit applies. Event identity, routing, monitor
+  envelope structure, and trading behavior are unchanged; legacy direct monitor history, order,
+  and raw-fill storage remain outside this payload boundary.
+
+- Event-bus degradation diagnostics now retain bounded exception types and canonical dropped-event
+  labels only. Sink isolation, queue behavior, counters for registered events, timing, return
+  values, event routing, and trading behavior are unchanged.
+
+- Failed Rust-orchestrator return events now retain bounded exception types instead of persisted
+  exception text. Existing timing and correlation metadata, event delivery, orchestration, and
+  trading behavior are unchanged.
+
+- Executor churn-admission and fresh-entry eligibility diagnostics now retain bounded exception
+  types only. Existing admission/defer reasons, batch limits, fail-closed behavior, trace handling,
+  event delivery isolation, scheduling, and trading behavior are unchanged.
+
+- Ambiguous create diagnostics now retain bounded exception types only. Existing ambiguous
+  bookkeeping, restart behavior, acknowledgement handling, event emission, and trading behavior
+  are unchanged.
+
+- Executor cancellation-priority/capacity and create/cancel acknowledgement diagnostics now
+  retain bounded exception types only. Existing priority fallback, emitter isolation,
+  acknowledgement/confirmation, and trading behavior are unchanged.
+
+- Terminal and ambiguous execution-order events now retain bounded exception types instead of
+  persisted exception text. Existing envelope correlation, result summaries, debug profiles,
+  routing, executor behavior, exchange calls, and trading behavior are unchanged.
+
+- Exchange-configuration refresh failure events now retain bounded exception types instead of
+  exception text. Periodic and connector-local payloads continue to preserve their existing
+  outcome and response metadata, best-effort delivery, and configuration control flow.
+
+- Candle disk-load and persistence observer diagnostics now retain only code-owned stages, bounded
+  exception types, and stable control-flow actions. Monitor persistence and cache-flush reporting
+  remain independently best-effort; callback ordering, throttling, completed disk persistence/load
+  behavior, event schemas, and trading behavior are unchanged.
+
+- Startup monitor-publisher and live-event-pipeline installation diagnostics now retain bounded
+  exception types and stable continuation actions without exception messages, unsafe class names,
+  URLs, credentials, tokens, or tracebacks. Monitor enablement, pipeline installation, startup
+  continuation, and trading behavior are unchanged.
+
+- Order-sort market-price fetch failure diagnostics now retain bounded symbol context, a bounded
+  exception type, and the stable `preserve_original_order` action. The existing empty-price
+  fallback, original-order preservation, reconciliation, planning, and trading behavior are
+  unchanged.
+
+- Approved/ignored coin-list refresh failure diagnostics now retain only a bounded exception type
+  and the stable `return_from_coin_list_refresh` action. Existing refresh return, list/universe and
+  eligibility update semantics, scheduling, risk, HSL, and trading behavior are unchanged.
+
+- Unrealized-PnL aggregation failure diagnostics now retain only a bounded exception type and the
+  stable `return_zero` action. The existing immediate `0.0` fallback, price fetching, balance and
+  equity handling, scheduling, risk, HSL, and trading behavior are unchanged.
+
+- Shared live diagnostic-event fallback and diagnostic-step failures now log only their stable
+  context and a bounded exception type. Their existing return values, isolation, routing, retry,
+  scheduling, and trading behavior are unchanged.
+
+- HSL history-replay candle-fetch and passive cache-observer diagnostics now retain bounded
+  exception types only. Candle fallback and degraded replay outputs, retries, cache behavior, and
+  trading state are unchanged.
+
+- Reconciliation diagnostics for trace recording, order-churn evidence, and malformed open-order
+  snapshots now retain only bounded exception types. This diagnostic-only redaction does not change
+  order planning, churn availability, malformed-order guardrails, or exchange-action gating.
+
+- Foreign-writer safety shutdown diagnostics now retain only bounded maintainer-cleanup failure
+  types and a stable continuation action. Stop flags, cleanup invocation, and terminal
+  foreign-writer stop behavior are unchanged.
+
+- Redact observer-only balance and position refresh diagnostic fallbacks, including their shared
+  market-snapshot structured and legacy projections, while preserving existing refresh
+  continuation behavior.
+
+- State-refresh position-change and progress-observer fallback diagnostics now retain only bounded
+  exception types and stable actions. Balance handling, cancellation propagation, staged refresh
+  cleanup, timing, fallback values, and event schemas are unchanged.
+
+- Market-snapshot provider primary-fetch, missing-symbol retry, cache-sink, fallback, pre-create
+  gate, event-emitter, and eligibility-trace diagnostics now retain only bounded exception types and
+  stable actions. Snapshot fallback order, fail-closed order filtering, block attribution, cache-sink
+  suppression, trace isolation, and exception cause chaining are unchanged.
+
+- Hourly candle disk-audit, maintenance-cycle, and exchange-config event-emitter fallback
+  diagnostics now retain only bounded exception types. Audit continuation, maintenance retry,
+  market refresh, and exchange-config result behavior are unchanged.
+
+- HSL replay cache and replay-lifecycle diagnostics now retain bounded exception types without
+  exception messages, tracebacks, or unsafe exception class names. Cache write failures remain
+  nonfatal, cache reuse still falls back to authoritative replay, and HSL readiness and protection
+  behavior are unchanged.
+
+- Fixed Bitget UTA open-order normalization recursively deriving position side from close-only
+  effect and close-only effect from position side in effective one-way mode. UTA orders with an
+  explicit `posSide` now derive close-only effect directly from the authoritative `side` plus
+  `posSide` tuple.
+- Fixed multi-collateral quote-value movement continuously resetting live order-churn evidence.
+  The account epoch now follows the hysteresis-snapped sizing balance plus authoritative fills,
+  realized PnL, positions, and Rust-reported risk-phase transitions instead of exact raw
+  quote-valued balance. While a Rust risk-critical order or realized-loss block is active, churn
+  admission cannot defer any order for that symbol and position side.
+- Fixed live order-churn evidence treating the execution loop's normal 30-second scheduled wait as
+  a provenance gap, which could prevent the account-wide churn gate from activating for slowly
+  moving EMA-based orders.
+- Fixed WEEX V3 live reconciliation rejecting valid `COMBINED`-mode close orders when the response
+  reported `reduceOnly=false`; WEEX close-only effect now follows its authoritative `side` plus
+  `positionSide` action tuple. WEEX account equity is also normalized to realized wallet balance by
+  excluding unrealized PnL, restoring live/backtest risk-input parity and preventing mark-to-market
+  churn-history resets. Runtime forager/mode/list changes now invalidate churn evidence only for the
+  affected symbol, so a rotating empty forager slot cannot erase unrelated history account-wide.
+  Repeated unchanged churn deferrals and history-reset diagnostics now remain durable in structured
+  events while INFO output is summarized at most every five minutes.
+- Configs using the retired `live.initial_entry_exec_max_market_dist_pct` now migrate automatically
+  to the account-wide replacement-churn gate. Positive values preserve the market-distance
+  threshold and hydrate the other new settings from canonical defaults; null and non-positive values
+  preserve the old disabled intent through `order_replacement_churn_gate_activation_count = 0`.
+  Explicit conflicting old and new settings still fail for manual resolution. This compatibility
+  applies to V8 config shapes; legacy `pb_multi` input remains unsupported.
+- Replaced the initial-entry-only market-distance posting gate with a strategy-agnostic,
+  account-wide Rust-ideal churn-evidence gate. Moving distant entries and closes may be deferred
+  after sustained create traffic, while market, risk-critical, and near-market orders remain
+  allowance-exempt. On audited supported connectors, stale actual orders are removed in managed
+  modes, malformed account-critical open-order snapshots block exchange writes, and any
+  cancellation forces full authoritative refresh and Rust replanning before non-panic creation.
+  One-way position-side and native close-only normalization is now deterministic across the
+  supported connectors, including OKX long/short mode, KuCoin open orders, and Gate.io's native
+  `is_reduce_only` field. Supported hedge-mode adapters no longer substitute client-order metadata
+  for a missing exchange-native position side, and untrusted Hyperliquid WebSocket order rows
+  trigger authoritative account-state refresh instead of reconnect churn. Hyperliquid admission
+  reserves required signed configuration actions with creates, and churn distance is rechecked from
+  a forced-fresh market read after configuration before any create call. A downstream churn
+  normalization failure now blocks account-wide non-panic creation when the affected symbol still
+  has actual orders or an authoritative nonzero position, while preserving only the dedicated
+  reduce-only market panic path. Missing or malformed position sides block every exchange write.
+  Hyperliquid carries ambiguous signed-action debits across `userRateLimit` refreshes, preventing
+  overlapping requests from overstating available action headroom, and failed required margin-mode
+  writes now leave dependent creates pending instead of marking the symbol configured.
+- Protective reducer arbitration now keeps the largest loss-admissible final absolute
+  reduction among active panic, TWEL/WEL auto-reduce, and auto-unstuck intents for each position
+  instead of using a fixed type priority or summing quantities. If the realized-loss gate blocks
+  the largest non-panic intent, Passivbot tries the next-largest intent before giving up protective
+  reduction. Equal-size ties keep panic first and otherwise prefer the closest-to-fill candidate,
+  so a tiny auto-reduce can no longer suppress a materially larger unstuck close. Reducer sizing is
+  finalized before its loss is checked, and a shared batch loss allowance is spent on finalized
+  reducers largest-first rather than in symbol iteration order.
+- Non-panic protective reducers may now coexist with compatible ordinary grid, trailing, or
+  EMA-anchor closes for the same position. Passivbot still selects only one protective reducer,
+  keeps panic close exclusive, reserves reducer quantity before trimming ordinary closes, and caps
+  aggregate reduce-only quantity to the position in Rust planning and live reconciliation. The
+  realized-loss gate evaluates the selected reducer first. This restores simultaneous unstuck plus
+  trailing close behavior for `trailing_grid_v7` without a strategy-specific exemption.
+
+- `trailing_grid_v7` with zero entry cooldown now preserves v7's simultaneous grid-entry ladder
+  when a later trailing leg uses retracement. Positive entry cooldowns and canonical
+  `trailing_martingale` retracement staging remain unchanged.
+
+- Shutdown-stage failure diagnostics now retain bounded exception types alongside existing stage,
+  task-count, timeout, and elapsed-time context without arbitrary exception messages, request URLs,
+  response text, or credentials. Event-delivery and event-pipeline-close fallback logs use the
+  same classification, as do per-maintainer cancellation and legacy cleanup failures.
+  Maintainer cancellation, execution-loop waits, session closing, shutdown timing, and process
+  control are unchanged.
+
+- Candle remote-fetch callbacks, HLCV progress logs, archive fetch/day diagnostics, structured
+  remote-call events, and fake-live candle traces now retain bounded exception types, URL hashes,
+  parameter keys, stage, attempt, timing, and correlation without arbitrary exception messages,
+  request URLs, or request-parameter values. Fetches, retry/backoff and rate-limit classification,
+  archive availability, cache behavior, and trading behavior are unchanged.
+
+- Local candle migration, cleanup, lock, index, disk/cache, health, inception-metadata, and
+  deferred-index diagnostics now retain bounded exception types without arbitrary exception
+  messages, repr values, or exception-value tracebacks. Cache contents, migration and cleanup
+  behavior, lock handling, retries, fallbacks, and trading behavior are unchanged.
+
+- Live candle completed-close fallback, startup/index/background warmup, forager refresh, active
+  refresh, and refresh-cap diagnostics now retain bounded exception types without arbitrary
+  exception messages or exception-value tracebacks. Warmup, cancellation, lock retry, refresh
+  scheduling, fallback values, readiness, and trading behavior are unchanged.
+
+- Live candle health-window, health-summary, trailing-fetch, freshness-readiness, and tail-gap
+  diagnostics now retain bounded exception types without arbitrary exception messages. Health
+  fallbacks, symbol/position-side availability, trailing deferral, readiness results, and trading
+  behavior are unchanged.
+
+- Fill-history refresh failure diagnostics now retain bounded exception types alongside existing
+  source, coverage, retry, timing, count, and endpoint context without arbitrary exception
+  messages or exception-value tracebacks. This includes exchange-specific fill fetchers, cache
+  reads and doctor repair, staged remote-call events, startup/process handling, HSL flatten
+  confirmation, and direct refresh callers. Validated numeric status/code and code-owned endpoint
+  labels remain available. Publication and time-sync classification cannot replace the original
+  refresh failure through hostile exception metadata, and wrapped timestamp failures remain
+  recoverable through a bounded cause/context graph check. Code-owned recovery markers are scanned
+  across complete exception text using bounded temporary chunks, preserving existing retry
+  classification and caller-specific marker case rules without retaining that text. Legacy
+  class-name recovery markers are inspected without projecting untrusted names. Exception
+  propagation, fill accounting, refresh cadence, planning, risk, and trading behavior are unchanged.
+
+- Best-effort live event emitter failure diagnostics, including HSL event emitters and the
+  event-adjacent HSL coin-status human-log fallback, now retain bounded exception types instead of
+  arbitrary exception messages that may contain request URLs, response text, or credentials.
+  Event payloads, routing, sink isolation, retries, HSL behavior, and trading behavior are
+  unchanged.
+
+- Legacy monitor error events and WebSocket reconnect diagnostics now retain bounded exception
+  classifications without arbitrary exception messages, request URLs, response text, or formatted
+  exception-value tracebacks. Monitor error context is restricted to known code-owned
+  classifications, and reconnect DEBUG output retains only bounded stack depth rather than frame
+  labels or line values. Reconnect cadence, retry behavior, monitor persistence, and trading
+  behavior are unchanged.
+
+- The `ema.unavailable` and `ema.fallback_used` events and their dedicated legacy summaries now
+  retain only code-owned reason classifications, bounded EMA/error types, symbols, spans, ages,
+  and counts. Malformed typed values are normalized or omitted, adjacent EMA failure logs retain
+  only exception type, and a bounded legacy warning remains when the structured event was not
+  emitted. These paths no longer retain arbitrary exception or fallback-reason text; EMA
+  calculation, fallback selection, candidate availability, and trading behavior are unchanged.
+
+- Noncritical market-snapshot diagnostic skips now use the existing
+  `market.snapshot_diagnostic_skipped` event as the sole normal warning when the structured console
+  is available. The bounded event and legacy fallback retain only stable context and exception type;
+  position/balance refresh behavior is unchanged, and arbitrary exception text is no longer stored
+  or projected.
+
+- Pre-create planning and market-snapshot skips now use the existing
+  `execution.create_skipped` event as the sole normal warning when the structured console is
+  available. The bounded event retains the stable reason, stage, count, symbols, and exception
+  type without raw exception text; the legacy warning remains a fallback, and create filtering is
+  unchanged.
+
+- Large open-order snapshot deltas now emit one bounded `open_orders.snapshot_delta` INFO event per
+  added or removed direction, with only the direction and order count. The event reaches structured,
+  monitor, console, and text sinks with the `[order]` tag; reconciliation and order behavior are
+  unchanged, and a bounded legacy INFO fallback remains when the structured console is unavailable.
+
+- Incident bundle manifest and command-result summaries now retain the
+  embedded live smoke report's text-log `scan_cost` metadata. The archive's
+  full smoke report, log reads, matching, redaction, filtering, verdicts,
+  exchange access, and live behavior are unchanged.
+
+- `live-smoke-report` log scans now include bounded `scan_cost` metadata in
+  full, summary, and brief output. The metadata reports elapsed time,
+  successfully read files and selected tail lines, read methods, and known
+  physical-versus-decoded bytes without changing log discovery, sequential
+  reads, matching, redaction, window filtering, smoke verdicts, exchange
+  access, or live behavior.
+
+- Incident bundles now include bounded `scan_cost` metadata for their
+  independent time-window event scan in the full report, manifest, and command
+  result. The metadata uses the same elapsed-time, successful file/record,
+  read-method, and physical-versus-decoded byte contract as the other live
+  artifact reports; event matching, truncation, archive contents, verdicts,
+  exchange access, and live behavior are unchanged.
+
+- `live-smoke-report` now includes bounded monitor `scan_cost` metadata in
+  full, summary, and brief output, matching the elapsed time, successfully
+  read files and records, read methods, and physical-versus-decoded byte
+  semantics exposed by the event query and performance report. This is
+  diagnostic-only and does not change smoke verdicts, event selection,
+  parsing, logs, process inspection, exchange access, or live behavior.
+
+- `live-event-query` and `live-performance-report` now include bounded
+  `scan_cost` metadata for elapsed artifact-scan time, successfully read files
+  and records, read methods, and physical versus decoded byte totals. Explicit
+  known flags prevent failed or unmeasurable reads from appearing complete;
+  query selection, results, monitor data, exchange access, and live behavior
+  are unchanged.
+
+- EMA Anchor live monitor snapshots now mark trailing diagnostics as not
+  applicable instead of requesting unrelated trailing-martingale parameters
+  and repeatedly failing snapshot publication. The trailing diagnostics tool
+  rejects snapshots that explicitly mark those diagnostics unsupported unless
+  the operator selects explicit wizard mode.
+
+- Gate.io live startup now selects CCXT 4.5.66's `gate` REST and WebSocket
+  clients at session construction while retaining canonical `gateio` identity
+  for user-facing configuration, market settings, caches, and logs.
+
+- Window-bounded live smoke collection now accepts a monitor with only
+  `current.ndjson` when the bounded monitor manifest proves that segment covers
+  the requested window start; missing or invalid coverage evidence still fails
+  closed.
+
+- Generic staged balance refreshes now retain the actual exchange response for
+  account data-packet provenance while carrying bounded balance composition as
+  a separate diagnostic, including Binance's sequenced account cohort and
+  legacy raw/normalized balance pairs. Packet hashes therefore reflect raw
+  response changes without exposing raw payloads.
+
+- HSL cooldown re-panic confirmation now remains protective after the original
+  cooldown deadline until the exact scope-flattening fill is available. The
+  confirmation path refreshes the fill cache and reconstructs durable fills
+  from unambiguous order side and position side when no transient action field
+  is present, including flattening fills stamped in the same exchange
+  millisecond as the non-flat intervention snapshot.
+
+- Hardened WEEX live reconciliation by requiring explicit combined/separated
+  position mode and long/short open-order sides, and by adaptively splitting
+  full fill-history windows so endpoint ordering cannot silently omit fills.
+  Empty private order-channel heartbeat messages no longer trigger CCXT Pro's
+  symbol resolver with an empty symbol set.
+
+- Added live WEEX USDT perpetual-futures support through CCXT, including
+  authenticated account state, simultaneous long/short order placement and
+  cancellation, per-symbol combined-position/margin/leverage setup, live
+  bid/ask pricing, positions, open orders, and fill/PnL ingestion. Because the
+  V3 book ticker has no last-trade field, live last-price consumers use its
+  top-of-book midpoint with the explicit `weex_book_ticker_mid` source label.
+  WEEX historical 1m backtest-data downloading is not included.
+
+- WEEX live 1m and 1h candle warmups now page through bounded historical
+  windows before using the recent tail, so long EMA windows, trailing extrema,
+  and HSL restart reconstruction are not silently truncated at 999 finalized
+  candles. Indicator/trailing/HSL consumers fail closed on incomplete windows;
+  WEEX bulk historical backtest downloading remains intentionally unsupported.
+
+- Updated the live CCXT dependency from 4.5.48 to 4.5.66. WEEX uses a narrowly
+  scoped compatibility handler for its documented successful configuration
+  response, which upstream CCXT 4.5.66 otherwise raises as an exchange error.
+  The Requests and aiohttp pins are aligned with CCXT 4.5.66's declared
+  dependencies.
+
+- Planning snapshot diagnostics now include a bounded completed-1m-candle
+  freshness summary when that surface is required. The summary is derived only
+  from the frozen planning signature and reports expected/real close ages plus
+  bounded tail-gap fallback counts; `live-performance-report` validates and
+  aggregates the same proof. Public row-count fields avoid secret-key redaction
+  so the persisted evidence remains machine-readable. It does not reread
+  candles or change planning, exchange access, orders, strategy, or risk
+  behavior.
+
+- `passivbot tool hsl-replay-benchmark` now reports exclusive timing profiles
+  for fixture construction, replay internals, final-state projection, candidate
+  and dense-reference runs, equivalence comparison, and residual orchestration.
+  Compact-history benchmarks retain the dense-reference timing evidence they
+  use for equivalence, while timeline-reference runs avoid double-counting the
+  same execution. This is offline diagnostic output only; HSL state, replay
+  behavior, exchange access, orders, and risk are unchanged.
+
+- Trailing fill-confirmation watermarks now advance only when a fill fetch
+  actually completes. Exhausted historical fill-gap retries still perform a
+  recent-fill refresh, keeping trailing confirmation live while historical PnL
+  coverage remains independently fail-closed.
+
+- Trailing-position fill confirmation now treats exchange position-update
+  timestamps as advisory and proves readiness with a successful post-position
+  fill refresh, a new fill identity for runtime changes, and matching fill
+  after-state. This prevents Bybit's later `updatedTime` from leaving valid
+  trailing positions permanently nontradable. Repeated unavailable warnings are
+  bounded, and monitor market state now exposes the actual planner tradability
+  plus fill-confirmation predicates and watermarks.
+
+- `passivbot tool runtime-attribution` now reconciles the producer's exact
+  12-character lowercase-hex startup-log run-id prefix with one complete
+  manifest or startup-event identity when exchange, user, prefix, and start time
+  agree within two seconds. Ambiguous, incomplete, malformed, or out-of-bound
+  observations remain separate. Monitor ingestion reads the canonical
+  `_live_event` envelope while retaining legacy input compatibility; the
+  read-only tool still does not contact exchanges or control bots.
+
+- Shutdown evidence in live smoke reports now distinguishes complete and
+  incomplete latest shutdown lifecycles per bot. Restart smoke validation uses
+  distinct complete bots instead of aggregate event counts, so duplicate
+  stopping or stopped events from one bot cannot satisfy a multi-bot restart
+  gate; general smoke verdicts and live runtime behavior remain unchanged.
+
+- Live smoke reports now include a bounded diagnostics-only event-pipeline
+  integrity verdict from each bot's latest health snapshot. Cumulative drops,
+  sink errors, and workers unexpectedly absent outside orderly pipeline shutdown
+  are explicit attention evidence; existing smoke, process, trading, and
+  top-level attention verdicts remain unchanged.
+
+- Fake-live scenario-time callbacks now retain their original offline fake
+  client through graceful shutdown. The final monitor snapshot can therefore
+  complete after the bot releases its public-session reference, without a
+  spurious `NoneType.now_ms` error or any change to live timekeeping, exchange
+  sessions, trading behavior, or event payloads.
+
+- Offline fake-live runs now retain the already-emitted redacted structured
+  event envelopes as a run artifact. The coin-mode HSL RED regression uses that
+  evidence to prove a panic fill is followed by an available planning snapshot
+  without a post-panic `planning.unavailable` handoff, while leaving live event
+  production, HSL behavior, exchange calls, orders, and risk unchanged.
+
+- Hyperliquid `balance.changed` composition diagnostics now parse only proven
+  unified-account `info.balances` coin and signed total fields from the
+  already-fetched balance response. Non-unified payloads remain explicitly
+  unavailable; malformed unified shapes remain diagnostic failures. The bounded
+  rows add no exchange calls, valuation inference, scalar-balance changes,
+  planning, order, or risk behavior, and raw connector payloads remain excluded.
+
+- Binance `balance.changed` composition diagnostics now normalize only CCXT's
+  documented unified `total`, `free`, `used`, and explicit `debt` maps from the
+  already-fetched balance response. The bounded rows add no exchange calls,
+  valuation inference, scalar-balance changes, planning, order, or risk
+  behavior; raw connector payloads remain excluded.
+
+- `balance.changed` now carries a bounded optional asset-composition diagnostic
+  from the same authoritative balance response. The first connector parser is
+  OKX: it reports only documented account-detail amount, USD value, unrealized
+  PnL, explicit liability, collateral state, and field provenance. Equal-total
+  collateral substitutions are durable through a separate composition
+  signature, while console admission remains snapped-balance based and shows at
+  most two sanitized assets. Generic paths report a stable unavailable
+  diagnostic until their own parsers are added; balance calculation, API calls,
+  refresh cadence, planning, orders, and risk are unchanged.
+
+- Live forager background refresh now schedules the native 1h candle windows required by inactive
+  candidates in addition to their 1m inputs. Candidate refresh budgeting operates per
+  symbol/timeframe surface, bounds and rotates cache-health scans, honors configured warmup and
+  stale-tail limits, interleaves 1m and 1h health checks while prioritizing cold 1m fetches, backs
+  off unavailable native-1h leading-prefix retries only after successful fetches, keeps known-stale
+  unfetched surfaces pending, and derives staleness from the actually refreshable universe. Forced
+  native higher-timeframe reads bypass partial range-cache hits, preserve complete disk coverage
+  when a retry returns only a partial range, keep incomplete ranges out of reusable EMA state, and
+  invalidate the refreshed timeframe's EMA cache and overlapping range-cache entries. Backoff is
+  scoped to the requested window and
+  begins only after a nonempty fetch still proves its leading gap. Health-only scans do not consume
+  fetch tokens, and native 1h work is scheduled only for nonzero strategy weights. Zero-budget
+  cycles perform no fetches or per-symbol warmup computation even with open slots. This prevents
+  cache-only planning from freezing the selection universe around incumbents whose 1h log-range
+  cache alone remained fresh.
+
+- Live startups now persist an immutable, non-secret runtime manifest and expose
+  the same Python commit, config hash, embedded Rust source fingerprint, loaded
+  Rust artifact hash, version, and run id through bounded startup events and
+  monitor state. Newly discovered fill events retain which runtime first
+  ingested them without falsely claiming that runtime created the order;
+  refreshes preserve existing attribution and leave legacy fills unattributed.
+
+- Added `passivbot tool runtime-attribution`, a bounded, read-only local report
+  that correlates fill caches and monitor fill history with immutable runtime
+  manifests, structured startup events, and legacy startup logs. It keeps
+  recorded first-ingestion identity separate from non-proving producer-window
+  candidates, leaves legacy fills unattributed, supports trailing-only and
+  account/symbol/time filters, and can fail when selected fills lack recorded
+  provenance without contacting exchanges or controlling bots.
+
+- Full live smoke reports now retain a separately bounded sample of hard
+  structured problem events, with authoritative total, retained, and truncated
+  counts. Later warning-level attention can no longer hide every classification
+  behind a nonzero hard-problem count. Concise summary, brief, and incident
+  bundle smoke metadata now retain the same bounded hard-only evidence; the
+  existing mixed latest-event sample and all runtime behavior remain unchanged.
+
+- HSL replay now recognizes every ordered, fill-derived scope flatten as an
+  episode boundary, including multiple close-and-reentry transitions within
+  one replay minute and compact coin replay without historical unrealized PnL.
+  RED cooldowns anchor to an episode-bounded flattening fill regardless of
+  close order type; when an initial or cooldown-repanic flatten fill is
+  temporarily unavailable, live supervision performs a rate-limited,
+  episode-bounded fill refresh and otherwise defers instead of using stale
+  pre-episode evidence, intervention entries, partial closes, or an invented
+  current-time timestamp. Intra-minute replay also reconstructs the account
+  balance at each ordered episode boundary so later fills cannot change an
+  earlier episode's drawdown or no-restart outcome.
+
+- `sink.degraded` events no longer retain raw sink exception text. They preserve
+  the stable sink-failure reason, sink name, exception type, health counters,
+  and pipeline timings while keeping request URLs, credentials, response data,
+  and other exception-message content out of degraded-event and monitor sinks.
+
+- `cycle.degraded` structured events no longer retain raw exception text or
+  request URLs from generic execution-loop failures or fill-history coverage
+  deferrals. A strict payload allow-list also drops nested spelling variants and
+  unknown caller fields. Stable reason codes, bounded exception types, cycle
+  correlation, safe operational details, and phase timings remain available;
+  retry, recovery, restart, and trading behavior are unchanged.
+
+- Added `passivbot tool live-restart-smoke-run`, an explicit local orchestrator
+  that requires exact repository, Rust-source, supervisor-command, and target
+  contracts before invoking the existing exact-pane graceful restart executor.
+  After a successful restart it waits one caller-bounded observation interval
+  and runs the existing bounded in-memory smoke collector over the exact
+  restart-through-observation window. It emits aggregate restart counts and
+  sanitized smoke evidence only, never pulls or builds code, SSHes, applies
+  force escalation or broad process-pattern signals, or writes report files;
+  post-action smoke failures leave the relaunched bots running and fail red for
+  operator follow-up.
+
+- Added `passivbot tool live-repository-prepare`, an explicit local executor
+  that fetches only the pinned public canonical `origin/master`, requires exact
+  caller-confirmed
+  current and target commits, a tracked-clean `master` checkout with no Git
+  operation in progress, and a hook-disabled true fast-forward before moving
+  the worktree.
+  It then verifies or rebuilds the Rust extension in a fresh bounded child
+  process and requires an exact caller-confirmed source fingerprint before the
+  checkout is restart-ready. It preserves untracked files and never SSHes,
+  contacts exchanges, signals or starts live bots, force-checks out, or rolls
+  back a target whose Rust preparation failed.
+
+- Added `passivbot tool live-restart-smoke-evidence`, a pure fail-closed
+  evaluator for already-generated full restart target and smoke JSON reports.
+  It binds stable exact-target evidence and bounded post-restart monitor/log,
+  shutdown, startup, and repository evidence to the expected head, supervisor
+  fingerprint, and target count without executing report producers or
+  controlling processes. Event and log windows retain and compare exact bounded
+  epoch-millisecond values, and dropped hard-looking log evidence fails closed.
+
+- Added `passivbot tool live-restart-smoke-collect` to collect the existing exact
+  local target and bounded smoke reports in memory and immediately evaluate the
+  sanitized restart evidence contract. It performs only local filesystem and
+  bounded `tmux`/`ps`/`git` inventory reads; it does not write intermediate
+  reports, pull or build code, contact exchanges, or control processes. Exact
+  historical event windows select only managed rotation segments whose encoded
+  intervals overlap the requested bounds, require retained predecessor coverage,
+  and fail closed before content scanning when names, per-bot counts, global
+  counts, or selected bytes exceed the bounded policy. Sanitized output reports
+  aggregate selection completeness, counts, scan bytes, and code-owned issues.
+
+- Live trailing restart reconciliation now preserves authoritative position-update
+  timestamps from CCXT and raw exchange payloads and no longer
+  treats position creation time as proof that fill history is current. Exchanges
+  without an update timestamp remain fail-closed until a successful fill refresh
+  after the position snapshot reports an after-state matching the live position.
+  Unchanged position snapshots no longer associate a prefetched fill with the old
+  position state, preventing a later real position change from waiting for an
+  additional fill.
+
+- Added `passivbot tool live-restart-executor`, an explicit local executor for
+  exact tmux targets that already pass the bounded stable target report. It
+  requires the expected Git commit, a tracked-clean checkout, an
+  operator-confirmed Rust build-input fingerprint, a Rust extension stamped
+  with that same fingerprint, a final rehash that detects ignored build-input
+  drift during verification, the expected full supervisor-command fingerprint,
+  and `--execute`,
+  sends one Ctrl-C round only to verified panes, waits a bounded time for exact
+  process exits, rechecks repository/runtime artifacts plus the private
+  supervisor snapshot and pane/process identity before typing launch commands,
+  and verifies stable replacements. It never pulls or builds code or applies
+  an automatic force signal; partial or changed state fails closed for manual
+  recovery.
+
+- Exact live restart target sampling now binds pane/PID stability to an opaque
+  fingerprint of the complete parsed supervisor command contract before
+  report redaction or truncation, failing closed when that contract changes or
+  is unavailable without exposing command content.
+
+- Live trailing extrema now latch an affected position side unavailable as soon
+  as an authoritative position change is observed, including the first
+  position snapshot after restart, and remain unavailable until a newer fill
+  identity at or after the authoritative position timestamp plus complete
+  finalized 1m coverage is present. Fill refreshes that arrive before the
+  matching position snapshot confirm against the prior snapshot's fill epoch.
+  Side-scoped trailing failures and panic plans no longer suppress valid
+  reconciliation on the unaffected hedge side.
+
+- Live trailing extrema now reset independently per symbol and position side
+  after every confirmed fill. Ordinary trailing closes are withheld and stale
+  trailing orders retired until post-fill candles establish fresh extrema,
+  while panic/HSL exits remain available. Trailing-martingale monitor
+  diagnostics now use the Rust close formula and report its exact wallet
+  exposure and volatility inputs.
+
+- Exact live restart targets now classify whether the bot is a child of its
+  tmux pane parent and therefore has a bounded candidate relaunch path after a
+  required post-stop pane recheck. The report exposes only method/proof
+  metadata, never the configured command, and restart plans require every
+  resolved target to be relaunch-ready.
+
+- `passivbot tool live-restart-smoke-plan` can now bind an explicitly
+  confirmed tmux session into its pre-restart readiness phase with
+  `--target-session-name`. The generated local-only target preflight requires
+  2-5 stable identity samples, remains non-executing, and makes the missing
+  target gate visible when no session is configured.
+
+- Added bounded `--samples` and `--interval-s` stability checks to
+  `passivbot tool live-restart-target-report`. Multi-sample reports fail if any
+  local preflight is hard-red or if a window's canonical pane ID, pane PID,
+  matched bot PID, or ownership proof changes during the sample window. Restart
+  execution and process control remain unavailable.
+
+- Added `passivbot tool live-restart-target-report`, a bounded local-only
+  preflight that joins supervisor-config window names with canonical tmux pane
+  IDs and proves ownership by matching each bot process PID or parent PID to
+  its pane PID. It fails on missing, duplicate, unconfigured, or mismatched
+  panes and never signals, starts, or controls a process, contacts a network
+  or exchange, loads credentials, or writes files.
+
+- Added `passivbot tool live-process-report`, a bounded local-only process
+  sampler that does not read monitor events or text logs, access credential
+  stores, contact networks or exchanges, control processes, or write files.
+  It can compare the local process table with an optional supervisor config
+  and sample process-state persistence/recovery using the existing smoke-report
+  process contract. Use `--brief` for aggregate-only process, config, resource,
+  state, and sampling counters without command, account, path, PID, or
+  per-process rows.
+
+- Live smoke reports can now opt into bounded repeated process-table sampling
+  to distinguish observed, persistent, and recovered uninterruptible-sleep
+  states while reporting stable PIDs, command/PID churn, and aggregate state
+  observations. The default remains one process snapshot, the final sample
+  retains the existing liveness/config verdict contract, and the sampler never
+  signals or restarts a process.
+
+- Added `passivbot tool trailing-inspect`, an offline one-shot explanation of effective
+  `trailing_martingale` entry and close thresholds, retracements, and analytical prices from a
+  config or explicit parameter overrides.
+
+- V7 trailing-grid migration now disables the v8 TWEL entry gate when a non-positive v7 TWEL
+  threshold disables its enforcer, collapses compatible v7 live/backtest warmup caps into the
+  shared v8 field, and validates the complete canonical result before writing. The CLI now writes
+  a durable JSON report by default while showing a concise action summary, and the new
+  `compare-backtests` tool reports dataset, metric, equity-path, and fill-event differences between
+  completed v7 and v8 artifacts without assigning a safety verdict.
+
+- Live smoke reports now expose bounded cycle terminal-outcome health from
+  existing `cycle.completed` and `cycle.degraded` events. The projection shows
+  latest successful/degraded outcomes, successful completion after the latest
+  observed degradation, elapsed time, order-change presence, and allowlisted
+  phase maxima without copying arbitrary payload details or exception text.
+  Existing hard-failure verdicts, cycle execution, exchange access, and trading
+  behavior are unchanged.
+
+- Live smoke reports now expose bounded latest-per-bot planning-snapshot health
+  from existing `snapshot.built` events: required-surface and age coverage,
+  market-snapshot freshness and missing counts, availability status counts,
+  packet counts, and correlation IDs. Symbol lists, packet rows, raw references,
+  hashes, values, and embedded availability records remain query-only; smoke
+  verdicts, snapshot construction, exchange access, and trading behavior are
+  unchanged.
+
+- Live smoke reports now expose bounded latest-per-bot-and-kind health from
+  existing `data_packet.updated` events: packet kinds, quality, freshness,
+  source, revision, safe coverage counts, and warning/error counts. Raw packet
+  references, hashes, timestamps, values, and warning/error text remain
+  query-only; smoke verdicts, exchange access, and trading behavior are
+  unchanged.
+
+- Binance backtest OHLCV downloads now fill the current v2 store from checksum-verified Binance
+  Vision monthly archives first, parallel daily archives second, and CCXT last. Monthly archives
+  are limited to sufficiently incomplete published months, recent days stay on CCXT, existing
+  valid rows are never overwritten, and CCXT repairs archive failures or real gaps within archive
+  data. The legacy downloader path is not re-enabled.
+
+- Live smoke reports now include bounded latest-per-bot planning-output health
+  from existing `rust_orchestrator.returned` and `action.planned` events. The
+  projection correlates cycle and remote-call IDs, Rust timing and order
+  counts, planned order classifications, redacted symbol samples, truncation,
+  and count mismatches without copying raw orders, quantities, prices, or
+  hashes. Smoke verdicts, planning, exchange access, and trading behavior are
+  unchanged.
+
+- Staged-readiness smoke reports now include bounded latest-per-bot
+  `entry.initial_eligibility` aggregates: evaluated and record totals, outcome
+  and reason counts, truncation coverage, and correlation IDs. Raw per-symbol
+  records remain query-only, and smoke verdicts, entry eligibility, exchange
+  access, and trading behavior are unchanged.
+
+- Staged-readiness smoke reports now include bounded latest-per-bot
+  `planning.symbol_state` evidence across full, summary, brief, and selected
+  output. The projection reports availability counts, unavailable reasons,
+  order classes, surfaces, and redacted symbol samples without changing smoke
+  verdicts, console output, planning, exchange access, or trading behavior.
+
+- Time-bounded live smoke reports now scope monitor event-type inventory and
+  sampled cycle IDs to the requested event window. Full-file validation and
+  scanned-record counters remain unchanged.
+
+- Live smoke reports now expose bounded existing
+  `forager.eligibility_changed` evidence across full, summary, brief, and
+  section-selective output, including approved/ignored add/remove counts,
+  source kind, position side, and redacted symbol samples. The projection does
+  not change smoke verdicts, console output, eligibility, or trading behavior.
+
+- Staged-readiness smoke summaries now include bounded existing
+  `planning.defer_summary` evidence such as defer counts, windows, required
+  surfaces, retry mode, and redacted symbol samples. Registered optional
+  section selectors also remain valid when their event family is naturally
+  absent from the selected window.
+
+- Live smoke reports now expose bounded existing
+  `forager.feature_unavailable` evidence across full, summary, brief, and
+  section-selective output. The projection does not change smoke verdicts,
+  console output, forager selection, readiness, or trading behavior.
+
+- Live configs may now define optional diagnostic `startup_phase_budgets` for
+  canonical startup timing phases. Existing `bot.startup_timing` events carry
+  configured elapsed and phase budgets, and live smoke reports prefer those
+  explicit values over historical p95 projections. Live performance reports
+  now retain bounded latest-lifecycle configured-budget assessments and
+  aggregate their status. The budgets are reporting metadata only and do not
+  gate startup, readiness, exchange access, or trading.
+
+- `log-secret-inventory --summary` now emits bounded aggregate scan evidence
+  without the per-file paths, ages, or hashes retained by the full report.
+
+- The read-only log secret inventory now detects credential-like query
+  parameters in scheme-less request paths and query fragments as well as full
+  URLs, without returning matched values.
+
+- Brief live smoke reports now summarize startup elapsed/phase budget status
+  coverage, distinguishing unavailable and no-baseline assessments from
+  within-budget phases without changing startup behavior or thresholds.
+
+- A new read-only `log-secret-inventory` tool scans bounded current and rotated
+  text-log input for secret-like artifact classes without returning matched
+  values or source lines. Reports contain only aggregate class counts, bounded
+  root-relative file identity, age, size, scan status, and stable hashes. The
+  tool never rewrites, deletes, quarantines, copies, or uploads log artifacts.
+
+- Successful maintainer cancellation summaries and hourly scheduler-jitter
+  detail now remain available at DEBUG instead of adding routine INFO lines.
+  Maintainer cancellation failures remain ERROR. Task cancellation, scheduler
+  timing, exchange calls, and trading behavior are unchanged.
+
+- Startup lifecycle output now has one normal human-ready signal: structured
+  startup timing. `bot.started` keeps its structured console/text projection
+  with a legacy fallback only when that projection is unavailable, while
+  durable `bot.ready` stays out of console/text. Decorative READY banners,
+  duplicate execution-loop startup lines, and routine warmup/maintainer detail
+  no longer add INFO noise. Background candle-warmup success detail is DEBUG
+  under `[candle]`; failure remains immediate ERROR. Startup timing, task
+  scheduling, monitor persistence, and trading behavior are unchanged.
+
+- The startup HSL safety warning now uses compact mode/budget/threshold wording
+  so its complete deposit, withdrawal, balance-override, configuration-change,
+  and history-reinterpretation warning fits the normal console record budget.
+  Warning admission, HSL configuration, risk behavior, and trading behavior are
+  unchanged.
+
+- Approved/ignored coin membership changes now use one bounded structured
+  console/text projection with per-side counts and symbol samples instead of
+  unbounded legacy symbol lists. Existing structured event data, membership
+  calculation, list mutation, and trading behavior are unchanged.
+
+- Exchange clock-offset recovery warnings and durable time-sync diagnostics no
+  longer retain raw exception text. They keep the stable exception class,
+  source, recovery status, and bounded client outcome details within the normal
+  rendered console record budget.
+
+- Candle-fetch retry and exhaustion warnings now fit the normal rendered
+  console record budget while retaining exchange, symbol/timeframe, attempt,
+  elapsed time, exception class, and action. Structured diagnostics, redaction,
+  retry behavior, candle readiness, and trading behavior are unchanged.
+
+- Required-EMA-unavailable warnings now use a bounded structured console/text
+  projection with counts, classified cause, nontradable-until-fresh action,
+  and compact symbol/error/EMA identity. The complete structured payload,
+  existing fifteen-minute human cadence, EMA readiness decisions, and trading
+  behavior are unchanged.
+
+- Periodic health summaries now use compact operator labels and separators so
+  uptime, loop, position, balance, order/fill/error, resource, and slow-phase
+  context fit the normal console record budget. Complete structured payloads,
+  cadence, health calculations, and trading behavior are unchanged.
+
+- Forager selection transitions now use a bounded operator summary with slot,
+  selected/incumbent, hysteresis, reason, ranking, and replacement context.
+  Complete structured and DEBUG diagnostics, transition cadence, Rust-owned
+  selection behavior, and trading behavior are unchanged.
+
+- Candle-health transition summaries now retain their aggregate counts and
+  bounded missing-candle examples within the normal console record budget.
+  Complete debug diagnostics, candle-health calculations, fetch behavior,
+  readiness checks, and trading behavior are unchanged.
+
+- Initial-entry distance-gate blocked events now retain every existing
+  per-symbol structured/monitor record while limiting console/text and legacy
+  fallback output to one bot-level representative per five minutes, with
+  bounded active/suppressed counts. Cleared transitions remain immediate; entry
+  eligibility, distance calculation, gate decisions, order creation, and
+  trading behavior are unchanged.
+
+- Close-EMA carry-forward warnings now use a bounded structured console/text
+  projection with counts, symbol/span examples, age, fallback streak, and a
+  classified reason. The existing fifteen-minute warning cadence, complete
+  event payload, legacy fallback, EMA calculations, and trading behavior are
+  unchanged.
+
+- Slow staged account-refresh timings and periodic timing summaries now use a
+  compact structured console/text projection. The existing ten-second detail
+  threshold, complete event payloads, legacy fallback, refresh calls, and
+  trading behavior are unchanged.
+
+- HSL startup settings now use a compact INFO projection that retains the
+  configured thresholds, spans, mode, tier ratios, actions, and restart policy
+  within the normal console line budget. HSL validation, state reconstruction,
+  risk decisions, and trading behavior are unchanged.
+
+- Candle fetch-lock hold warnings now retain the affected exchange, symbol,
+  timeframe, and compact local-holder identity/timing without repeating the
+  deterministic lock path, duplicated owner scope, configured timeout, or
+  implied action. Watchdog timing, lock behavior, and warning cadence are
+  unchanged.
+
+- CLI overrides of `live.approved_coins` now use a bounded startup log summary
+  with per-side counts and three-symbol samples instead of printing the full
+  old and new collections. Config application and non-target config-change
+  logging are unchanged.
+
+- Visible `trailing.status` console/text records now use a compact operator
+  projection that fits the normal line budget while retaining status, position
+  identity, mode, trigger gates, material threshold/retracement values, current
+  price, and correlation. Structured and monitor payloads, visibility
+  admission, cadence, trailing calculations, and trading behavior are
+  unchanged.
+
+- Five-minute `trailing.status` and `unstuck.status` snapshots now remain
+  complete in structured and monitor sinks while normal console/text output is
+  limited to first observations, qualitative or material numeric transitions,
+  and hourly reminders. Unstuck allowance movement uses five-percent relative
+  hysteresis; trailing ratio and price movement use explicit 0.05 percentage-
+  point and 0.5-percent boundaries. Trading, risk, planning, and event cadence
+  are unchanged.
+
+- Material live memory snapshots now emit a bounded `resource.memory_snapshot`
+  event and one compact operator line instead of a 457-525 character cache and
+  task diagnostic. The complete bounded samples remain available in structured
+  and monitor sinks, detailed diagnostics remain at DEBUG, and collection,
+  cadence, admission, and trading behavior are unchanged.
+
+- Execution-loop failures now use a bounded incident signature in normal
+  console, monitor, and structured burst output instead of retaining raw
+  exception text, request URLs, and unconditional tracebacks. Stack frames
+  remain available at DEBUG without the exception value, and the error-budget
+  summary is compact and tagged; retry, restart, and trading behavior are
+  unchanged.
+
+- Intermediate HSL coin-history replay progress now appears on the normal live
+  console at most once every 30 seconds. The first progress update, completion,
+  complete structured progress events, replay behavior, and safety readiness
+  are unchanged.
+
+- OKX per-symbol margin-mode/leverage configuration now emits bounded structured
+  outcome events. Explicit already-configured responses stay available at DEBUG
+  instead of appearing as routine INFO, while confirmed responses and failures
+  retain their existing operator visibility and exchange behavior.
+
+- Successful fill-refresh and fetcher-request timing detail now stays at DEBUG
+  instead of appearing in the normal live console. Fetcher request errors,
+  actual fills, degraded warnings, structured refresh summaries, refresh
+  behavior, and failure propagation are unchanged.
+
+- Completed staged account-refresh timing lines now stay at DEBUG unless the
+  cohort takes at least ten seconds. Interesting sub-ten-second samples remain
+  available as structured INFO events, and periodic timing summaries,
+  readiness, exchange calls, and trading behavior are unchanged.
+
+- Candle-fetch retry and exhaustion warnings now use bounded operator
+  signatures instead of retaining raw request parameters and exception text.
+  Their first occurrence is emitted even during the process's initial
+  five-minute throttle window.
+  Structured remote-call events omit raw exception text and replace explicit
+  request URLs with a redacted marker plus stable hash; retries, callback
+  invocation, and candle behavior are unchanged.
+
+- Routine open-tail EMA projection-context aggregates now remain available at
+  DEBUG instead of printing thousand-character diagnostics in the normal live
+  console. Compact active-tail transitions and warnings, EMA projection,
+  readiness, and trading behavior are unchanged.
+
+- Rust-orchestrated forager selection changes now have one normal console/text
+  owner: the producer's materiality-aware INFO summary. Their complete
+  `forager.selection` events remain available in structured and monitor sinks
+  without printing a second independently throttled summary. Python-filter
+  selection events retain their existing console/text projection.
+
+- Successful background forager candle-refresh completions now remain available
+  at DEBUG instead of repeating in the normal live console. Refresh scheduling,
+  wall-time-cap notices, failures, and candle behavior are unchanged.
+
+- Successful candle-index maintenance now stays available at DEBUG under the
+  `[candle]` tag instead of appearing as repeated `[boot]` INFO output after
+  readiness. Index rebuild behavior and failure visibility are unchanged.
+
+- Routine successful candle-warmup details now remain available at DEBUG
+  instead of filling the normal live console. Startup readiness milestones,
+  degraded/failure visibility, structured cache decisions, and warmup behavior
+  are unchanged.
+
+- Backtests now write `drawdown.png` alongside the existing summary plots,
+  showing drawdown from the running peak of collateral-agnostic strategy equity.
+
+- Raw-only wallet-balance jitter no longer appears on the normal live console
+  when the hysteresis-snapped balance is unchanged. The complete
+  `balance.changed` event remains available in structured, monitor, and durable
+  text sinks; snapped changes and events without valid materiality metadata
+  remain console-visible.
+
+- Realized-loss gate blocks now use their structured warning as the sole normal
+  console/text line when a live-event console sink is available. The legacy
+  warning remains the fallback; gate decisions, diagnostics, and throttling are
+  unchanged.
+
+## v8.0.0 - 2026-07-14
+
+- Restored the documented offline HSL restart smoke by pinning its fixture to
+  the intended per-side HSL contract and updating its post-flatten drawdown
+  assertion to the current panic-fill-anchored finalization semantics. Coin-mode
+  fake-live RED handling now exercises the production protective supervisor
+  instead of falling through normal planning while confirmations are pending.
+
+- Detailed min-effective-cost entry blocks now use their structured events as
+  the sole normal console/text lines when a live-event console sink is
+  available. Legacy detail lines remain the fallback, while the distinct
+  throttled aggregate summary and all gate behavior are unchanged.
+
+- Initial-entry distance-gate blocked and cleared transitions now use their
+  structured events as the sole normal console/text lines when a live-event
+  console sink is available. The throttled legacy summaries remain the
+  fallback; gate state, eligibility, and order filtering are unchanged.
+
+- Ambiguous-cancel terminal states now use the structured execution warning as
+  the sole normal console/text line when a live-event console sink is
+  available, with an explicit full-account-confirmation cue in its compact
+  projection. The legacy summary remains the fallback; cancellation and
+  authoritative-confirmation behavior are unchanged.
+
+- Execution-loop error bursts now use the structured `health.summary` console
+  projection as the sole normal console/text line when a live-event console sink
+  is available. The legacy warning remains the fallback when that projection or
+  its emitter is unavailable; error thresholds, redaction, restart/backoff, and
+  trading behavior are unchanged.
+
+- Periodic health console/text output now projects the structured
+  `health.summary` event as one compact line when the live event console is
+  available, while retaining the same legacy fallback when it is disabled or
+  absent. Health payloads now include quote, error-budget, bounded slow-phase,
+  and correct RSS fields without changing trading behavior.
+
+- Live fill console/text output now projects structured `fill.ingested` events,
+  avoiding duplicate legacy lines when the structured console is available.
+  Large fill batches emit one `fills.ingested_summary` console/text event while
+  retaining every per-fill structured and monitor event; fill accounting,
+  history, and PnL semantics are unchanged.
+
+- Monitor retention now builds the same complete recursive inventory with one
+  healthy-path `os.scandir` traversal and one explicit `DirEntry.stat` per
+  visited entry, avoiding the duplicate directory scans performed by the prior
+  `Path.rglob` path. A failed directory scan gets one bounded immediate retry;
+  persistent errors still isolate that subtree. Cadence, symlink handling,
+  protected paths, accounting, and deletion policy are unchanged.
+
+- Periodic structured health summaries now split monitor retention work into
+  fixed inventory, age-unlink, and byte-cap-unlink timings plus bounded work
+  counts. Live smoke and performance reports project the same fields without
+  changing retention cadence, policy, failure handling, report verdicts, or
+  trading behavior.
+
+- Balance-change console and text lines now show exact raw and snapped
+  before/after transitions with signed deltas, equity, and source in one compact
+  human-readable line. The complete structured event remains unchanged.
+
+- Monitor retention pruning now inventories retained files once per due run and
+  reuses the same size/mtime snapshot for age and byte-cap deletion. Retention
+  cadence, protected files, recursive byte accounting, direct-only deletion,
+  and oldest-first policy are unchanged.
+
+- Position-change console and text lines now use a compact aligned transition
+  with old/new size and price plus WE, base-WEL, effective-WEL, TWEL, and uPnL.
+  The complete structured event remains unchanged for queries and incident
+  reconstruction.
+
+- Periodic structured health summaries now separate event-path manifest
+  checkpoint and retention run counts and service totals/maxima within the
+  existing inclusive monitor maintenance timing. Live smoke and performance
+  reports project the fixed fields without changing persistence cadence,
+  retention policy, event delivery, verdicts, or trading behavior.
+
+- Monitor event and history appends now coalesce the best-effort manifest
+  checkpoint to the existing snapshot cadence while forcing it at lifecycle
+  and rotation boundaries. Startup also recovers the event sequence from a
+  fixed-memory scan of checksummed current-segment recovery trailers when an
+  unclean exit leaves the manifest stale, preventing sequence reuse or payload
+  marker confusion without changing NDJSON append durability or trading
+  behavior.
+
+- Periodic structured health summaries now split real monitor-sink service time
+  into fixed event-conversion, publisher lock-wait, rotation, persistence, and
+  maintenance totals/maxima. Live smoke and performance reports project the
+  same bounded fields without changing monitor persistence, event delivery,
+  verdicts, or trading behavior.
+
+- Periodic structured health summaries now attribute queued worker sink time to
+  fixed structured and monitor sink classes with bounded per-window write
+  counts and service totals/maxima. Live smoke and performance reports project
+  the same fields without changing routing, delivery, verdicts, or trading
+  behavior.
+
+- Periodic structured health summaries now expose bounded event-pipeline queue
+  wait and worker sink-service timing windows. Live smoke and performance
+  reports project the processed counts, totals, and maxima without changing
+  event delivery, smoke verdicts, or trading behavior.
+
+- Reorganized AI-facing engineering documentation around a compact mandatory instruction set,
+  explicit live/authenticated-operation approval boundaries, task-routed feature contracts and
+  runbooks, generated live-event references, and warning-only documentation size/structure checks.
+  The local fake-live harness is now explicitly distinguished from public-network and authenticated
+  exchange validation. Temporary compatibility routes preserve active external review automations
+  while they migrate to the canonical Markdown principles, validation matrix, and PR-review runbook.
+
+- `live-performance-report` now correlates current-startup fill-cache loading
+  with exact post-start fill-history coverage proof. Cache presence alone never
+  claims proof, cache/proof ordering is explicit, and incomplete or absent
+  lifecycle evidence remains unknown.
+
+- Live order writes now emit bounded structured/monitor evidence immediately
+  before concrete connector create and cancel calls. The events distinguish
+  local connector-call arrival from pre-call submission intent and exchange
+  acknowledgement without changing order payloads or execution behavior.
+
+- `live-performance-report` now derives the current lifecycle's first
+  connector-bound initial-entry eligibility milestone from
+  `entry.initial_eligibility`. Blocked, candidate-free, protective-only, and
+  malformed eligibility events do not claim fresh-entry readiness.
+
+- Completed normal live order plans now emit one bounded structured/monitor
+  `entry.initial_eligibility` event. It distinguishes fresh initial entries
+  that were absent, already satisfied, blocked by an existing local gate,
+  accompanied only by protective actions, or selected for the final
+  connector-bound create batch immediately before invocation. The event
+  observes existing reconciliation
+  and execution decisions only; it does not add a gate, change order batches,
+  or claim exchange acknowledgement.
+
+- Startup readiness reporting now uses one canonical phase parser across
+  performance and smoke consumers, rejects conflicting `phase`/legacy `stage`
+  records, rejects stale rotated lifecycle data after any incomplete current
+  tail, preserves bounded HSL replay context across sparse terminal events, and
+  keeps prior restart samples available for smoke timing budgets.
+
+- `live-performance-report` now derives bounded current-lifecycle startup
+  milestones for the first cycle, first Rust call, and first submitted
+  exchange write from existing structured events. Missing observations remain
+  explicitly unknown; submitted write events do not claim connector success
+  or fresh-entry eligibility.
+
+- Capped rotated `live-performance-report` scans now keep each bot's startup
+  readiness snapshot on the latest observed lifecycle even though recent-file
+  selection reads `current.ndjson` before older segments. Historical aggregate
+  startup distributions remain unchanged.
+
+- Existing `bot.startup_timing` events now include bounded machine-readable
+  readiness scope and trading-impact labels for account, HSL protective,
+  execution-loop, first-market-state, and background-candle milestones. The
+  best-effort active-candle phase remains timing-only. Live performance and
+  smoke reports expose per-bot and aggregate readiness SLA timing without
+  changing startup sequencing, readiness gates, exchange calls, or trading
+  behavior.
+
+- Coin-mode HSL replay progress now separates scanned candidate rows from
+  applied state-update rows. Live performance and smoke reports use scan
+  throughput for remaining-work estimates when available, retain explicit
+  legacy applied-row fallback labeling for older events, use the dense upper
+  bound for the generic active replay estimate while keeping required-pair
+  estimates separate, preserve exact terminal candidate-work estimates, and
+  keep legacy terminal events without candidate totals from reporting active
+  remaining work. These report semantics do not change HSL replay ordering,
+  readiness, or trading behavior.
+
+- Isolated-only markets excluded from new entries by cross-margin preference
+  now emit bounded per-side `config.market_compatibility` events while
+  preserving the existing filter and warning behavior.
+
+- Hyperliquid non-unified HIP-3 startup rejection now emits a bounded terminal
+  `config.market_compatibility` event before preserving the existing fatal
+  error. The event records only redacted account/capability counts and symbol
+  samples and does not change market, margin, or startup policy.
+
+- Unsupported configured markets now emit bounded
+  `config.market_compatibility` structured and monitor events with list,
+  position-side, count, redacted symbol sample, and stable reason context.
+  Existing coin filtering and text-log warnings are unchanged.
+
+- Added `passivbot tool pareto --scenario LABEL` for rebuilding and selecting from a
+  scenario-specific nondominated sub-front of a suite optimization's saved aggregate Pareto
+  members. Scenario metrics are used consistently for limits, objectives, and ranking, and output
+  explicitly notes that candidates discarded from the original aggregate front are not recoverable.
+
+- `passivbot tool live-performance-report` now retains each bot's explicit HSL
+  protective-ready replay milestone and summarizes replay history formats,
+  protective-ready elapsed time, and completed full-replay elapsed time from
+  existing structured events. If the earlier milestone has rotated out of the
+  selected event files, its aggregate elapsed value is recovered from the
+  retained completion event. This is read-only reporting and does not change
+  HSL startup or trading behavior.
+
+- Cold coin-mode HSL history reconstruction now uses a private compact
+  NumPy-backed replay payload instead of retaining the full nested per-minute,
+  per-symbol timeline. Public balance/equity history output, pside/unified HSL,
+  cache authority, episode/cooldown rules, and Rust risk math are unchanged.
+  The offline replay benchmark can now separate held and background work, opt
+  into a 30-day local-scale fixture, compare rich and compact history formats,
+  and report Python allocation peaks.
+
+- `passivbot tool live-smoke-report --processes` now includes bounded current
+  live-process state counts, uninterruptible-sleep count, and CPU, memory, and
+  RSS totals/maxima/reporting counts in full, summary, and brief output. These
+  read-only fields remain observational and unavailable metrics stay null.
+
+- Coin-mode HSL startup now reconstructs currently held pairs before declaring
+  protective readiness, then continues cooldown-affected and remaining flat
+  pairs in one shutdown-owned background replay. Initial entries remain
+  blocked per coin and position side until that pair is reconstructed, while
+  cancellations and panic/reduce-only protection remain available. Replay
+  events and smoke reports distinguish protective-ready time from full replay.
+  After protective readiness, replay now yields in smaller bounded chunks with
+  a short cooperative pause so live exchange I/O is not starved; held-position
+  reconstruction retains the faster startup cadence.
+
+- Coin-mode HSL drawdown normalization now uses one Rust-owned live/backtest
+  contract: account balance divided by the applicable slot count. TWEL still
+  enables the side but no longer scales the HSL denominator, so increasing an
+  exposure allowance cannot silently weaken the configured RED threshold.
+
+- HSL RED episode finalization now uses one Rust-owned live/backtest contract
+  for caller-supplied persistent no-restart peaks, restart policy, and cooldown
+  deadlines. Coin-mode live restart now retains that no-restart peak like
+  pside live and backtest instead of discarding it with the episode tracker.
+  Python remains responsible for exchange/history proof and supplies the exact
+  scope-flattening fill timestamp; backtests retain the exact configured
+  deadline instead of extending sub-bar cooldowns to a full candle interval.
+
+- Added `passivbot tool hsl-replay-benchmark`, a bounded offline benchmark for
+  the current coin-HSL history initializer. It emits deterministic fixture and
+  final-state hashes, explicit timeline-row and pair-row throughput, profiled
+  stage timings, replay counters, and side-effect counters without contacting
+  exchanges or reading/writing live cache and state artifacts.
+
+- Approved and ignored forager-eligibility membership changes now emit bounded
+  `forager.eligibility_changed` structured and monitor events. Each aggregate
+  event identifies the list, add/remove operation, source kind, and per-side
+  count with at most 12 sorted symbols; existing eligibility behavior and text
+  logs are unchanged.
+
+- `passivbot tool crash-finder` can now regenerate scenario suites from an existing
+  `crash_clusters.csv` without rescanning local OHLCV data, emit market-wide/coin-focused/single-coin
+  filtered suites, merge overlapping stress windows, and add per-coin forced-normal overrides for
+  idiosyncratic non-market-wide crash stress scenarios, capped at two forced coins per scenario.
+  When scanned range metadata is available, generated suites now drop coins with no cached data
+  overlap in the scenario date window and omit targeted scenarios when no coins remain. Full
+  discovery now efficiently groups 1m source rows into parameterized crash candles (`1h` by default)
+  without rescanning the full minute array for every candle, while preserving the ordered
+  high-to-later-low metric.
+
+- Websocket reconnect attempts now emit bounded `websocket.reconnect`
+  structured events with retry timing, fixed reason classification, text-log
+  visibility, traceback cadence, and exception type. Existing reconnect timing,
+  warning throttling, traceback logging, and exchange behavior are unchanged.
+
+- Connector-local exchange-config failure logs in Binance, Bitget, Defx,
+  Hyperliquid, KuCoin, and OKX, plus the parent per-symbol retry log, now keep
+  bounded operation, symbol, retry, canonical known-code, and exception-type
+  context without rendering arbitrary exception messages or partial API
+  responses. Existing connector catches, fail-loud behavior, retries, and
+  per-symbol success/failure handling are unchanged.
+
+- Exchange-config success logs now use one bounded, value-safe formatter across
+  the shared CCXT connector and Binance, Bitget, Bybit, KuCoin, and OKX. Raw API
+  response values are replaced by canonical status, finite numeric leverage,
+  bounded numeric code, or response type/presence labels; exchange calls and
+  failure behavior are unchanged.
+
+- Live executor create/cancel anomalies, including lower-level base/CCXT order
+  write failures, no longer print raw order dictionaries, exchange responses,
+  exception messages, or tracebacks. Existing bounded structured execution
+  events remain authoritative; when their console projection is unavailable,
+  fallback logs contain only safe action/symbol/type/reason context. Exchange
+  behavior is unchanged.
+
+- Live performance timing groups now expose their latest bounded report-safe
+  canonical event IDs, including in `operation_durations` and
+  `slowest_blockers`, so an operator can correlate a slow row with the
+  structured event stream without exposing free-form event payloads. Existing
+  legacy snapshot IDs are normalized consistently with `live-event-query`, and
+  equal-timestamp samples use persistent event ordering.
+
+- Backtests now warn when interior data gaps split a coin's history and real
+  data outside the longest contiguous run is excluded from the backtest
+  (previously silent). Stock-perps (`xyz:`) coins instead log their
+  synthetic-flat-candle share at INFO level. The synthetic-candle backtesting
+  model for stock perps (tradable flat candles during underlying-market
+  closure) is now documented in docs/stock_perps.md with its accepted
+  modeling caveats.
+
+- Hardened OHLCV gap classification against transient exchange conditions. A
+  persistent gap (missing tail, leading, or internal range) now gets a short
+  one-hour re-verification window on its first observation and keeps the full
+  seven-day window only once the identical gap is observed again at least 30
+  minutes later — so an exchange publishing delay or partial response can no
+  longer silently clip a coin's backtest data for a week. KuCoin pagination
+  holes between pages are now recorded as expiring auto-detected gaps
+  (retried on later fetches) instead of permanent no-trade gaps; holes inside
+  a single exchange response remain verified no-trade minutes.
+
+- Faster backtest startup on hlcvs cache hits: the multi-GB hlcvs artifact is
+  now decompressed once instead of twice (manifest verification hands its
+  arrays to the loader), array/chunk hashing no longer materializes a full
+  copy of the data, and the OHLCV catalog reuses its sqlite connection instead
+  of reconnecting per query. Cache formats, hashes, and outputs are unchanged;
+  manifest verification now logs its elapsed time separately.
+
+- Fixed Alpha Vantage stock-perps data provider misfiling candles by 4-5 hours:
+  its US-Eastern timestamps were interpreted in the host's local timezone
+  (DST-dependent) instead of America/New_York. Backtest data fetched with
+  `tradfi.provider = "alphavantage"` before this fix should be re-downloaded.
+
+- Live auto-unstuck emission is no longer gated in Python by whether an
+  unstuck order is already resting on the exchange. Rust owns whether an
+  unstuck ideal order is emitted from the realized-PnL cumsum facts; duplicate
+  order risk now rides the same live reconciliation path as every other order
+  type.
+
+- HSL flat detection now uses a shared half-qty-step epsilon where symbol
+  precision is available, including replay cache extension, pside/unified cache
+  synthesis, current-episode proof, and coin replay episode transitions. This
+  keeps dust below half a step from extending or restarting HSL episodes.
+
+- Plan tracker: closed the Python-simplification item, the final open item
+  of the risk/unstuck/HSL action plan. Removed live-path policy
+  re-decisions: execution type, the redundant unstuck-suppression channel,
+  and the per-cycle unstuck-allowance computation. The remaining
+  Python-side order handling is documented as intentionally Python-owned
+  reconciliation or live-only execution/data guards. Docs-only change.
+
+- The live path no longer computes unstuck allowances for the Rust
+  orchestrator input. Rust has always derived the unstuck allowance
+  internally from the realized-pnl cumsum facts (risk.rs); the
+  unstuck_allowance_long/short input fields were consumed only as a legacy
+  fallback for the auto_unstuck_allowed flag, which live callers always set
+  explicitly. The fields are now optional (serde defaults) and documented
+  as legacy/diagnostic; live inputs and recorded planning snapshots omit
+  them, removing the last per-cycle duplicate of the allowance formula from
+  the hot path. The monitor still computes allowances on demand for
+  diagnostics. Behavior unchanged.
+
+- Optimizer defaults now keep HSL restarts enabled by setting
+  `bot.long/short.hsl.restart_after_red_policy=always` in
+  `optimize.fixed_runtime_overrides` instead of forcing
+  `no_restart_drawdown_threshold=1`. This avoids permanent optimizer halts
+  while preserving the live/default no-restart threshold values for configs
+  that use `restart_after_red_policy=threshold`.
+
+- Live unstuck-allowance inputs to the Rust orchestrator are no longer
+  zeroed while an unstuck order is resting on the exchange. The allowance
+  values are pure budget facts derived from fill history; suppression of
+  new unstuck emission rides solely on the existing auto_unstuck_allowed
+  flag, which the Rust orchestrator consumes as the sole gate. Behavior is
+  unchanged (Rust emitted no unstuck either way); this removes a redundant
+  second suppression channel that made the allowance inputs diverge from
+  the backtest for reasons unrelated to budget.
+
+- Live order conversion no longer re-decides execution type in Python. The
+  Rust orchestrator is the single source of execution-type truth
+  (`should_use_market_execution` owns the panic market-vs-limit choice from
+  `hsl_panic_close_order_type`); the Python fallback that re-derived it for
+  short order tuples was dead on every live path and is replaced by
+  fail-loud validation - a tuple without a valid `limit`/`market`
+  execution type now raises instead of silently defaulting to a limit
+  order, which could have downgraded a panic market close.
+
+- Plan tracker: closed the canonical HSL equity-history signal design item.
+  The one-raw-per-minute data-store goal is realized by the shared
+  authoritative timeline plus the cache-primitive store (pair matrices +
+  per-pside account series) consumed by all three signal modes, with
+  sample-parity tests at every trust boundary; the originally sketched five
+  named dataframes are superseded by these primitives. Docs-only change.
+
+- Plan tracker: closed the HSL replay performance/readiness item. All
+  sub-items are implemented (persisted npz+manifest checkpoints with
+  watermark extension for all three signal modes, fail-closed reuse gates,
+  doctor coverage, phased timing evidence); dense per-minute replay
+  stepping remains Python->PyO3 by explicit choice, amortized to
+  first-boot-only by cache reuse, with batch vectorization noted as
+  optional future work contingent on production startup timings.
+
+- HSL pside/unified startup replay now attempts cache reuse before the full
+  history fetch, completing the replay-cache arc for all signal modes. The
+  gate shares the coin-mode core (fresh fill-coverage proof, strict
+  write-time-proven expected metadata, account/pair watermark agreement,
+  gap panic-fill rejection, watermark extension from exchange fills/candles,
+  current-position reconciliation) and adds the pair-completeness proof the
+  aggregate synthesis requires: any fill inside the covered window or the
+  extension gap belonging to a pair that is not currently held (and thus
+  not cached) rejects reuse, because per-pside unrealized/flatness
+  aggregates are summed from cached pair matrices alone. Any rejection or
+  unexpected error falls back to the authoritative full replay. End-to-end
+  test proves the cache-fed unified boot reaches state identical to the
+  full replay with the fetch provably skipped.
+
+- HSL pside/unified startup replay now derives cooldown and no-restart
+  evidence from canonical reconstructed RED episodes, matching the coin-mode
+  behavior shipped earlier: an episode that crossed RED and was flattened by
+  an ordinary (non-panic) close now latches its cooldown anchored at the
+  scope-flattening fill (falling back to the flatten row minute when no fill
+  evidence exists) and evaluates restart_after_red_policy/no-restart at that
+  stop via the persistent cross-episode tracker. Previously such episodes
+  were silently dropped, so a restart during an active cooldown resumed
+  trading. RED-free ordinary flattenings now perform a plain episode reset
+  (clearing the episode's RED memory) instead of carrying state into the
+  next episode.
+
+- HSL: new pure, unwired synthesis helper
+  `_hsl_replay_pside_timeline_rows_from_cache` converts persisted held-pair
+  matrices plus the schema-v5 account series into the aggregate timeline
+  rows the pside/unified startup replay consumes, with fail-loud
+  span/continuity/alignment checks. Parity tests prove the synthesized rows
+  equal the authoritative history timeline field-for-field (long and short
+  pairs, realized events on both sides, flatness transitions) and that
+  contract-shaped rows drive the pside/unified initializer to a state
+  identical to authoritative-shaped rows. The helper is not yet consumed:
+  the pside/unified reuse gate is a follow-up slice, and it must prove from
+  fills that cached pairs were the only pairs with in-window positions
+  before trusting these aggregates.
+
+- HSL replay cache schema v5: the persisted account-level realized-PnL
+  series now carries per-minute per-pside deltas (`pnl_long`, `pnl_short`)
+  alongside the account-level `pnl`, collected from the authoritative
+  per-pside running totals during the history replay and reproduced exactly
+  by the watermark-extension helper (which now requires an explicit position
+  side on every extension fill and rejects the cache otherwise). This is
+  groundwork for the future pside/unified cache-reuse gate, whose timeline
+  synthesis needs per-pside realized PnL. Existing v4 caches fail schema
+  validation and are rebuilt by the next full replay, by design.
+
+- HSL pside/unified startup replay now persists the same write-only replay
+  cache as coin mode after a successful replay (held-pair raw matrices plus
+  the account-level realized-PnL series). The cache config digest includes
+  the HSL signal mode, so caches written by one mode can never be reused by
+  another, and cache-write failures only warn - they never affect the
+  completed replay. The caches are not yet read back on pside/unified boot;
+  the reuse gate for those modes is a follow-up slice.
+
+- Live coin-HSL startup replay now derives cooldown and no-restart evidence
+  from canonical reconstructed RED episodes, not only from bot-emitted panic
+  order markers. An episode that crossed RED and was flattened by an ordinary
+  (non-panic) close fill - including a manual close - now latches its
+  cooldown anchored at the scope-flattening fill timestamp and evaluates the
+  no-restart policy at that stop, exactly like a confirmed panic marker.
+  Previously such episodes were silently reset with no stop accounting, so a
+  restart during an active cooldown (or after a terminal-drawdown episode)
+  would resume trading. RED-free ordinary flattenings keep the plain episode
+  reset. The Rust backtest already finalizes cooldown/no-restart for such
+  episodes (its per-episode tier latch keeps the stop path armed after the
+  sample recovers); new Rust regression tests pin that parity for both the
+  pside and coin scopes.
+
+- Repaired three stale Rust hard_stop unit tests that pinned pre-B2.1/A2.2
+  mode-override behavior and were never run by CI: ORANGE tp-only now forces
+  flat sides too (A2.2), and RED only authorizes panic while the current
+  sample is actively RED - a recovered sample downgrades to tp-only (B2.1
+  red split). The repaired red test now pins both branches; no behavior
+  changes.
+
+- HSL startup now applies the clarified incomplete-history policy: with
+  `restart_after_red_policy=always`, missing pre-episode fill coverage
+  degrades to a loud warning when the coin scope's current-episode start is
+  provable from covered fills (the `always` policy ignores historical
+  no-restart evidence); `threshold` and `never` still require full
+  configured lookback coverage. A new dangerous per-run CLI flag
+  `--hsl-accept-incomplete-history` lets an operator explicitly start on
+  incomplete evidence for any policy, with a critical startup banner and
+  per-use critical logs warning that panic/cooldown/no-restart may be wrong.
+  The override is enforced as per-run only: values persisted in config
+  files are stripped at load time (with a critical log) before CLI
+  overrides are applied, so it can never survive a restart. Corrupt
+  (pending/degraded) PnL data still always hard-fails.
+
+- HSL RED cooldown now anchors at the fill that actually flattened the
+  affected scope, by any means, instead of the latest bot-emitted panic
+  fill. If a position is finished off manually (or by any non-panic close)
+  after the last panic fill, the cooldown window starts at that flattening
+  fill rather than earlier, so cooldowns can no longer expire prematurely
+  for manually-completed flattens.
+
+- Backtest ORANGE `tp_only_with_active_entry_cancellation` now forces flat
+  symbols in the affected HSL scope too, blocking initial entries exactly
+  like live has since the A2.2 contract change; previously backtests allowed
+  new initial entries during ORANGE for symbols without a position, so
+  backtest results could overstate entry activity near the orange tier.
+
+- HSL panic orders are now authorized only while the CURRENT drawdown sample
+  is in RED (`red_active_now`), in both live and backtest. Previously a
+  latched RED episode kept emitting panic closes until the scope was flat
+  even after the drawdown recovered; now a recovered sample pauses panic
+  emission for the remainder of the episode while entries stay blocked
+  (`tp_only_with_active_entry_cancellation`), and panic resumes if RED
+  re-activates. Flat-scope stop finalization, cooldown, and no-restart
+  accounting are unchanged and still use the episode's RED evidence.
+
+- The HSL no-restart (permanent halt) trigger now evaluates
+  `max(drawdown_raw, drawdown_ema)` against
+  `hsl_no_restart_drawdown_threshold` in both live and backtest, instead of
+  raw drawdown only. The permanent halt is intentionally conservative: it now
+  also trips on sustained smoothed damage even when the instantaneous
+  drawdown at the stop sample has partially recovered. The RED/panic-now
+  trigger is unchanged (`min(raw, ema)` crossing `hsl_red_threshold`).
+- `passivbot tool live-smoke-report` now summarizes existing cache load, flush,
+  and warmup-decision events as `cache_health` in full/summary output and
+  `cache` in brief output.
+- Live coin-mode HSL startup can now reuse its persisted replay cache: when
+  the cached series pass every trust gate (proven fill coverage at write and
+  load time, config digest identity, watermark agreement, gap extension from
+  exchange fills/candles, and current-position reconciliation), the bot
+  replays from the cache plus the gap instead of re-fetching the full
+  lookback. Any gate failure falls back to the full exchange-derived replay;
+  the cache never becomes authoritative trading state, and a fresh VPS
+  reconstructs identical decisions.
+- HSL-enabled startup and live-config preflight now surface a history
+  reinterpretation caveat and point operators to a dedicated HSL risks doc for
+  deposits, withdrawals, balance overrides, and HSL config changes.
+- Rust close-reducer pruning now keeps only the closest-to-fill reducer when
+  multiple same-priority protective reducers target one coin+pside in the same
+  ideal-order batch; ordinary grid/trailing close ladders remain preserved.
+- Bounded `we_excess_allowance_mode` now treats non-positive or non-finite base
+  WEL as zero allowed exposure and non-positive/non-finite TWEL as zero excess
+  headroom instead of falling back to the raw excess percentage.
+- Rust protective reducers now suppress lower-priority same-position ordinary
+  close orders in the same ideal-order batch, so panic, TWEL/WEL auto-reduce,
+  and auto-unstuck no longer stack with grid/trailing closes for one coin+pside.
+- Rust WEL auto-reduce now takes priority over same-position auto-unstuck
+  reducers in the same ideal-order batch, matching the documented reducer
+  priority before auto-unstuck is admitted.
+- Rust TWEL auto-reduce now takes priority over same-position auto-unstuck
+  reducers in the same ideal-order batch, preventing two reducer closes from
+  stacking on one coin+pside when portfolio exposure enforcement is active.
+- Rust TWEL `reduce_overweight` auto-reduce now uses the dynamic currently
+  tradable slot count when deciding which positions are overweight, matching
+  dynamic WEL sizing instead of the configured `n_positions` floor. If no
+  symbols are eligible for new entries but positions remain open, TWEL repair
+  falls back to the held-position count so protective reduce-only closes can
+  still be emitted.
+- `passivbot tool live-config-preflight` now reports
+  `balance_hysteresis_snap_pct` and warns when it is invalid or above `0.05`,
+  where snapped-balance entry sizing/gating can diverge noticeably from
+  raw-balance exposure repair near risk boundaries.
+- Entry ladder throttling now uses `entry_cooldown_minutes` as the single
+  control: full simultaneous ladders are allowed only when
+  `entry_cooldown_minutes = 0.0` and entry retracement is disabled. Any
+  positive cooldown, including fractional sub-minute values, stages at most one
+  position-adding entry order and blocks further adds until the exact cooldown
+  window expires.
+- Live and backtest HSL runtime paths now require normalized
+  `live.hsl_signal_mode` instead of silently treating a missing raw key as
+  `unified`; raw-config diagnostics now report the schema default `coin`.
+- The Rust orchestrator JSON boundary now rejects invalid account/risk globals
+  such as non-positive raw balance, negative realized-loss limits, and negative
+  unstuck allowances before risk gates or order planning can silently skip.
+- HSL/risk/unstuck config validation now clamps HSL EMA spans below `1.0`
+  during config preparation and rejects malformed HSL, risk, and unstuck
+  numeric inputs at the Rust orchestrator JSON boundary before order planning.
+- HSL panic close execution now preserves side-local
+  `bot.long/short.hsl.panic_close_order_type` in live and backtests; configuring
+  one side as `market` no longer market-promotes panic closes for the other side
+  when that side is configured as `limit`.
+- HSL restart behavior after RED is now controlled by explicit
+  `bot.long/short.hsl.restart_after_red_policy` values: `threshold` preserves
+  the previous no-restart-threshold behavior, `never` makes any RED terminal,
+  and `always` restarts after cooldown while disabling the no-restart safety
+  latch for that HSL scope.
+- Live TWEL auto-reduce now honors configured
+  `risk_twel_enforcer_policy` when building Rust orchestrator payloads instead
+  of always falling back to `reduce_overweight`, aligning live behavior with
+  backtests for configs using `reduce_portfolio`.
+- Live coin-mode HSL now computes slot drawdown from configured
+  `n_positions` and current raw balance only, so TWEL or excess allowance no
+  longer makes the configured RED drawdown threshold tolerate a larger
+  percentage loss. Compared with the previous TWEL-scaled denominator, this
+  makes TWEL > 1 coin-HSL stops trigger sooner and TWEL < 1 stops trigger later.
+- DEAP optimizer generation evaluations now honor
+  `optimize.max_pending_starting_evals_per_cpu`, bounding queued offspring
+  evaluations with the same memory-control cap used for starting seeds.
+- Pymoo optimizer starting configs now reuse their precomputed seed evaluations
+  during initial population setup instead of backtesting the same seed vectors a
+  second time.
+- Optimizer Pareto storage now checks candidate/front dominance in a single
+  pass, reducing per-candidate overhead without changing Pareto semantics.
+- Optimizer vector-shape extraction now rejects empty `config.optimize.bounds`
+  instead of generating key paths that fail later without matching bounds.
+- Compressed `all_results.bin` optimizer history now preserves deleted keys
+  during replay, preventing stale fields such as prior candidate errors from
+  leaking into later entries.
+- Pareto limit filters now fail loudly when a configured limit metric is missing
+  instead of silently retaining candidates that cannot be checked.
+- Suite optimizer workers now close lazy-slicing master shared-memory attachments when the
+  evaluator is cleaned up, avoiding attachment churn across evaluations.
+- Pareto pruning now rejects non-finite objective matrices before selecting
+  required extremes, preventing NaN values from being retained as best/worst axes.
+- Pareto bootstrap now uses non-empty scoring metadata from existing entries
+  before rebuilding the front, preventing legacy unscored files from forcing
+  minimize-all dominance for scored results.
+- Suite scenarios now reject unknown scenario fields before running, catching
+  typos such as `coin` instead of silently ignoring them.
+- Resumed pymoo optimizer checkpoints now refresh the active problem,
+  termination target, and checkpoint callback before continuing, so increasing
+  `optimize.iters` on resume takes effect.
+- Optimizer overrides now reject unknown `optimize.enable_overrides` names before
+  the run starts, and `forward_tp_grid` / `backward_tp_grid` now reorder
+  `trailing_grid_v7` close-grid markup bounds as intended.
+- Anchored fine-tune optimizer seed conversion now preserves each anchor's
+  original id when an earlier starting seed is skipped.
+- Optimizer SIGINT handling now safely no-ops before a worker pool exists and
+  terminates an active pool without referencing backend-local shutdown state.
+- `passivbot optimize --suite-config` now enables suite mode when `--suite` is
+  omitted, while explicit `--suite n` still disables suite mode.
+- Partial suite override files that define scenarios without `aggregate` now
+  preserve the base config's `backtest.aggregate` instead of resetting to mean.
+- Optimizer stepped bounds now stay on the configured grid for fractional steps
+  such as `0.25`, `0.125`, and `0.0025`, avoiding off-grid candidate values in
+  DEAP, pymoo repair, seed conversion, and result hashing.
+- Fixed DEAP optimizer candidate recording so duplicate-guard perturbations and
+  evaluated starting seeds keep the fitness attached to the actual evaluated
+  parameter vector.
+- Suite optimizer context preparation now matches suite-runner exchange and
+  coin-universe setup, and fails loudly when a scenario cannot be prepared
+  instead of silently dropping scenarios or falling back to other exchanges.
+- Added optional `optimize.seed`; the default `null` randomizes optimizer
+  population and worker RNGs, including replacing pymoo's previous fixed
+  default seed, while an integer seed opts into deterministic seeding for
+  diagnostics.
+- Optimizer Pareto recording now fails loudly on corrupt existing Pareto files
+  or invalid objective payloads instead of silently skipping store errors or
+  pruning files that were never loaded.
+- The `cache` live-event debug profile now enriches existing cache load,
+  flush, and warmup-decision events with bounded key/count/source metadata
+  without changing default event payloads or console output.
+- `passivbot tool live-incident-bundle --restart-smoke-plan` now exposes the
+  embedded restart plan's compact timeout-escalation ladder summary in the
+  returned report and bundle manifest.
+- `passivbot tool live-incident-bundle --restart-smoke-plan` now exposes the
+  embedded restart plan's compact warning and issue summaries in the returned
+  report and bundle manifest.
+- `passivbot tool live-incident-bundle --restart-smoke-plan` now exposes the
+  embedded restart plan's compact process-signal safety and execution-policy
+  summaries in the returned report and bundle manifest.
+- `passivbot tool live-incident-bundle --restart-smoke-plan` now exposes the
+  embedded restart plan's planned smoke and follow-up incident-bundle command
+  summaries in the returned report and bundle manifest.
+- `passivbot tool live-incident-bundle --restart-smoke-plan` now exposes the
+  embedded restart plan's smoke/performance section filters in the returned
+  report and bundle manifest summary.
+- `passivbot tool live-incident-bundle --restart-smoke-plan` now passes
+  `--performance-section` filters into the embedded restart plan's planned
+  failure-bundle command when performance sections are selected.
+- `passivbot tool live-restart-smoke-plan` now supports
+  `--performance-section`, passing selected performance-report sections to the
+  planned failure incident-bundle command.
+- `passivbot tool live-smoke-report --section` now accepts base smoke metadata
+  selectors such as `repository`, `monitor`, and `event_window`, so repeated
+  smoke loops can request checkout or scan-window evidence directly.
+- `passivbot tool live-incident-bundle --performance-report` now supports
+  `--performance-section`, so embedded performance evidence can be scoped to
+  selected top-level sections while keeping common metadata.
+- `passivbot tool live-restart-smoke-plan` now includes
+  `live-incident-bundle --performance-report` in its planned failure evidence
+  command, so restart-smoke incident bundles capture bounded performance timing
+  and readiness summaries by default.
+- `passivbot tool live-incident-bundle --performance-report` now embeds an
+  opt-in `live-performance-report` artifact and compact manifest summary using
+  compatible bundle time, bot/exchange/user, debug-profile, and event-file
+  bounds.
+- `passivbot tool live-performance-report` now supports `--debug-profile`, so
+  performance summaries can be scoped to events enriched by one live-event
+  debug profile.
+- `passivbot tool live-incident-bundle` now supports `--debug-profile`, passing
+  the first-class debug-profile filter through its embedded event, problem-event,
+  and time-window reports plus the bundle manifest.
+- `passivbot tool live-event-query` now supports `--debug-profile`, a
+  first-class filter for events whose structured data has a matching
+  `debug_profile` value.
+- The `startup` live-event debug profile now enriches existing startup timing
+  events with bounded phase, timing, and details-shape metadata without
+  changing default event payloads or console output.
+- The `state` live-event debug profile now enriches existing state refresh
+  timing and progress events with bounded plan, pending-surface, and slowest
+  surface metadata without changing default event payloads or console output.
+- The `forager` live-event debug profile now enriches existing forager
+  selection and feature-unavailable events with bounded count/key-shape
+  metadata without changing default event payloads or console output.
+- `passivbot tool live-smoke-report --brief` now includes allowlisted
+  `latest_data` for risk-event groups, exposing compact state such as HSL mode
+  transitions and unstuck over-budget summaries while still excluding raw
+  balances, drawdown internals, and per-side allowance details.
+- `passivbot tool live-smoke-report --summary` and `--brief` now include
+  bounded dropped-unparsed log samples when `--log-window-unparsed-policy drop`
+  suppresses contextless hard or attention-looking log lines.
+- `passivbot tool live-event-query` now emits a warning issue when filtered
+  current-only queries skip rotated monitor event segments, making empty
+  incident queries less likely to be mistaken for complete history.
+- `passivbot tool live-incident-bundle` now includes the compact time-window
+  query summary in `manifest.json`, so archived bundles expose matched-event,
+  truncation, and scan-bound evidence without opening `time_window_report.json`.
+- `passivbot tool live-incident-bundle` now includes the bundle-level result
+  verdict in `manifest.json`, so archived incident bundles expose total
+  `ok`/`hard_failures` without opening the command output.
+- `passivbot tool live-incident-bundle` now includes top-level smoke verdict
+  fields in `manifest.json`, making the bundle manifest self-contained for
+  `ok`, `attention`, and smoke failure/count triage.
+- `passivbot tool live-incident-bundle` now includes bounded repository and
+  monitor smoke summaries in the returned report and `manifest.json`, making
+  checkout cleanliness and monitor event-count context visible in bundle-level
+  triage.
+- `passivbot tool live-incident-bundle` now includes bounded text-log and
+  event-window smoke summaries in `manifest.json`, so bundle manifests can
+  explain log-sourced hard or attention verdicts without opening the embedded
+  full smoke report.
+- `passivbot tool live-incident-bundle` now includes the bounded process
+  smoke summary in the returned report and manifest, making missing,
+  duplicate, or unexpected live-bot process evidence visible without opening
+  the embedded full smoke report.
+- `passivbot tool live-incident-bundle` now includes smoke verdict source
+  breakdowns and recovered problem-event counts in the returned report and
+  manifest, making red or attention incidents easier to attribute without
+  opening the embedded full smoke report.
+- `passivbot tool live-incident-bundle` now includes the bounded
+  `problem_events` smoke summary in the returned report and manifest, including
+  hard and non-hard problem-event type histograms for quicker incident triage.
+- `passivbot tool live-smoke-report --summary` and `--brief` now split
+  structured problem-event type counts into hard and non-hard histograms,
+  making mixed smoke attention easier to triage without opening grouped event
+  rows.
+- `passivbot tool live-smoke-report --summary` and `--brief` now include
+  `problem_events.non_hard`, making non-fatal structured attention easier to
+  distinguish from hard problem events at a glance.
+- `passivbot tool live-smoke-report --section` and
+  `passivbot tool live-incident-bundle --smoke-section` now accept the brief
+  smoke-summary names such as `fill_refresh`, `hsl_replay`, and
+  `remote_calls` as aliases for their embedded full-report sections, reducing
+  CLI friction when moving between brief smoke output and incident bundles.
+- `passivbot tool live-incident-bundle` now includes bounded data-plane smoke
+  summaries for remote calls, account-critical remote calls, fill refresh,
+  startup timings, and HSL replay in the returned report and manifest, making
+  common exchange/data-readiness and startup-latency evidence visible without
+  opening the full embedded smoke report.
+- `passivbot tool live-incident-bundle` now includes bounded operational smoke
+  summaries for exchange config refresh, staged readiness, event-pipeline
+  health, and shutdown events in the returned report and manifest, so common
+  live-smoke attention sources are visible without opening the full embedded
+  smoke report.
+- `passivbot tool live-incident-bundle` now includes the bounded EMA-readiness
+  smoke summary in the returned report and manifest, so incident bundles expose
+  current EMA unavailable reason counts without requiring operators to open the
+  full embedded smoke report.
+- `passivbot tool live-incident-bundle` now includes a bounded risk-event
+  smoke summary in the returned report and manifest, so incident bundles expose
+  HSL RED/cooldown/raw-red context without requiring operators to open the full
+  embedded smoke report.
+- `passivbot tool live-smoke-report --brief` now includes bounded risk
+  attention groups, prioritizing HSL RED/cooldown/raw-red and risk panic-mode
+  context even when newer routine risk status events would otherwise bury them
+  in latest-event ordering.
+- `passivbot tool live-smoke-report --brief` now includes bounded latest risk
+  event samples, making HSL RED/cooldown/mode-change smoke context visible
+  without dumping verbose risk event payloads.
+- `passivbot tool live-smoke-report --brief` now includes bounded hard and
+  attention log-match samples, so hard smoke verdicts can be attributed without
+  rerunning the larger summary report.
+- `passivbot tool live-smoke-report --brief` now adds dense and required HSL
+  replay max remaining-work aggregates alongside the existing primary
+  remaining-work max fields.
+- `passivbot tool live-smoke-report --brief` now distinguishes dense and
+  required HSL replay remaining-work estimates in active replay samples, so
+  dense pair replay is not hidden when required-position replay is already
+  complete.
+- `passivbot tool live-smoke-report --brief` now includes bounded active HSL
+  replay samples with bot, stage, symbol, elapsed age, progress, and remaining
+  work estimates, making long-running HSL startup replay easier to attribute.
+- `passivbot tool live-smoke-report` now summarizes staged-readiness reason
+  codes, defer reasons, contexts, and bounded max timing fields in concise
+  output, making current-epoch planning delays easier to attribute without a
+  separate event query.
+- `passivbot tool live-smoke-report --brief` now includes bounded slowest
+  remote-call latency samples, making slow exchange/account/candle surfaces
+  visible without dumping the full summary.
+- `passivbot tool live-smoke-report` now includes bounded EMA-readiness symbol
+  samples by unavailable reason in summary and brief output, so operators can
+  see which symbols are affected without a separate event query.
+- `passivbot tool live-smoke-report` now summarizes HSL raw-red-pending
+  targets in concise risk output, including bounded red-proximity and
+  EMA-gap-to-red percentages without exposing raw drawdown internals.
+- `passivbot tool live-smoke-report` now names staged-readiness missing and
+  invalid surfaces in summary and brief output, so issues like stale
+  `completed_candles` are visible without a separate event query.
+- `passivbot tool live-smoke-report` now lists active HSL cooldown targets in
+  concise risk summaries, so RED cooldown symbols are visible even when they do
+  not have current drawdown-distance metrics.
+- `passivbot tool live-smoke-report` now includes normalized HSL red-proximity
+  percentages in concise closest-to-red risk summaries, making current HSL
+  proximity visible without exposing raw drawdown-space thresholds.
+- `passivbot tool live-smoke-report` now summarizes failed remote-call
+  reasons, surfaces, kinds, and error types in concise smoke output, making
+  transient exchange failures easier to identify without a separate event
+  query.
+- `passivbot tool live-smoke-report` now attaches the timestamped log context
+  line to unparseable traceback/error matches, making hard text-log matches
+  easier to attribute without changing smoke verdict policy.
+- `passivbot tool live-smoke-report` now summarizes EMA-readiness unavailable
+  reasons and candidate error types in concise smoke output, making
+  `cache_only_fetch_failed` vs `never_fetched_cache_only` visible without a
+  separate event query.
+- `passivbot tool live-smoke-report` now reports timestamp/nonce
+  `cycle.degraded` events recovered by a subsequent successful
+  `exchange.time_sync` event as recovered problem events instead of hard smoke
+  failures, while unrecovered timestamp/nonce errors remain hard.
+- Coin-mode HSL startup reconstruction now limits candle-price replay and
+  strict historical UPnL validation to current-position symbols and historical
+  panic-close cooldown symbols. Flat non-panic historical fill symbols no
+  longer block startup or force broad candle replay, while runtime coin-HSL
+  still evaluates them from fill history after startup.
+- `passivbot tool live-smoke-report` now labels active HSL startup replay
+  groups as stale or long-running when existing monitor events show no recent
+  progress or prolonged replay elapsed time, making startup-blocked bots easier
+  to spot without changing trading behavior.
+- Low-balance exposure-increasing create skips now appear through the
+  structured live event console as `execution.create_skipped` summaries, and
+  the legacy `[balance] too low` line is only a fallback when that path is
+  unavailable or disabled.
+- Legacy balance and position-change console lines are now suppressed when the
+  structured live event console path is active, leaving `balance.changed` and
+  `position.changed` projections as the default operator output while
+  preserving legacy lines as fallback.
+- Flat coin-mode HSL cooldown finalizations now emit their
+  `hsl.red_triggered` event as informational instead of critical when no
+  exchange close was needed, so smoke reports no longer treat cooldown-only
+  flat symbols as hard panic failures.
+- Legacy order-wave complete/settled console lines are now suppressed when the
+  structured live event console path is active, leaving structured execution
+  wave summaries as the default operator output while preserving the legacy
+  lines as fallback.
+- Legacy unstuck status/selection console lines are now suppressed when the
+  structured live event console path is active, leaving the structured
+  `[unstuck]` projection as the default operator output while preserving a
+  fallback if that path is disabled.
+- Legacy startup timing console lines are now suppressed when the structured
+  live event console path is active, leaving the structured `[boot]` projection
+  as the default operator output while preserving a fallback if that path is
+  disabled.
+- Startup timing events now appear in the live event console projection by
+  default, making account-ready, candle-ready, HSL-ready, market-ready, and
+  startup-ready phase durations visible from the structured event stream.
+- Live event console summaries are now enabled by default for `passivbot live`;
+  set `logging.live_event_console=false` or `PASSIVBOT_LIVE_EVENT_CONSOLE=0`
+  to opt out while legacy console logs are still being migrated.
+- Improved opt-in live event console summaries for trailing and unstuck
+  positions, including threshold/retracement prices and unstuck selection
+  details from existing structured events.
+- Added `--level` filtering to `passivbot tool live-event-query`, so operator
+  event, timeline, trace-summary, order-trace, and cycle-trace reports can be
+  scoped by live-event severity.
+- `passivbot tool live-smoke-report --brief` now includes the structured event
+  window `enabled` flag, matching the full report and making unwindowed brief
+  smoke output explicit.
+- `passivbot tool live-smoke-report --brief` now includes bounded text-log
+  window counters, making it clear when hard/attention log counts came from a
+  time-windowed scan and how many log lines were skipped.
+- `passivbot tool live-smoke-report --summary` and `--brief` now expose
+  existing startup timing evidence, making slow restart phases visible in the
+  concise smoke-loop projections.
+- Added opt-in `passivbot tool live-event-query --event-tail-lines` to bound
+  monitor event parsing for repeated recent-window queries while leaving full
+  event validation as the default.
+- Added opt-in `passivbot tool live-smoke-report --event-tail-lines` to bound
+  monitor event parsing for repeated recent-window smoke checks while leaving
+  full monitor-event validation as the default.
+- Added structured `hsl.raw_red_pending` diagnostics when HSL raw drawdown is
+  already beyond red but EMA-confirmed drawdown has not crossed yet, helping
+  operators spot pending RED risk without changing trading behavior.
+- HSL history replay now ignores historical `close_panic_*` markers that cannot
+  be confirmed as RED by reconstructed HSL metrics at the marker timestamp, so
+  an old or erroneous panic fill does not recreate RED cooldown or supervisor
+  state on restart.
+- `passivbot tool live-smoke-report --processes` now performs a read-only
+  local config check for running/expected live commands and reports a hard
+  smoke failure when account-level HSL (`unified`/`pside`) is combined with an
+  active balance override.
+- `passivbot tool live-config-preflight` now flags active
+  `balance_override` plus account-level HSL signal modes (`unified`/`pside`)
+  before live startup, including an optional `--balance-override` argument for
+  preflighting runs that will pass `-bo`.
+- Added a live HSL safety guard: `hsl_signal_mode=unified` or `pside` now
+  fails before account-level equity replay when `balance_override` is active,
+  preventing synthetic historical peaks from triggering false RED panic orders
+  until an explicit HSL baseline/checkpoint exists. HSL history replay also
+  zero-anchors realized-PnL timeline fields at the configured lookback boundary
+  so replayed peaks match the live runtime lookback contract.
+- Added root-level `passivbot -V` and `passivbot --version` output.
+- Added `hsl_replay_health` summaries to
+  `passivbot tool live-smoke-report`, so smoke reports show active,
+  completed, and failed HSL startup replay state from existing
+  `hsl.replay.*` events.
+- Added structured `risk.entry_cooldown_delta_anchored` events when live
+  entry cooldown is anchored from an exchange position-size increase, including
+  cases where the legacy text warning is throttled.
+- Updated the canonical v8 trailing-martingale default config profile, including
+  the 41-coin universe, per-coin HSL signal mode, refreshed optimizer
+  scoring/limits/bounds, `bot.long.risk.n_positions = 5`, and
+  `entry.ema_gate_mode = "all"` for default-reliant configs.
+- Added `--tag` filtering to `passivbot tool live-event-query`, so operator
+  event, timeline, trace-summary, order-trace, and cycle-trace reports can be
+  scoped by structured live-event tags.
+- Corrected `passivbot tool live-performance-report` `snapshot_to_rust`
+  correlation so planning snapshot epochs are no longer mistaken for live
+  cycle IDs; legacy snapshot events now use the latest preceding snapshot in
+  the same bot/restart scope and expose match counters.
+- Added `operation_durations` summaries to
+  `passivbot tool live-performance-report`, collating existing startup, cycle,
+  state-refresh, remote-call, HSL replay, cache, decision-boundary,
+  input-staleness, execution, and shutdown timing groups into one bounded
+  trading-impact-ranked table without adding new live events or exchange calls.
+- Added `forager_ema_readiness` summaries to
+  `passivbot tool live-performance-report`, deriving bounded forager selection,
+  forager feature-unavailable, EMA unavailable, and EMA fallback evidence from
+  existing events without exposing raw EMA errors, top-score payloads, account
+  values, or cache paths.
+- Added `cache_warmup` summaries to
+  `passivbot tool live-performance-report`, deriving bounded warm-cache reuse,
+  cold-path, candle cache load, and candle cache flush evidence from existing
+  cache events without exposing raw cache paths or payloads.
+- Added `hsl_replay_profile` summaries to
+  `passivbot tool live-performance-report`, deriving bounded HSL replay
+  work/progress and startup-blocking timing context from existing
+  `hsl.replay.*` events.
+- Added snapshot surface and market-snapshot age breakdowns to
+  `passivbot tool live-performance-report`, using bounded metadata from
+  existing `snapshot.built` events without exposing market prices or raw
+  payloads.
+- Added `execution_timing` summaries to
+  `passivbot tool live-performance-report`, deriving bounded exchange-action
+  latency groups from existing order-wave, create/cancel, and confirmation
+  events without exposing raw order payloads.
+- Added `shutdown_latency` summaries to
+  `passivbot tool live-performance-report`, projecting existing lifecycle
+  shutdown events into per-stage and total shutdown timing groups without
+  copying shutdown error text.
+- Added `resource_pressure` summaries to
+  `passivbot tool live-performance-report`, projecting whitelisted
+  `health.summary` process and event-pipeline fields with count, min, mean,
+  median, p95, max, and latest values without raw account or financial
+  payloads.
+- Added `exchange_config_refresh` summaries and elapsed timing groups to
+  `passivbot tool live-performance-report`, projecting existing structured
+  refresh success/failure events without copying raw exchange error text or
+  making new exchange calls.
+- Exchange-config refresh summaries in `live-smoke-report` and
+  `live-performance-report` now distinguish historical failures from each
+  bot's latest status and count recovered bots after a later successful refresh.
+- Improved cold `passivbot backtest` materialization by batching legacy OHLCV
+  imports by month, vectorizing chunk writes, staging HLCV cache writes with
+  rollback on publish failure, and honoring Ctrl+C between expensive
+  materializer/cache stages.
+- Added explicit hard-failure and attention source breakdowns to
+  `passivbot tool live-smoke-report`, so red or attention smokes identify
+  monitor parse errors, invalid rows, structured events, log matches, and
+  process liveness contributions without changing verdict logic.
+- Added risk/HSL log-match counters to `passivbot tool live-smoke-report`, so
+  CRITICAL risk-state log lines can be distinguished from non-risk hard log
+  matches without changing smoke verdict logic.
+- Added event-pipeline health summaries to
+  `passivbot tool live-smoke-report`, projecting existing `health.summary`
+  queue/drop/sink-error counters into full, summary, and brief reports.
+- Added bounded staged-readiness health summaries to
+  `passivbot tool live-smoke-report`, projecting existing staged
+  `cycle.degraded` events into latest missing/invalid surface counts and
+  completed-candle mismatch evidence.
+- Added bounded EMA readiness health summaries to
+  `passivbot tool live-smoke-report`, projecting existing `ema.unavailable`
+  events into latest candidate/unavailable counts plus reason/error evidence.
+- Added no-extra-call `exchange_surface_health` summaries to
+  `passivbot tool ticker-endpoint-probe`, interpreting already-recorded endpoint
+  outcomes into exchange/user-level notes for open-orders fallback, time-sync
+  support, fill-history pagination, and OHLCV tail shape.
+- Added no-extra-call endpoint latency health summaries to
+  `passivbot tool ticker-endpoint-probe`, derived from existing probe outcomes.
+- Added opt-in bounded fill-history pagination sampling to
+  `passivbot tool ticker-endpoint-probe` via `--fill-history-pages`, while
+  preserving the default single-call `fetch_my_trades(first symbol)` behavior.
+- Added no-extra-call rate-limit pressure estimates to
+  `passivbot tool ticker-endpoint-probe`, derived from existing probe outcomes
+  and CCXT rate-limit metadata.
+- Added no-extra-call fill-history sample health summaries to
+  `passivbot tool ticker-endpoint-probe`, derived from the existing
+  `fetch_my_trades(first symbol)` probe result without raw trade/order ids.
+- Added no-extra-call 1m candle freshness health summaries to
+  `passivbot tool ticker-endpoint-probe`, derived from the existing OHLCV tail
+  probe results.
+- Added read-only `fetch_time` clock-skew health summaries to
+  `passivbot tool ticker-endpoint-probe`, with `--skip-time-sync` for operators
+  who want to omit the extra time-sync call.
+- Added process-signal safety guidance to
+  `passivbot tool live-restart-smoke-plan`, warning future restart automation
+  away from broad `pkill -f`/`pgrep -f` live-bot matches and toward exact tmux
+  panes or exact canonical process rows.
+- Added report-only startup phase budget projections to
+  `passivbot tool live-smoke-report`, comparing latest startup timings with
+  prior local p95 baselines from existing monitor events.
+- Hardened forager active-symbol EMA readiness by allowing required
+  qv/log-range ranking features to carry forward bounded cached real-candle EMA
+  values for active/normal symbols during fill handoff.
+- Added optional `--compare` diff reporting to
+  `passivbot tool live-config-preflight` for local, read-only HSL, universe,
+  forager, identity, and cache-setting changes between two configs.
+- Added config-only cache readiness/root-hint reporting to
+  `passivbot tool live-config-preflight`, including derived compare-mode
+  readiness deltas without scanning cache artifacts or enforcing startup
+  policy.
+- Added report-only warm-cache readiness evidence to
+  `passivbot tool cache-integrity-doctor`, derived from already-scanned local
+  candle, fill, and HSL/risk cache metadata.
+- Added interior/boundary candle gap summaries to
+  `passivbot tool cache-integrity-doctor` and its report-only warm-cache
+  readiness projection, clarifying leading missing rows and trailing shortfall
+  gaps without repair or startup enforcement.
+- Added fill-cache and HSL/risk-state metadata summaries to
+  `passivbot tool cache-integrity-doctor`, including local fill
+  `pnl_contract` compatibility counts and coverage timestamps.
+- Hardened recent live-ops tooling and debug-profile diagnostics by redacting
+  shareable path fields consistently, keeping Rust debug sample construction
+  best-effort, and scoping EMA debug enrichment to the `ema` profile only.
+- Hardened read-only live-ops tools so `live-config-preflight` and
+  `hsl-startup-preview` resolve both grouped and flat bot-side config keys, and
+  HSL preview output keeps allowlisted event details scalar-only.
+- Added a `fills` live-event debug profile with bounded fill refresh and fill
+  ingestion shape metadata, without raw fill/source payloads or default console
+  changes.
+- Added an `hsl` live-event debug profile with bounded HSL event key, metric
+  key, and latch/cooldown state-shape metadata, without changing default HSL
+  events, console output, or trading behavior.
+- Added an `execution` live-event debug profile with bounded order-wave,
+  order-write, and confirmation key-shape metadata, without raw order payloads
+  or default console changes.
+- Added v2 candle coverage windows and suspicious interior gap samples to
+  `passivbot tool cache-integrity-doctor`, derived only from local `.valid.npy`
+  cache artifacts.
+- Added `passivbot tool live-restart-smoke-plan` for read-only dry-run restart
+  smoke planning from a tmuxp-style supervisor config, with explicit
+  non-execution metadata and rejected execution flags.
+- Added `passivbot tool hsl-startup-preview` for read-only offline HSL
+  startup previews from config and local monitor events, with explicit
+  unavailable fields for current drawdown and panic-order prediction.
+- Added `logging.live_event_debug_profiles` and
+  `PASSIVBOT_LIVE_EVENT_DEBUG_PROFILES` for opt-in structured live-event
+  enrichment, starting with bounded Rust orchestrator input/output samples.
+- Added the `ema` live-event debug profile, which enriches structured
+  `ema.unavailable` events with bounded parsed readiness detail without
+  changing console output or trading behavior.
+- Added the `remote_calls` live-event debug profile, which enriches structured
+  remote-call events with bounded payload-shape and correlation details without
+  adding raw payloads or console output.
+- Added the `candles` live-event debug profile enrichment for candle tail and
+  disk-coverage events, exposing bounded key-shape and timing/counter details
+  without raw candle payloads or console output.
+- Added `passivbot tool live-config-preflight` for read-only offline summaries
+  of risk-relevant live config facts before startup.
+- Added shutdown-event summaries to `passivbot tool live-smoke-report`, including
+  `bot.stopping`, shutdown stage, and `bot.stopped` events in full, summary, and
+  brief reports.
+- Added structured `exchange.time_sync` live events for CCXT timestamp/nonce
+  recovery diagnostics without changing recovery behavior or console volume.
+- Added structured `fills.refresh_summary` startup cache-ready events for fill
+  history cache load diagnostics without adding console noise.
+- Added `passivbot tool live-smoke-report --brief` for top-level VPS smoke
+  counters without event groups or log match details.
+- Added periodic console status lines for coin-mode HSL positions, including
+  distance to RED, drawdown, slot budget, realized PnL peak, and unrealized PnL.
+- Added `passivbot tool live-smoke-report --summary` for concise smoke evidence
+  that keeps high-signal process, log, problem-event, risk, repository, and
+  remote-call health fields without emitting the full verbose report.
+- Added account-critical remote-call health summaries to
+  `passivbot tool live-smoke-report`, isolating balance, position, and
+  open-order endpoint health from broader candle/fill traffic.
+- Added top-level success, failure, and throttle totals to remote-call health
+  summaries in `passivbot tool live-smoke-report`.
+- Added remote-call health rollups to `passivbot tool live-smoke-report`,
+  grouping successes, failures, throttles, latency, and affected symbols by
+  bot/component/kind/surface.
+- Added remote-call elapsed-time summaries to `passivbot tool live-smoke-report`
+  so slow exchange/API calls can be inspected even when they eventually succeed.
+- Added repository branch/head metadata to `passivbot tool live-smoke-report`
+  so VPS smoke evidence records the deployed code revision without counting
+  local untracked artifacts as dirty.
+- Added grouped problem-event summaries to `passivbot tool live-smoke-report`
+  so repeated structured degradation can be inspected by bot, event type,
+  reason, and hard/non-hard status without reading every event sample.
+- Changed `passivbot tool live-smoke-report --log-window-unparsed-policy drop`
+  to skip contextless unparsed log lines inside time-windowed scans, avoiding
+  stale traceback matches when the tail starts in the middle of an old
+  traceback.
+- Added structured `state.refresh_timing` and `state.refresh_progress` live
+  events for staged authoritative refresh timing/progress diagnostics, with
+  bounded smoke-report context for slow pending refresh surfaces.
+- Added live-event trace summary and order-trace sections to
+  `passivbot tool live-incident-bundle` event reports, with
+  `--no-trace-report` for compact bundles.
+- Added `passivbot tool cache-integrity-doctor` for read-only local cache smoke
+  reports covering root presence, file counts/sizes, and empty or corrupt
+  JSON/NDJSON/NPY artifacts.
+- Improved `passivbot backtest --help-all` descriptions for high-impact
+  runtime/config overrides, including plot groups, suite aggregation,
+  HLCV dataset replay modes, HSL modes, and TWEL/WEL policy flags.
+- Added `passivbot tool live-event-query --cycle-trace` for offline cycle
+  reconstruction grouped by cycle id, including bounded timeline samples,
+  aggregate event summaries, and nested order traces.
+- Added `passivbot tool live-event-query --order-trace` for offline order
+  lifecycle reconstruction grouped by order wave and action ids.
+- Added startup phase timing baselines to `passivbot tool live-smoke-report`,
+  showing latest phase timings with rolling median/p95 context from local
+  monitor events.
+- Added `passivbot tool live-event-query --trace-summary` for compact aggregate
+  summaries of matched live event traces, including event types, statuses,
+  reason codes, ids, symbols, and order-wave coverage.
+- Improved event-projected live console summaries for cycle/order execution
+  events, including compact wave, order, confirmation, and Rust planning
+  details without increasing console event volume.
+- Added structured `health.summary` live events for periodic health and
+  resource summaries without adding console noise.
+- Added process/system/event-pipeline resource-pressure fields to structured
+  `health.summary` events, including load average, open file count, queue depth,
+  event drops, and sink error counters when available.
+- Added `passivbot tool live-incident-bundle` for collecting local monitor
+  events, smoke summaries, redacted log excerpts, monitor snapshots, config
+  hashes, runtime metadata, and bounded event segments into a tarball.
+- Added `passivbot tool live-event-query` filters and timeline ids for bot id,
+  snapshot id, plan id, action id, and remote call group id so operators can
+  trace non-cycle live event scopes.
+- Added `passivbot tool live-smoke-report` for local smoke-test summaries from
+  monitor event NDJSON and recent text logs.
+- Added `passivbot tool live-event-query` filters for order wave id, remote
+  call id, symbol, position side, reason code, and status, plus optional
+  timeline rows for matched structured live events.
+- Added structured `cache.load.completed` live events for candle disk-cache load
+  summaries.
+- Throttled repeated `cache.load.completed` live events per symbol/timeframe and
+  added `suppressed_count` so warmup/HSL replay does not flood monitor storage.
+- Added throttled structured `cache.flush.completed` live events for candle
+  disk-cache write summaries.
+- Added structured `risk.mode_changed` live events for HSL runtime forced-mode
+  changes such as panic, graceful-stop, tp-only, and clear transitions.
+- Added off-console structured `unstuck.status` and `unstuck.selection` live
+  events alongside existing `[unstuck]` logs, and included them in
+  `live-smoke-report` risk-event summaries.
+- Added structured `hsl.red_triggered` live events for HSL stop finalization
+  paths that reconstruct or finalize RED state without a fresh threshold-crossing
+  sample.
+- Added structured `bot.startup_timing` live events for startup phase timing
+  diagnostics.
+- Added structured `cache.warmup_decision` live events for candle warmup cache
+  reuse/cold-path summaries.
+- Added `passivbot tool live-event-query --event-type`/`--kind` filters for
+  inspecting specific structured live events without grepping monitor files.
+- Added structured `candle.tail_projected` live events for open-tail EMA
+  projection decisions, preserving per-symbol candle-tail context without
+  default console noise.
+- Added structured `candle.coverage_checked` live events for required candle
+  disk-coverage audits, including bounded missing-span summaries.
+- Added structured `fills.refresh_summary` live events for fill/PnL refresh
+  timing, coverage, retry, and failure summaries without exposing raw fill ids.
+- Reduced default console/file noise for candidate-only forager EMA and
+  open-tail projection diagnostics; detailed per-symbol internals remain in
+  structured/debug events while active-symbol failures still fail loudly.
+- Changed `passivbot tool live-event-query` directory scans to inspect
+  `current.ndjson` segments by default; use `--include-rotated` for full
+  rotated history validation.
+- Added `live.limit_order_create_max_market_dist_pct` with a default of `0.8`
+  so live skips limit-order creations far outside fresh market price bands
+  instead of repeatedly submitting exchange-invalid deep orders.
+- Added `passivbot tool live-event-query` to validate monitor event NDJSON and
+  reconstruct one live event chain by `cycle_id`.
+- Added staged live shutdown progress events/logs, made candle fetch-lock waits
+  abort promptly once shutdown is requested, and shortened the post-cancel
+  background execution-loop grace from 5s to 1s.
+- Fixed Bitget UTA / Elite close-order placement by omitting the one-way-only
+  `reduceOnly` flag from hedge-mode v3 orders that already send `posSide`.
+- Fixed Bitget UTA / Elite open-order normalization so hedge-mode close orders
+  keep their exchange-reported `side` instead of being misread as entries.
+- Fixed Rust extension freshness detection for Python abi3 builds so
+  `passivbot_rust.abi3.so` artifacts are discovered, source-stamped, and reused
+  instead of triggering repeated rebuilds followed by stale-extension failures.
+- Fixed v8 backtests/optimizer runs so candidates with depleted raw wallet
+  balance terminate through the normal liquidation path and emit incomplete
+  `backtest_completion_ratio` metrics instead of crashing coin-HSL slot-budget
+  evaluation.
+- Implemented the v8 TWEL policy contract: TWEL entry gating is now controlled
+  separately from TWEL auto-reduce, entry gating uses the capped thresholded
+  portfolio cap, and TWEL auto-reduce supports `reduce_overweight` and
+  `reduce_portfolio` policies while remaining subject to the realized-loss gate.
+  Manual and panic exposure now counts toward same-side TWEL measurement while
+  remaining excluded from TWEL auto-reduce candidate selection.
+- Fixed live forager EMA readiness for flat approved-universe and transient
+  forager-selected symbols: missing close/required EMA data now marks the flat
+  symbol nontradable for that planning cycle instead of restarting the execution
+  loop, while explicit normal symbols and held/open-order symbols remain
+  fail-loud.
+- Fixed two live restart/minute-boundary edge cases: required 1m log-range EMA
+  loads now retry bounded open-tail projection when a fresh one-candle tail
+  appears after projection precompute without clearing candidate-only forager
+  qv/log-range maps to `None`, and coin-HSL balance/equity replay now emits
+  explicit zero coin-UPnL for replay-proven flat symbols with realized history.
+- Hardened live forager promotion readiness: newly selected normal forager
+  symbols now get targeted candle warmup before normal order planning, and
+  missing required forager ranking EMAs still fail loudly for active/normal
+  symbols instead of silently making them nontradable.
+- Fixed live HSL restart replay so historical drawdown threshold crossings no
+  longer create a fresh RED panic after recovery; startup now panics only when
+  current drawdown is RED or when exchange-derived panic/cooldown markers
+  reconstruct an active prior HSL stop.
+- Hardened v8 live startup after overnight VPS probes: deterministic coin-HSL
+  validation errors stop as terminal startup failures instead of restart loops,
+  stale candle fetch locks now include owner diagnostics and local hold-timeout
+  warnings, partial fill-history gap repairs persist correctly, true secondary
+  forager symbols with unavailable required EMA inputs are marked nontradable
+  until fresh data is available, active/normal EMA inputs remain fail-loud, and
+  Gateio history replay uses single-fetch concurrency by default.
+- Hardened v8 live restart behavior by clearing successfully retried empty
+  fill-history gaps, failing loudly on ambiguous coin-HSL carry-in replay,
+  avoiding duplicate coin-HSL startup replay, keeping active/normal forager
+  EMA inputs fail-loud, and summarizing close-EMA fallbacks.
+- Reduced v8 live startup noise and CPU pressure by summarizing flat forager
+  candidate EMA readiness failures, optimizing coin-HSL restart replay, adding
+  coin-HSL replay progress logs, and suppressing known websocket timeout futures.
+- Reduced live Kucoin fill-history churn by keeping old synthetic PnL records out of
+  routine/latest repair windows, and made flat forager candidates with unavailable
+  required EMA volatility inputs non-tradable for that planning cycle instead of
+  restarting the execution loop.
+- Fixed v8 live fill-history startup/restart behavior so unproven
+  `pnls_max_lookback_days` coverage triggers a blocking lookback refresh and
+  retry/defer instead of sending neutral PnL inputs or repeatedly restarting the
+  execution loop.
+- Reduced repeated live fill-history repair work when coverage remains blocked
+  by the same unresolved gap, and made live execution-loop retry delays respond
+  promptly to shutdown.
+- Hardened live candle EMA inputs by filtering invalid OHLCV rows at ingestion and
+  preventing a leading non-finite candle sample from poisoning log-range EMAs.
+- Added `strategy_eq_underwater_pct_mean` and `strategy_eq_underwater_pct_median`
+  backtest metrics for average and median daily-worst strategy-equity drawdown.
+- Added `bot.<side>.strategy.trailing_martingale.entry.ema_gate_mode` with
+  `disabled`, `all`, `initial`, and `reentry` modes for controlling which entry
+  orders are EMA-gated. The fixed enum is not optimized; one-way flat
+  long-vs-short tie-breaking still requires EMA bands even when emitted entry
+  EMA gating is disabled.
+- Added `bot.<side>.unstuck.ema_gating_enabled` as a fixed auto-unstuck toggle.
+  When false, auto-unstuck skips the EMA trigger while keeping loss allowance,
+  exposure threshold, and sizing checks intact.
+- Changed the v8 default backtest candle interval to 1 minute and added
+  `bot.<side>.risk.we_excess_allowance_mode`. V8 defaults to bounded excess
+  allowance; migrated v7 trailing-grid configs also force v7-absent entry
+  cooldowns to `0.0`, warn when v7 raw excess allowance would be clamped, and
+  report inserted v8 defaults for review.
+- Coin overrides can now set `bot.<side>.unstuck.loss_allowance_pct`. When an
+  overridden coin+side is selected for auto-unstucking, Rust uses that percentage
+  in the existing account-wide allowance formula while preserving the one-position
+  global unstuck selection behavior.
+- Added Bitget UTA / Elite copy-trading account support with v3 API routing for
+  balance, orders, and fill-event history while keeping classic Bitget accounts
+  on the existing v2/mix paths.
+- Fixed Hyperliquid balance on unified/portfolio-margin accounts. The unified
+  `total[USDC]` payload is the cross-margined account *equity* (it already
+  includes perp unrealized PnL for core and every HIP-3 dex), but Passivbot was
+  using it directly as `balance`, then recomputing `equity = balance + uPNL` —
+  double-counting unrealized PnL. Balance now subtracts the exchange-reported
+  uPNL across all perp positions (core + HIP-3), matching the non-unified path
+  and the Passivbot `balance = equity - uPNL` contract. Missing/invalid uPNL on
+  a counted position hard-fails rather than defaulting.
+- Added `backtest.market_settings` overrides for historical/rebranded market metadata, including
+  exchange-specific overrides before Rust backtests receive market parameters; backtests now warn
+  and default missing `c_mult` to 1.0 instead of hard-failing.
+- Fixed live `[pos]` logging so short position size increases are labeled as
+  `added` and short size decreases as `reduced`, matching exposure magnitude
+  instead of signed numeric ordering.
+- Fixed live ignored-coin handling so ignored symbols are sent to the Rust
+  orchestrator as `graceful_stop`, preventing new initial entries after a
+  previously open ignored position becomes fully flat.
+- Added a v8 TWEL/total exposure enforcer policy-contract plan for the future
+  portfolio governor redesign, based on the known v7 threshold/refill behavior
+  but without changing current v8 runtime behavior.
+- Hardened v8 live-safety review follow-ups: ambiguous order-create responses are
+  remembered before retry, protective panic bypasses stale normal-mode filters
+  while requiring fresh account-critical balance/position/order state, PnL risk
+  gates require explicit fill-history coverage including coin HSL, Bitget keeps
+  multiple fills per order, and OKX net-mode accounts fail loudly.
+- Added optimizer polish bounds via `--polish-pct`/`--polish-bounds-pct`, which narrows
+  existing optimize bounds around the current config values while preserving positive steps.
+  `--polish-bounds-mode` can now choose the default clamped behavior, allow tunable
+  polished bounds to escape the original bounds, or expand fixed bounds too.
+- Fixed Pareto-member replay drift when a reusable HLCV cache contains more warmup than
+  the selected config's own indicators require. Backtests now preserve the optimizer's
+  bounds-aware warmup window and requested-start trade floor, so replaying an optimizer
+  Pareto JSON matches its recorded metrics when the same dataset is used.
+- Hardened v8 audit follow-ups: live HSL cooldowns now reset from flat-confirmed
+  panic fills, suite metric medians are real/fail-loud, malformed foreign
+  client-order ids decode to `unknown`, partial OHLCV fetches no longer bless
+  stale gaps/chunk rows, live realized-loss gate zero values and fee metadata are
+  preserved, trailing-anchor-unavailable symbols keep existing orders untouched,
+  and unsupported live fill-event exchanges now fail with an explicit startup error.
+- Fixed v8 backtests so delisted open positions are realized at the last valid candle, and
+  next-candle close-ladder peeking expands recursive close grids when any ladder rung can fill.
+- Fixed live v8 trailing state handling so missing fill anchors or candle failures preserve
+  the last known trailing bundle and mark affected symbols non-tradable for the planning cycle.
+- Tightened optimizer fail-loud behavior: non-finite scenario metrics now invalidate the
+  candidate instead of scoring as zero, median limit stats are emitted, malformed
+  `optimize.limits` fail config loading, and fatal optimizer exceptions exit non-zero.
+- Fixed fill-event attribution edge cases: Bitget hedge-mode bare close fills now map
+  buy closes to shorts and sell closes to longs, fill normalization no longer falls back
+  to raw client ids or long-side defaults on helper import failures, and Bybit refreshes
+  avoid double-counting overlapping coalesced execution ids.
+- Tightened OHLCV fetch failure handling so exhausted CCXT retries now fail instead of
+  masquerading as an empty page that can persist a false trailing-unavailable gap.
+- Fixed live HSL no-restart latching to preserve the persistent stop-episode peak
+  across auto-restart cooldowns and restart history replay, matching v8 backtest behavior.
+- Tightened Bitget fill normalization so ambiguous side/position-side payloads fail
+  loudly instead of defaulting fills to the long side.
+- Backtests now use exchange-derived per-coin maker/taker fees by default, while
+  `backtest.maker_fee_override` and `backtest.taker_fee_override` remain explicit
+  global overrides and are exposed as visible backtest/optimize CLI flags.
+- Suite backtests and optimizer suites now reject asymmetric per-side approved/ignored
+  coin lists instead of silently converting them to a long/short union.
+- Live execution now skips both order cancellations and creations while the raw wallet
+  balance is below the configured threshold, avoiding entry-grid cancellation from a
+  transient near-zero balance snapshot.
+- Live order reconciliation now blocks a symbol and requests a full account refresh
+  when an open order snapshot is malformed, instead of dropping the bad actual order
+  and creating a duplicate.
+- Rust live/backtest orchestration now rejects missing or invalid exchange metadata
+  and requires the realized-loss gate parameter instead of accepting neutral serde/PyO3
+  defaults.
+- Exchange configuration and test doubles now fail loudly on unsafe setup gaps:
+  Binance/Bitget/KuCoin hedge-mode failures propagate, KuCoin order side inference
+  prefers explicit hedge-side payloads, custom endpoint override errors raise, and
+  the fake exchange rejects invalid reduce-only orders instead of silently clipping them.
+- OHLCV cache integrity handling now retries expired persistent gaps after the documented
+  seven-day horizon, avoids stealing active fetch locks by unlinking lock files, serializes
+  v2 chunk writes with per-chunk locks, and no longer wipes corrupt chunks before a remote
+  repair succeeds.
+- Backtest HLCV preparation now preserves real-row validity through source-dir/direct fetches,
+  dataset overrides, and archive day imports, preventing edge-filled listing/delisting gaps
+  from becoming tradable candles.
+- Changed optimizer candidate canonicalization so disabled trailing-martingale close
+  retracement params collapse to bounded canonical values before evaluation, duplicate
+  detection, and Pareto/result persistence.
+- Fixed suite backtests so scenario data preparation always includes the base
+  `live.approved_coins` universe even when other scenarios define explicit
+  coin subsets, and so `coin_overrides.<coin>.live.forced_mode_<side>=normal`
+  is carried into Rust backtests as a forced normal active slot.
+- Tightened fail-loud handling for live cancellations, current fill-event caches, and
+  single-exchange HLCV preparation: unexpected cancel failures now propagate through
+  restart/error handling, unreadable current fill-cache day files fail cache loading, and
+  per-coin HLCV fetch errors no longer silently shrink the requested backtest universe.
+- Added HSL `coin` signal mode, which tracks per-coin realized drawdown plus current UPnL
+  against the configured slot budget and panic-closes only the affected `coin+pside`. Live
+  uses configured `n_positions`; backtests use configured `n_positions` in fixed-WEL mode and
+  the effective tradability-aware denominator when `dynamic_wel_by_tradability=true`.
+- Hardened HSL `coin` restart reconstruction and backtest artifacts: live replay now restores
+  active RED panic state from per-coin history, and coin-mode backtests emit side strategy-equity
+  and drawdown series with one sample per bar.
+- Fixed backtest HSL setup so enabling HSL on one side no longer implicitly enables the disabled
+  opposite side through the common HSL config.
+- Hardened live coin-HSL restart replay so open positions and panic/cooldown history require
+  exchange-derived per-coin timeline PnL, panic-flatten markers are reconstructed per coin, and
+  active cooldown intervention/residue state survives restart.
+- Exposed `live.hsl_signal_mode` on the backtest/optimize CLI as `--hsl-signal-mode`,
+  so HSL signal mode can be changed without editing the config file.
+- Added HSL backtest metrics for per-event panic-close realized-loss drawdown severity:
+  min, mean, and max loss as a fraction of equity before each panic-close episode.
+- Reduced suite-optimizer seed-evaluation memory pressure by passing lazy-sliced coin
+  columns to Rust as active indices instead of materializing per-worker HLCV coin-subset
+  copies.
+- Fixed live Hyperliquid `xyz:*` stock-perp EMA reads during off-hours/no-trade
+  tails by allowing stock-perp-only flat zero-volume tail candles from the last
+  real close, while preserving fail-loud behavior when no real candle seed exists.
+- Tightened optimizer starting-config semantics: seed and fine-tune anchor values outside
+  `optimize.bounds` are clamped with aggregated source/key logging, while base-config runtime
+  policy fields such as HSL/unstuck boolean toggles now win over anchor configs.
+- Added a Metric/Metric Correlations table to `passivbot tool pareto-analyze`,
+  limited to metrics already shown in Metric Distributions, and wrote the full
+  selected metric-correlation set to `metric_correlations.csv` when using
+  `--output-dir`.
+- Changed pymoo NSGA-III `population_size: null` to use a default population
+  budget of `500` while auto-selecting the finest compatible reference-direction
+  grid, so adding objectives no longer drops the per-generation population
+  because of Das-Dennis grid jumps.
+- Added `passivbot tool ohlcvs-doctor` to audit v2 OHLCV chunk caches and
+  rebuild `caches/ohlcvs/catalog.sqlite` metadata from copied `data/` chunks.
+- Capped loss/profit-ratio analysis metrics at a finite value for losing-only
+  backtests while keeping no-PnL runs neutral, preventing optimizer scoring on
+  `loss_profit_ratio` from failing after JSON/Python metric aggregation.
+- Capped `risk_we_excess_allowance_pct` by the side's `total_wallet_exposure_limit`
+  before per-position sizing, WEL enforcement, unstuck, threshold weighting, and
+  min-effective-cost projections use it, so `n_positions = 1` no longer allows
+  per-symbol exposure above TWEL through excess allowance.
+- Changed v8 optimizer fine-tuning so combining `--fine-tune-params` with `--start`
+  treats the starting configs as fixed-parameter anchors, letting one run tune selected
+  params across multiple Pareto candidates while preserving plain `--start` as seed-only.
+- Canonicalized live fill-event accounting: cached fills now store gross `pnl`,
+  signed quote-currency `fee_paid`, fee-quality metadata, and a
+  `gross_pnl_quote_fee_best_effort_v2` cache contract. Non-quote fees are
+  converted when a fresh ticker is available, otherwise estimated from reported
+  fee rates or `live.fee_pct_fallback`; every fill is sanity-checked against
+  `live.fee_pct_sanity_abs_max`.
+- Fee-policy warnings now deduplicate repeated overlapping-refresh examples
+  and include the original rejected fee ratio/source when sanity replacement
+  uses `live.fee_pct_fallback`.
+- Live realized-loss gates, unstuck allowances, fill health summaries, and
+  backtest rolling realized-PnL risk windows now use net realized PnL
+  (`pnl + fee_paid`) consistently. KuCoin positions-history net cycle PnL is
+  converted back to gross close-fill PnL before reconciliation, and
+  legacy/missing-contract caches are repaired when safe or quarantined and
+  rebuilt automatically from exchange fills on startup.
+- Fixed live bots so non-shutdown `asyncio.CancelledError` failures from CCXT
+  account-state or candle fetches are logged, counted, and routed through the
+  existing restart/backoff path instead of silently exiting without countdown.
+- Fixed live orchestrator order calculation so live bots no longer require
+  `backtest.market_order_slippage_pct`; backtest-only market slippage remains
+  confined to backtest simulation.
+- Backtest and optimizer runs now automatically clean stale `caches/ohlcvs/materialized/`
+  scratch payloads while preserving materialized directories locked by active processes.
+- `live.custom_endpoints_path` is now part of the canonical config schema, so normalized
+  live configs preserve endpoint override files instead of dropping the documented setting.
+- Updated user-facing docs for current CLI logging flags, custom endpoint setup,
+  backtest exchange naming, suite exchange expansion, uncovered tool commands, and
+  current Forager/indicator wording.
+- Changed the v8 strategy runtime to use Rust-owned `trailing_martingale` and `ema_anchor`
+  strategy parameters end-to-end, with no production fallback bridge from removed v7
+  `trailing_grid` fields.
+- Added deprecated v8 compatibility strategy kind `trailing_grid_v7` plus
+  `passivbot tool migrate-config-v7` for explicitly converting v7 trailing-grid configs into
+  canonical v8 shape without reinterpreting them as `trailing_martingale`.
+- Fixed live v8 EMA warmup sizing to fail loudly on malformed strategy/forager span values
+  instead of silently shrinking the warmup window and risking missing orchestrator EMA inputs.
+- Hardened `trailing_martingale` close recursion against non-finite close prices before
+  sorting recursive close ladders.
+- Updated the canonical v8 schema defaults and mirrored example config to the new
+  `trailing_martingale` long-only `n_positions = 4` profile at
+  `configs/examples/default_trailing_martingale_long.json`.
+- Fixed Hyperliquid `xyz:*` stock-perp backtest/optimizer startup so explicit
+  `backtest.ohlcv_source_dir` data can use the direct source-dir preparation path when
+  strict local v2 materialization is unavailable.
+- Added optimizer `--resume` checkpoint recovery safeguards: resume now requires a
+  readable checkpoint plus prior `all_results.bin` metadata, rejects changed optimizer
+  search domains before appending results, and exits non-zero on fatal optimizer errors.
+- Changed explicit `backtest.ohlcv_source_dir` backtest/optimizer runs to read that
+  caller-managed OHLCV tree directly instead of first importing it into PB7's v2 raw
+  `caches/ohlcvs` store; the final prepared HLCV cache is still written normally.
+
+## v7.12.0 - 2026-05-27
+
+- Changed backtest/optimizer HLCV preparation to treat normal market availability limits as coverage metadata: late coin starts and unavailable tails are logged and persisted in artifacts instead of aborting the whole run; large internal gaps are repaired or excluded from the tradable window so synthetic spans do not become tradable. Corruption, malformed candles, missing BTC benchmark data, and no tradable candles still fail loudly.
+- Final `caches/hlcvs_data/` caches now require valid manifests and old manifest-less final caches rebuild by default; explicit override datasets require valid manifests/checksums.
+- Added per-coin HLCV coverage metadata to materialized datasets, including requested range, valid start/end, leading/trailing missing minutes, internal gap counts/windows, and synthetic fill count/source.
+- Capped omega-ratio analysis metrics at a finite value when a backtest has positive returns with no losing days, and reports flat/no-movement windows as `0.0`, preventing optimizer scoring metrics from disappearing during JSON/Python aggregation.
+- The `v8` branch is versioned as the next major release, `v8.0.0`.
+- Increased the pymoo NSGA3 auto reference-direction cap from `330` to `500`, giving 9-objective auto-population optimizer runs `495` reference directions instead of `165`.
+- Fixed v8 strategy min-effective-cost gating so live and backtest use the active strategy's initial sizing parameter instead of legacy flat `BotParams.entry_initial_qty_pct`.
+- Fixed flat shared bot keys to override grouped defaults during config canonicalization, and changed flat strategy coin overrides to fail loudly instead of being silently discarded.
+- Added a live-only entry cooldown guard that can anchor `entry_cooldown_minutes` from exchange-observed position increases when fill-event data is temporarily delayed.
+- Fixed optimizer/backtest HLCV universe preparation for canonical v8 grouped bot config, so side enablement reads `bot.<side>.risk.total_wallet_exposure_limit` and `bot.<side>.risk.n_positions` without requiring runtime flat aliases.
+- Fixed strict v2 HLCV materialization so a leading invalid prefix is accepted as pre-inception when the first valid candle matches authoritative first-timestamp metadata, even if an older persistent gap starts inside that prefix.
+- Fixed strict v2 HLCV gap cleanup so overlapping persistent pre-inception records no longer crash materialization with a SQLite unique-constraint error while normalizing authoritative first-candle boundaries.
+- Fixed suite HLCV preparation so individual exchange datasets use the date windows of the scenarios that consume them instead of inheriting the global combined-suite window.
+- Fixed `position_held_*` and `position_unchanged_*` backtest metrics so still-open positions are measured through the backtest end timestamp instead of stopping at the last fill.
+- Changed optimizer `fixed_params` and `--fine_tune_params` to v8 dotted config-path selectors, with path-prefix matching such as `long.strategy` for `bot.long.strategy.<active_strategy>.*` and sorted multi-line logs showing each selector expansion in compact dotted form.
+- Extended optimizer `fixed_params` and `--fine_tune_params` selectors to match config-path suffixes, so leaf selectors such as `we_excess_allowance_pct` expand to all matching long/short bounds while still avoiding partial-substring matches.
+- Added fill-activity backtest analysis metrics covering fill counts, per-day rates, long/short and entry/close splits, no-fill gap durations, slot-normalized activity, active fill days, analysis duration, active symbols, and top-symbol fill concentration.
+- Fixed `passivbot tool pareto -o/--objectives` so stored fill-activity metrics such as `fills_gap_p95_hours` can be used for candidate selection even when they were not part of the optimizer run's original `optimize.scoring`.
+- Added `passivbot tool pareto-compress` for selecting a compact, non-destructive representative subset from a Pareto front, with optional copied JSON output and a selection manifest. When writing to a non-empty output directory, the tool now leaves unrelated files in place and overwrites only selected output filenames plus `selection.json`.
+- Changed optimizer scoring and limit handling to fail loudly when a configured metric is absent from backtest analysis instead of silently treating it as zero or no violation.
+- Restored `backtest_completion_ratio` in backtest analysis and optimizer suite metrics so default optimizer limits can reject early-stopped backtests without failing on a missing metric.
+- Replaced the v7 `trailing_grid` strategy schema with the v8 `trailing_martingale` strategy. Entries and closes now use unified threshold/retracement parameters with 1h/1m volatility scaling; entries also support wallet-exposure scaling, while closes support additive wallet-exposure threshold shifts for recursive reduce ladders.
+- Bumped the canonical config schema to `v8.0.0`, added shared dynamic distance multiplier logic for `trailing_martingale` and `ema_anchor`, changed `ema_anchor` inventory sensitivity to signed wallet-exposure ratio, and added explicit runtime toggles for the position exposure enforcer, total exposure enforcer, and auto-unstuck.
+- Renamed timeframe-specific EMA span config fields to use explicit `1m` / `1h` suffixes, including forager `volume_ema_span_1m` / `volatility_ema_span_1m`, trailing martingale `volatility_ema_span_1m` / `volatility_ema_span_1h`, and ema anchor volatility span fields.
+- Changed v8 risk handling so manual-mode positions are outside bot-managed active slots and bot-scope TWEL accounting, renamed user-facing WEL/TWEL enforcer config keys to `position_exposure_enforcer_*` / `total_exposure_enforcer_*`, and gave total exposure enforcement a second reduction pass that can trim least-stuck bot-scope positions below their per-position floor when required to bring total exposure back under the configured threshold.
+- Added canonical strategy-equity recovery-duration metrics: `strategy_eq_recovery_days_mean`, `strategy_eq_recovery_days_median`, `strategy_eq_recovery_days_p95`, `strategy_eq_recovery_days_p99`, `strategy_eq_recovery_days_mean_worst_5pct`, `strategy_eq_recovery_days_mean_worst_1pct`, and `strategy_eq_recovery_days_max`; `peak_recovery_days_strategy_eq` remains as a backwards-compatible alias for the max.
+- Changed pymoo NSGA-II optimization so `optimize.population_size: null` now auto-resolves to `250`, avoiding startup failures when `optimize.pymoo.algorithm: "auto"` selects NSGA-II for small objective sets.
+- Added backtest `entry_interval_hours_mean`, `entry_interval_hours_median`, `entry_interval_hours_p95`, `entry_interval_hours_p99`, and `entry_interval_hours_max` analysis metrics, measuring gaps between normal initial entries per coin and side.
+- Fixed CCXT live startup so malformed metadata on unrelated ineligible exchange markets no longer blocks the bot, while executable symbols still fail loudly when required qty sizing metadata is missing.
+- Fixed Bybit UTA live balance parsing so Passivbot uses account equity minus perpetual UPNL as raw balance instead of double-applying UPNL from collateral `usdValue` fields.
+- Fixed KuCoin aggregate realized-PnL enrichment so positions-history rows are reconciled as cycle observations against reconstructed fill lifecycles only when unambiguous, preventing rapid or delayed position cycles from being assigned to the wrong close fill while ambiguous rows stay synthetic and refreshable.
+- Changed staged live bounded active 1m tail gaps to project provisional no-trade EMA inputs for close, quote-volume, and log-range instead of carrying forward latest-real EMA values; projected rows and EMA values are not persisted or reused once real candles arrive.
+- Live fill events now synthesize missing realized PnL from canonical fill history when exchange enrichment remains unavailable, with explicit synthetic/degraded provenance and later authoritative replacement when enriched data is fetched.
+- Added exponential backoff while live account refresh is blocked by pending realized-PnL enrichment, so stale KuCoin close fills no longer trigger continuous fill-history polling while PnL-dependent logic remains blocked.
+- Fixed OHLCV v2 backtest/data-download fetches so newly downloaded rows are written directly to `caches/ohlcvs` instead of repopulating deprecated `caches/ohlcv` daily shards.
+- Cleaned up `passivbot tool generate-mcap-list` startup output by routing through its normal CLI entrypoint and suppressing noisy symbol-map lock maintenance warnings.
+- Fixed live fill refreshes so cached close fills with pending realized PnL keep extending the incremental refresh window until exchange enrichment catches up, KuCoin positions-history enrichment uses a bounded delayed-record lookahead, and pending-PnL account refresh blocks no longer burn the generic restart budget.
+- Fixed backtest/data-downloader startup when the legacy `caches/ohlcv` path is a dangling symlink after moving to the v2 `caches/ohlcvs` store.
+- Increased the pymoo NSGA3 auto reference-direction cap from `330` to `500`, giving 9-objective auto-population optimizer runs `495` reference directions instead of `165`.
+- Restored `backtest_completion_ratio` in backtest analysis and optimizer suite metrics so default optimizer limits can reject early-stopped backtests without failing on a missing metric.
+- Changed optimizer scoring and limit handling to fail loudly when a configured metric is absent from backtest analysis instead of silently treating it as zero or no violation.
+- Fixed `passivbot tool pareto -o/--objectives` so stored fill-activity metrics such as `fills_gap_p95_hours` can be used for candidate selection even when they were not part of the optimizer run's original `optimize.scoring`.
+- Fixed `position_held_*` and `position_unchanged_*` backtest metrics so still-open positions are measured through the backtest end timestamp instead of stopping at the last fill.
+- Added `passivbot tool pareto-analyze` and `passivbot tool pareto-compress` for inspecting Pareto-front metric/config distributions and selecting compact representative subsets with optional copied JSON output. When `pareto-compress` writes to a non-empty output directory, it leaves unrelated files in place and overwrites only selected output filenames plus `selection.json`.
+
+## v7.11.0 - 2026-05-13
+
 - Fixed backtests with asymmetric `approved_coins` so long-only and short-only coin lists remain side-specific, disabled sides no longer inflate HLCV data preparation, and dynamic WEL-by-tradability counts side-eligible coins separately.
 - Fixed Rust extension auto-rebuild coordination so simultaneous bot startups share one compile, waiters re-check freshness after the lock, stale lock timeouts fail closed, and stale shadow artifacts are no longer stamped as current.
+- Live fill events now distinguish detected fills from realized-PnL enrichment: close fills whose exchange PnL details are not yet available log `pnl=pending`, block PnL-dependent logic until enriched, and emit an enrichment log once the authoritative PnL arrives.
 - Fixed TWEL auto-reduce dead zones where positions sitting at raw per-position WEL could block reductions even though `risk_twel_enforcer_threshold < 1.0` required total exposure below TWEL.
 - Changed the HSL config default `live.hsl_signal_mode` to `unified`, making account-level strategy drawdown the canonical HSL signal while keeping `pside` available for side-local HSL tuning, and clarified that HSL RED waits for all positions on that side to be fully closed rather than waiting for PnL recovery.
 - Added `passivbot tool merge-paretos` for combining two or more Pareto run/front directories into capped long/short starting-config sets.
@@ -14,6 +2433,48 @@ All notable user-facing changes will be documented in this file.
 - Fixed Gate.io live order creation with current CCXT/Gate.io by passing Passivbot custom ids as `clientOrderId`, letting CCXT emit Gate.io's required `t-`-prefixed order `text` while preserving the embedded Passivbot order-type marker.
 - Fixed live foreign-writer detection so a bot's own freshly acknowledged orders can be recognized by exchange order id, canonical Passivbot custom id, or a strict recent order fingerprint instead of relying only on raw client-id string equality.
 - Fixed OHLCV v2 planning so persistent gaps are not bypassed by sparse store bounds, and single-exchange backtest preparation no longer attempts the same v2 local path twice before falling back.
+- Hyperliquid HIP-3 ticker fallback now uses dex inference from market metadata instead of relying only on CCXT `info.hip3`, and ticker probe coin resolution now accepts HIP-3 aliases such as `SP500`, `xyz:SP500`, and `XYZ-SP500`.
+- Hyperliquid live startup now detects and logs account abstraction mode, treats `portfolioMargin` as unified-compatible for HIP-3/non-standard perps, limits non-unified `dexAbstraction` accounts to vanilla perps, and adds `passivbot tool hyperliquid-abstraction-probe`.
+- Hyperliquid staged live state now uses one coherent positions+balance snapshot without the earlier exchange-specific HIP-3 reserve-reconciliation layer, reducing `REST`/`REST+open_orders` balance oscillation and order-size churn.
+- Live candle fetching now applies the configured candle fetch delay inside `CandlestickManager` before each CCXT OHLCV call, reducing paginated startup/refresh bursts across exchanges instead of only sleeping after symbol-level refresh loops.
+- Live background candle warmup now runs as lower-priority work by default, with one-symbol concurrency and minimum pacing, so broad cache catch-up is less likely to compete with account-state refreshes and order execution.
+- Live fill refreshes now distinguish routine recent-fill checks from explicit account-state confirmations: routine incremental refreshes default to a narrower `live.fills_recent_overlap_minutes=10.0`, while confirmation refreshes keep `live.fills_confirmation_overlap_minutes=60.0`.
+- Staged live routine fill refreshes now prefetch in a single-flight background lane after the initial fill stamp, so ordinary minute-boundary fill checks no longer block account refresh/order planning unless fills fall behind or an explicit confirmation is pending.
+- Live forager INFO logs now report actual selected-set/slot changes, hysteresis replacements, and periodic heartbeats; rank-only score movement is kept at DEBUG to reduce log noise.
+- Live active-candle refresh gaps that look like one-candle exchange publication lag now log at INFO with slower throttling instead of recurring WARNING lines; larger/actionable gaps still warn.
+- Live initial entry creations now have an optional executor-side market-distance gate (`live.initial_entry_exec_max_market_dist_pct`, default `0.005`) to avoid posting far-from-market EMA-drifting initial orders. Blocked initial entries are visible at INFO when first blocked or when price/qty drift exceeds `live.order_match_tolerance_pct`.
+- Increased the default `live.forager_score_hysteresis_pct` from `0.005` to `0.02` to reduce forager selection flip-flop observed in live multi-exchange testing.
+- Tightened the default live OHLCV budget from `30` to `24` fetches/minute and increased default `live.recv_window_ms` from `5000` to `10000` to reduce public-data pressure and Binance timestamp drift rejects.
+- Detailed per-symbol min-effective-cost entry blocks now log at INFO at most once per hour per symbol/side, summary counts are INFO with explicit blocked/detailed/suppressed totals, and unchanged repeated blocks are suppressed to DEBUG to keep normal logs actionable.
+- Routine empty fill-refresh timing, KuCoin empty fill-history fetch chatter, and clean fast order-settlement confirmations now log at DEBUG; INFO is reserved for new fills, blocking fill confirmations, very slow fill refreshes, non-open-order confirmation changes, or slow settlement.
+- Live staged completed-candle freshness now keys the ledger by required completed minute per symbol instead of mutable cache internals, reducing unnecessary safe deferrals after background candle refreshes improve the cache.
+- Live websocket reconnect logs are now throttled: early reconnects and persistent reconnect storms remain visible at WARNING, while repeated reconnect chatter and tracebacks move to DEBUG.
+- Live forager candle refresh now prioritizes symbols with positions or open orders and budgets forager-only active symbols with `live.max_ohlcv_fetches_per_minute`, reducing broad approved-coin OHLCV refresh bursts.
+- Live forager candle refresh now has a wall-time cap (`live.max_forager_candle_refresh_seconds`, default `45`) so best-effort broad candidate candle catch-up yields and retries later instead of monopolizing runtime on slow or sparse exchanges.
+- Staged live active-symbol candle freshness now tolerates bounded open-ended 1m tail gaps with `live.max_active_candle_tail_gap_minutes` (default `10`), carrying forward the latest real candle/EMA state with warning-visible diagnostics instead of blocking immediately; gaps beyond the threshold still block the affected trading-critical candle surface.
+- Added `passivbot tool ticker-probe`, a read-only exchange capability probe for `fetch_ticker`, `fetch_tickers(symbols)`, `fetch_tickers()`, and optional top-of-book data to support separating live price truth from candle fetching.
+- Added `passivbot tool ticker-endpoint-probe`, a multi-user read-only CCXT timing probe for ticker variants, bids/asks, order book, 1m OHLCV tail behavior, market metadata, and private account-state endpoints.
+- Staged live order planning now sources bid/ask/last from a dedicated market snapshot provider before falling back to candle-manager last prices, moving current price truth out of incomplete candle paths.
+- Live authoritative refresh now always uses the staged account-state pipeline. The legacy live refresh path and `live.authoritative_refresh_mode` config selector were removed; older branches such as `v7.10` remain the comparison point for legacy behavior.
+- Live market snapshots now cache all valid symbols returned by a bulk ticker response and coalesce concurrent cache misses behind one in-flight `fetch_tickers()` request, reducing redundant remote calls during staged planning.
+- Live market snapshots now strictly retry missing symbols with the exchange's symbol-scoped ticker endpoint before failing, avoiding unnecessary execution-loop aborts when a bulk ticker response omits a few requested symbols.
+- Live market snapshots now use an explicit ticker strategy: broad `fetch_tickers()` remains the default, Hyperliquid keeps its custom `allMids` path, and Bitget defaults to `fetch_tickers(symbols)` because Bitget's broad CCXT ticker response can omit requested USDC perp symbols.
+- Live foreign-writer detection now treats create-order timeouts/errors as ambiguous bot-owned attempts for a bounded recent window, preventing the bot from falsely flagging its own orders as foreign when the exchange accepted an order but the create call timed out.
+- Staged live execution now records account, candle, and market-data freshness in an explicit ledger and blocks new order creation for a symbol when a bot-created order disappears before a follow-up account-state refresh can rule out a fill.
+- Staged live order planning now hard-fails before Rust order calculation if the current authoritative epoch is missing required account, completed-candle, or market-snapshot freshness stamps.
+- Staged live order sorting now preserves the original deterministic order with a visible warning when market prices are unavailable, instead of silently assigning missing prices a neutral distance.
+- CandlestickManager now has a completed-candle-only contract: compatibility latest-close helpers no longer fetch tickers, current-minute OHLCV, or persist in-progress candles; live current price reads use market snapshots instead.
+- Live candle health diagnostics now report required completed-candle coverage for active symbols, including 1m/15m/1h freshness, missing spans, known gaps, and runtime synthetic candles, with detailed output at `DEBUG` and `INFO` only when interesting.
+- Live forager candle budgeting now ranks refresh candidates by latest completed-candle staleness, keeps position/open-order symbols outside non-critical budget limits, and supports `live.max_forager_candle_staleness_minutes` to cap acceptable eligible-coin staleness.
+- Live startup now performs only a minimal trading-ready candle warmup for symbols with positions/open orders before entering the main loop, then runs broad approved-coin candle catch-up in a cancellable background task. Set `live.defer_broad_candle_warmup=false` to keep the old blocking broad warmup behavior.
+- Live shutdown now interrupts candle/EMA warmup and cancels a stuck execution loop before closing exchange sessions, reducing Ctrl-C/shutdown hangs during broad market-data refresh.
+- Live startup warmup now reuses already-fresh 1m candle cache windows when local coverage and refresh metadata prove the required completed-candle range, with `live.force_cold_startup=true` available to force the existing cold fetch path.
+- Removed the deprecated broad `live.price_distance_threshold` setting. Rust-owned order generation and the live `order_match_tolerance_pct` replacement tolerance now define normal order placement/churn behavior; stale `price_distance_threshold` keys are stripped during config normalization. Use `live.initial_entry_exec_max_market_dist_pct` for the narrower live-only initial-entry posting economy gate.
+- Live startup logs one-shot readiness timings for account state, active candles, optional HSL history replay, first market refresh, startup readiness, and broad candle warmup completion.
+- Rust order orchestration now emits only the next most-likely flat entry order for live symbols without a position, while preserving full entry-grid expansion once a position exists and preserving backtest next-candle expansion behavior.
+- Added `live.forager_score_hysteresis_pct` to keep already-selected flat forager coins when challenger scores are only marginally better, reducing selection flip-flop in live, backtest, and optimizer.
+- Live forager diagnostics now include Rust-owned selection score logs: `INFO` reports selected/incumbent coins and top scores only on selection/hysteresis changes or periodic heartbeat, while `DEBUG` includes top-score component detail.
+- Live config validation now requires `live.max_n_cancellations_per_batch > live.max_n_creations_per_batch`, making the intended cancel-before-create batch capacity contract explicit at config load.
 - Fixed OHLCV v2 local preparation so sparse invalid v2 windows are repaired from existing legacy daily shards first, then fetched with exact intraday ranges instead of triggering full-range archive downloads or collapsing same-day repair windows to empty fetches.
 
 ## v7.10.0 - 2026-04-22
@@ -35,6 +2496,8 @@ All notable user-facing changes will be documented in this file.
 - Fixed all-zero `forager_score_weights` configs to normalize to EMA-readiness-only ranking consistently across Python config prep, Rust selection, and optimizer inputs instead of drifting into ambiguous fallback behavior.
 - Stopped hydrating omitted `config.bot.{long,short}` fields from schema-tuned bot defaults in legacy/current configs. Newly omitted feature-style params now hydrate to explicit off/compatibility values with config logs, sparse disabled sides remain loadable, legacy `n_closes` and `min_markup` aliases are preserved, and the Rust parser now fails loudly instead of silently supplying bot-key fallbacks.
 - Hyperliquid live balance reconciliation no longer republishes bot-managed resting-order reserve after `fetch_open_orders()`. This removes the old `REST`/`REST+open_orders` balance oscillation path that could trigger self-induced order-size churn.
+- Live balance/equity replay now skips unsupported historical fill symbols that have no current position, and coin-mode HSL restart reconstruction accepts realized-only rows only when fill replay proves that coin side is flat. This avoids restart loops from stale delisted/unsupported history while preserving hard failures for open or ambiguous risk inputs.
+- New/generated live configs now enable bounded text log rotation by default while preserving explicit `logging.rotation = false` in existing configs.
 - Fixed OHLCV cache backfills so earlier requested ranges are no longer silently suppressed just because later shards already exist on disk. CandlestickManager now separates earliest observed cached candles from authoritative exchange-history lower bounds, migrates stale legacy `pre_inception` gaps out of old indexes, and warns when a requested span is clipped by an authoritative start boundary.
 - Live bots now watch for newer Passivbot-managed open orders they did not emit during the current runtime and stop after repeated detections within a rolling window. This ignores manual/non-Passivbot orders and older inherited orders, reducing the chance of two Passivbot instances silently competing on the same account indefinitely.
 - Staged live bots now route orchestrator latest-price reads through `CandlestickManager`, and `CandlestickManager.get_last_prices()` now uses cheap cache hits plus one bulk ticker snapshot when safe before any per-symbol fallback. This materially reduces staged live market-data call bursts on exchanges like Bybit.
