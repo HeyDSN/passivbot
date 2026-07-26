@@ -79,6 +79,16 @@ Primary reference: `src/fill_events_manager.py` (`BybitFetcher._fetch_positions_
 
 ## KuCoin Futures
 
+### IPv4 API-key whitelist transport
+
+Problem: A dual-stack host may select IPv6 for KuCoin REST and private
+WebSocket traffic even when the API key permits only the host's stable public
+IPv4 address. KuCoin then rejects the first authenticated request as an IP
+whitelist authentication failure.
+
+Handling: Both KuCoin REST and WebSocket CCXT clients use IPv4-only network
+connectors. Keep the host's stable public IPv4 address in the API-key whitelist.
+
 ### KuCoin hedge-mode refresh
 
 Problem:
@@ -171,6 +181,19 @@ Handling in Passivbot:
 
 ## Gate.io Futures
 
+### Exchange identity boundary
+
+Passivbot's canonical exchange identity is `gateio`. This identity owns connector
+routing, cache and event paths, broker attribution, and persisted state. CCXT 4.5.66
+renamed only its client class to `gate`.
+
+For compatibility, `api-keys.json` may specify either `"exchange": "gateio"` or
+`"exchange": "gate"`. Passivbot normalizes the latter to `gateio` and logs that
+migration. Only CCXT REST and WebSocket client construction translates `gateio` to
+`gate`; do not add parallel `gate` identities to internal registries or state paths.
+Normalize Gate's numeric REST account `user` value to a string before assigning it
+as CCXT Pro's private futures subscription UID.
+
 ### Contract order text must start with `t-`
 
 Problem:
@@ -240,6 +263,21 @@ Handling in Passivbot:
 Primary references: [WEEX V3 place-order API](https://www.weex.com/api-doc/contract/Transaction_API/PlaceOrder),
 [current-orders API](https://www.weex.com/api-doc/contract/Transaction_API/GetCurrentOrderStatus),
 and [account-balance API](https://www.weex.com/api-doc/contract/Account_API/GetAccountBalance).
+
+### API whitelist transport
+
+Problem: WEEX API keys accept IPv4 whitelist entries, while a dual-stack host
+may select its IPv6 source address for `api-contract.weex.com`. Public market
+data then works, but private endpoints reject the authenticated request with
+`-1056 ILLEGAL_IP` even when the host's public IPv4 address is whitelisted.
+
+Handling: Both the REST and WebSocket WEEX CCXT clients use IPv4-only network
+connectors. Keep the host's stable public IPv4 address in the API-key whitelist;
+do not interpret `-1056` as a credential, signature, or Passivbot fill-history
+failure.
+
+Primary references: [WEEX V3 error codes](https://www.weex.com/api-doc/contract/ExampleOfErrorCode)
+and [WEEX API integration preparation](https://www.weex.com/api-doc/spot/QuickStart/IntegrationPreparation).
 
 ### Market data and CCXT compatibility
 
