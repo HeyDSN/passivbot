@@ -51,6 +51,8 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `execution.create_skipped`
 - `execution.create_succeeded`
 - `fill.ingested`
+- `fill.position_open_boundary_recovery_used`
+- `fill.position_price_tolerance_used`
 - `fills.ingested_summary`
 - `fills.refresh_summary`
 - `forager.eligibility_changed`
@@ -215,8 +217,6 @@ The code-owned registries live in `src/live/event_bus.py`. Payload and emission 
 - `open_tail_projection`
 - `optional_ema_dropped`
 - `order_churn_action_attempt`
-- `order_churn_action_headroom_exhausted`
-- `order_churn_action_headroom_unavailable`
 - `order_churn_admission`
 - `order_churn_allowance_exhausted`
 - `order_churn_history`

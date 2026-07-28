@@ -20,8 +20,16 @@ from live.event_bus import (
     utc_ms,
 )
 from live.balance_composition import public_balance_composition
-from live.diagnostic_safety import bounded_exception_type as _bounded_exception_type
+from live.diagnostic_safety import (
+    bounded_exception_type as _bounded_exception_type,
+    bounded_exchange_error_context as _bounded_exchange_error_context,
+    bounded_exchange_error_context_from_mapping,
+)
 from candlestick_manager import sanitize_remote_fetch_diagnostic
+
+_bounded_exchange_error_context_from_mapping = (
+    bounded_exchange_error_context_from_mapping
+)
 
 
 def current_live_event_cycle_id(bot: Any) -> str | None:
@@ -3164,6 +3172,8 @@ def _emit_candle_tail_projected_event_unchecked(
     symbol: str,
     context: dict[str, Any] | None,
     reason_code: str = ReasonCodes.OPEN_TAIL_PROJECTION,
+    pside: str | None = None,
+    status: str = "recovered",
 ) -> None:
     ctx = dict(context or {})
     data: dict[str, Any] = {"timeframe": str(ctx.get("timeframe") or "1m")}
@@ -3174,10 +3184,14 @@ def _emit_candle_tail_projected_event_unchecked(
         "tail_gap_candles",
         "missing_candles",
         "max_tail_gap_ms",
+        "consecutive_uses",
     ):
         value = _safe_int(ctx.get(key))
         if value is not None:
             data[key] = value
+    consumer = ctx.get("consumer")
+    if consumer is not None:
+        data["consumer"] = str(consumer)
     reason = ctx.get("reason")
     if reason is not None:
         data["projection_reason"] = str(reason)
@@ -3189,10 +3203,15 @@ def _emit_candle_tail_projected_event_unchecked(
         EventTypes.CANDLE_TAIL_PROJECTED,
         level="debug",
         component="candle.tail_projection",
-        tags=(EventTags.CANDLE, EventTags.TAIL, EventTags.EMA),
+        tags=(
+            (EventTags.CANDLE, EventTags.TAIL, EventTags.TRAILING)
+            if data.get("consumer") == "trailing_extrema"
+            else (EventTags.CANDLE, EventTags.TAIL, EventTags.EMA)
+        ),
         cycle_id=current_live_event_cycle_id(bot),
         symbol=str(symbol),
-        status="recovered",
+        pside=str(pside) if pside is not None else None,
+        status=str(status),
         reason_code=str(reason_code),
         data=data,
     )
@@ -4001,7 +4020,6 @@ def emit_order_churn_admission_event(
     rolling_count: int,
     activation_count: int,
     market_distance_threshold: float,
-    action_headroom: float | int | None,
     wave: dict | None = None,
 ) -> bool:
     """Emit one bounded summary after final churn admission and priority slicing."""
@@ -4033,8 +4051,6 @@ def emit_order_churn_admission_event(
                 float(distance) * 100.0 for distance in sorted(distances)[:8]
             ],
         }
-        if action_headroom is not None and math.isfinite(float(action_headroom)):
-            data["action_headroom"] = max(0, int(action_headroom))
         emitted = bot._emit_live_event(
             EventTypes.ORDER_CHURN_ADMISSION,
             level="debug",
@@ -4445,10 +4461,13 @@ def emit_execution_order_event(
                     ),
                 }
             )
+            if status in {"failed", "degraded"}:
+                data.update(_bounded_exchange_error_context_from_mapping(result))
         elif isinstance(result, BaseException):
             error = result
         if error is not None:
             data["error_type"] = _bounded_exception_type(error)
+            data.update(_bounded_exchange_error_context(error))
         if extra:
             data.update(extra)
         _add_execution_debug_profile(
